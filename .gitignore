@@ -1,0 +1,41 @@
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# C++ / CMake Build directories
+build/
+cmake-build-*/
+out/
+bin/
+
+# IDE and Environment
+.idea/
+.vscode/
+.venv/
+__pycache__/
+*.pyc
+
+# JUCE generated
+JuceLibraryCode/
+*.jucer
+
+# Compiled VST / AU Plugins
+*.vst3
+*.component
+*.aaxplugin
+*.vst
+*.dll
+*.dylib
+*.so
+*.exe
+*.app
+
+# Large asset files if needed (you can comment these out if you want to track them)
+# *.wav
+# *.aif
+# *.mp3
