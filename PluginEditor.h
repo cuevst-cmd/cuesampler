@@ -37,7 +37,6 @@ public:
 private:
     float getUiScale() const noexcept;
 
-    void showCorrectionDialog();
     void paintSideRail (juce::Graphics&, juce::Rectangle<int>, bool isLeftRail) const;
     void paintScrew (juce::Graphics&, juce::Point<float>) const;
 
@@ -54,8 +53,6 @@ private:
 
     std::unique_ptr<cue::HelpOverlayComponent> helpOverlayComponent;
     std::unique_ptr<juce::FileChooser> fileChooser;
-
-    juce::TextButton saveCorrectionButton;
 
     juce::TooltipWindow tooltipWindow { this, 500 };
     juce::DropShadow defaultShadow { juce::Colours::black.withAlpha (0.6f), 12, { 0, 5 } };

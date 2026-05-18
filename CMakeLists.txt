@@ -90,7 +90,6 @@ juce_add_plugin(CueSampler
 target_sources(CueSampler
     PRIVATE
         AudioFingerprinter.cpp
-        CorrectionLog.cpp
         KeyDetector.cpp
         PluginEditor.cpp
         PluginProcessor.cpp
@@ -124,7 +123,7 @@ target_compile_definitions(CueSampler
 juce_add_binary_data(CueSamplerBinaryAssets
     NAMESPACE CueSamplerBinaryData
     SOURCES
-        assets/Syne-wght.ttf)
+        assets/cue_logo.png)
 
 # `target_link_libraries` links libraries and JUCE modules to other libraries or executables. Here,
 # we're linking our executable target to the `juce::juce_audio_utils` module. Inter-module

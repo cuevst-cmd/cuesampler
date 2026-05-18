@@ -146,6 +146,7 @@ public:
     // adjusted so the dragged edge lands on a fresh chop boundary. All other
     // chops are then rebuilt against this new grid.
     void  resizeChopBoundary (int chopId, int newStartSample, int newEndSample);
+    void  setChopBounds (int chopId, int newStartSample, int newEndSample);
     bool  isBitCrusherEnabled() const noexcept;
     float getBitCrusherBits()   const noexcept;
     float getBitCrusherCrush()  const noexcept;

@@ -1,6 +1,5 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
-#include "CorrectionLog.h"
 
 #include <bungee/Stream.h>
 
@@ -4294,6 +4293,74 @@ void AudioPluginAudioProcessor::resizeChopBoundary (int chopId, int newStartSamp
             std::atomic_store (&chopState, updated);
         }
     }
+
+    notifyEditStateChanged();
+    touchTempoUiRevision();
+    requestHostStateSync();
+}
+
+void AudioPluginAudioProcessor::setChopBounds (int chopId, int newStartSample, int newEndSample)
+{
+    if (newEndSample <= newStartSample)
+        return;
+
+    const auto sampleData = std::atomic_load (&loadedSample);
+    if (sampleData == nullptr || sampleData->buffer.getNumSamples() == 0)
+        return;
+
+    const auto currentState = std::atomic_load (&chopState);
+    if (currentState == nullptr)
+        return;
+
+    const int totalSamples = sampleData->buffer.getNumSamples();
+    const int clampedStart = juce::jlimit (0, juce::jmax (0, totalSamples - 2), newStartSample);
+    const int clampedEnd   = juce::jlimit (clampedStart + 1, totalSamples, newEndSample);
+    if (clampedEnd - clampedStart < 2)
+        return;
+
+    auto nextState = std::make_shared<ChopState> (*currentState);
+    auto chopIt = std::find_if (nextState->chops.begin(), nextState->chops.end(),
+                                [chopId] (const ChopDefinition& chop)
+                                {
+                                    return chop.id == chopId;
+                                });
+
+    if (chopIt == nextState->chops.end())
+        return;
+
+    const auto oldStart = chopIt->startSample;
+    const auto oldCueSample = oldStart + chopIt->cueOffsetSamples;
+
+    chopIt->startSample = clampedStart;
+    chopIt->endSample = clampedEnd;
+
+    const int newLength = juce::jmax (1, clampedEnd - clampedStart - 1);
+    const int clampedCueSample = juce::jlimit (clampedStart, juce::jmax (clampedStart, clampedEnd - 1), oldCueSample);
+    chopIt->cueOffsetSamples = juce::jlimit (0, newLength, clampedCueSample - clampedStart);
+
+    chopIt->warpMarkers.erase (std::remove_if (chopIt->warpMarkers.begin(), chopIt->warpMarkers.end(),
+                                               [clampedStart, clampedEnd] (const ChopWarpMarker& marker)
+                                               {
+                                                   return marker.sourceSample <= clampedStart
+                                                       || marker.sourceSample >= clampedEnd;
+                                               }),
+                               chopIt->warpMarkers.end());
+    const bool hasWarpMarkers = ! chopIt->warpMarkers.empty();
+
+    std::sort (nextState->chops.begin(), nextState->chops.end(),
+               [] (const ChopDefinition& left, const ChopDefinition& right)
+               {
+                   if (left.startSample == right.startSample)
+                       return left.id < right.id;
+
+                   return left.startSample < right.startSample;
+               });
+    nextState->selectedChopId = chopId;
+    std::atomic_store (&chopState, nextState);
+
+    chopAudioCache.evict (chopId);
+    if (hasWarpMarkers)
+        requestChopWarpRender (chopId);
 
     notifyEditStateChanged();
     touchTempoUiRevision();

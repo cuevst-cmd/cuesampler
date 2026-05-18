@@ -1,6 +1,5 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
-#include "CorrectionLog.h"
 
 #include <BinaryData.h>
 
@@ -54,20 +53,9 @@ const juce::Colour textMuted (0xff777777);
 const juce::Colour textFaint (0xff6a7282);
 const juce::Colour metalGrey (0xff555555);
 
-juce::Typeface::Ptr getSyneTypeface()
-{
-    static auto typeface = juce::Typeface::createSystemTypefaceFor (CueSamplerBinaryData::Synewght_ttf,
-                                                                    CueSamplerBinaryData::Synewght_ttfSize);
-    return typeface;
-}
-
-
 juce::Font heavyFont (float height)
 {
-    static const auto registeredTypeface = getSyneTypeface();
-    juce::ignoreUnused (registeredTypeface);
-
-    return { juce::FontOptions ("Syne", "ExtraBold", height) };
+    return { juce::FontOptions ("Helvetica", height, juce::Font::bold) };
 }
 
 juce::Font monoFont (float height)
@@ -1163,6 +1151,8 @@ private:
         {
             "Click chop                     Select + preview",
             "Double-click chop           Toggle favourite (pink)",
+            "Drag chop edge              Resize grid + update tempo",
+            "Shift-drag chop edge       Snap edge to nearest bar",
             "Drag audio file onto view   Load new sample",
             "Alt-click any knob           Reset to default value",
             "Scroll wheel                   Zoom in / out to cursor",
@@ -1231,7 +1221,9 @@ class HeaderComponent final : public juce::Component,
 {
 public:
     explicit HeaderComponent (AudioPluginAudioProcessor& p)
-        : processor (p)
+        : processor (p),
+          logoImage (juce::ImageCache::getFromMemory (CueSamplerBinaryData::cue_logo_png,
+                                                      CueSamplerBinaryData::cue_logo_pngSize))
     {
         setBufferedToImage (true);
         startTimerHz (headerRefreshHz);
@@ -1294,33 +1286,63 @@ public:
             g.strokePath (meterArc, juce::PathStrokeType (meterTrackThickness, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
         }
 
-        fillEllipseGradient (g, logoCircle, accentOrange.brighter (0.35f), accentOrange.darker (0.28f));
+        if (logoImage.isValid())
+        {
+            const auto minSourceDimension = juce::jmin (logoImage.getWidth(), logoImage.getHeight());
+            const auto sourceInset = juce::roundToInt ((float) minSourceDimension * 0.135f);
+            const auto sourceSize = juce::jmax (1, minSourceDimension - sourceInset * 2);
+            const auto sourceX = juce::jlimit (0, logoImage.getWidth() - sourceSize,
+                                               (logoImage.getWidth() - sourceSize) / 2);
+            const auto sourceY = juce::jlimit (0, logoImage.getHeight() - sourceSize,
+                                               (logoImage.getHeight() - sourceSize) / 2 - 20);
+
+            juce::Graphics::ScopedSaveState logoState (g);
+            juce::Path logoClip;
+            logoClip.addEllipse (logoCircle);
+            g.reduceClipRegion (logoClip);
+            g.setImageResamplingQuality (juce::Graphics::highResamplingQuality);
+            g.drawImage (logoImage,
+                         juce::roundToInt (logoCircle.getX()),
+                         juce::roundToInt (logoCircle.getY()),
+                         juce::roundToInt (logoCircle.getWidth()),
+                         juce::roundToInt (logoCircle.getHeight()),
+                         sourceX,
+                         sourceY,
+                         sourceSize,
+                         sourceSize);
+        }
+        else
+        {
+            fillEllipseGradient (g, logoCircle, accentOrange.brighter (0.35f), accentOrange.darker (0.28f));
+            g.setColour (textPrimary);
+            g.setFont (heavyFont (16.0f));
+            g.drawFittedText ("CUE", logoCircle.toNearestInt(), juce::Justification::centred, 1);
+        }
+
         g.setColour (juce::Colours::black.withAlpha (0.35f));
         g.drawEllipse (logoCircle.expanded (0.5f), 1.0f);
 
-        g.setColour (textPrimary);
-        g.setFont (heavyFont (16.0f));
-        g.drawFittedText ("CUE", logoCircle.toNearestInt(), juce::Justification::centred, 1);
-
-        const auto titleFont = heavyFont (60.0f);
+        const auto titleFont = heavyFont (52.0f);
         juce::GlyphArrangement titleGlyphs;
         titleGlyphs.addLineOfText (titleFont, "SAMPLER", 0.0f, 0.0f);
         const int samplerTextWidth = (int) std::ceil (titleGlyphs.getBoundingBox (0, -1, true).getWidth());
 
         const int titleX = 96;
+        const int titleY = 4;
+        const int titleHeight = 58;
         g.setColour (textPrimary);
         g.setFont (titleFont);
-        g.drawText ("SAMPLER", juce::Rectangle<int> (titleX, 0, samplerTextWidth + 4, 60),
+        g.drawText ("SAMPLER", juce::Rectangle<int> (titleX, titleY, samplerTextWidth + 4, titleHeight),
                     juce::Justification::centredLeft, false);
 
         const int dotX = titleX + samplerTextWidth;
         g.setColour (accentOrange);
-        g.drawText (".", juce::Rectangle<int> (dotX, 0, 20, 60), juce::Justification::centredLeft, false);
+        g.drawText (".", juce::Rectangle<int> (dotX, titleY, 20, titleHeight), juce::Justification::centredLeft, false);
 
         const int betaX = dotX + 18;
         g.setColour (textMuted);
-        g.setFont (heavyFont (18.0f));
-        g.drawText ("(beta)", juce::Rectangle<int> (betaX, 36, 90, 20), juce::Justification::centredLeft, false);
+        g.setFont (heavyFont (16.0f));
+        g.drawText ("(beta)", juce::Rectangle<int> (betaX, 35, 90, 20), juce::Justification::centredLeft, false);
 
         g.setColour (textMuted.brighter (0.25f));
         g.setFont (heavyFont (12.0f));
@@ -1339,6 +1361,7 @@ private:
 
     AudioPluginAudioProcessor& processor;
     juce::TextButton helpButton;
+    juce::Image logoImage;
 };
 
 class WaveformDisplayComponent final : public juce::Component,
@@ -1353,6 +1376,8 @@ public:
     {
         setBufferedToImage (true);
         setTooltip ("Click a chop to select and preview it.  Double-click to toggle favourite (pink highlight).  "
+                    "Drag a selected chop edge to resize the grid and update tempo.  "
+                    "Shift-drag a selected chop edge to snap that edge to the nearest bar without changing tempo.  "
                     "Drag an audio file here to load it.");
         processor.sampleChangeBroadcaster.addChangeListener (this);
         processor.editChangeBroadcaster.addChangeListener (this);
@@ -1471,6 +1496,7 @@ public:
             {
                 edgeDragChopId    = hitChopId;
                 edgeDragKind      = hitKind;
+                edgeDragBarSnap   = event.mods.isShiftDown();
                 edgeDragLiveSample = sampleForDisplayPosition (event.position.x);
                 setMouseCursor (juce::MouseCursor::LeftRightResizeCursor);
                 setBufferedToImage (false);
@@ -1605,6 +1631,7 @@ public:
         {
             edgeDragChopId = -1;
             edgeDragKind   = 0;
+            edgeDragBarSnap = false;
             return;
         }
 
@@ -1613,6 +1640,9 @@ public:
         const int    minLen       = juce::jmax (1, (int) std::round (sr * 0.05)); // 50 ms minimum chop
 
         double newSample = sampleForDisplayPosition (mousePos.x);
+
+        if (edgeDragBarSnap)
+            newSample = sampleForNearestBarLine (newSample);
 
         if (edgeDragKind == 1) // left edge
         {
@@ -1652,12 +1682,18 @@ public:
             else if (edgeDragKind == 2) newEnd   = dragSample;
 
             if (newEnd - newStart >= 2)
-                processor.resizeChopBoundary (edgeDragChopId, newStart, newEnd);
+            {
+                if (edgeDragBarSnap)
+                    processor.setChopBounds (edgeDragChopId, newStart, newEnd);
+                else
+                    processor.resizeChopBoundary (edgeDragChopId, newStart, newEnd);
+            }
         }
 
         edgeDragChopId     = -1;
         edgeDragKind       = 0;
         edgeDragLiveSample = 0.0;
+        edgeDragBarSnap = false;
     }
 
     // ---- Warp-mode interaction helpers (step 9) ---------------------------
@@ -2176,7 +2212,7 @@ public:
             auto hintBar = displayBounds.toNearestInt().reduced (18, 12).removeFromTop (34);
             fillRoundedGradient (g, hintBar.toFloat(), juce::Colour (0xff171717).withAlpha (0.58f),
                                  juce::Colours::black.withAlpha (0.48f), 6.0f);
-            drawHelperText (g, "Click chop: preview/select   Double-click: favorite   Hold 2s + drag: export",
+            drawHelperText (g, "Click chop: preview/select   Drag edge: resize tempo   Shift-drag edge: snap to bar",
                             hintBar.reduced (10, 4), juce::Justification::centred, 10.8f);
         }
         else
@@ -2554,6 +2590,34 @@ private:
         return displayBounds.getX() + relativePosition * displayBounds.getWidth();
     }
 
+    double sampleForNearestBarLine (double samplePosition) const
+    {
+        const auto sampleData = processor.getLoadedSample();
+        const auto analysis = processor.getTempoAnalysis();
+        if (sampleData == nullptr || analysis == nullptr || analysis->beatPeriodSeconds <= 0.0)
+            return samplePosition;
+
+        const double sr = sampleData->sampleRate;
+        if (sr <= 0.0)
+            return samplePosition;
+
+        const auto trimBpm = (double) processor.getGridBpmTrim();
+        const auto adjustedBpm = analysis->estimatedBpm + trimBpm;
+        const auto scaleFactor = (adjustedBpm > 0.0 && analysis->estimatedBpm > 0.0)
+                               ? analysis->estimatedBpm / adjustedBpm : 1.0;
+        const auto beatPeriod = analysis->beatPeriodSeconds * scaleFactor;
+        const auto barPeriod = beatPeriod * 4.0;
+        if (barPeriod <= 0.0)
+            return samplePosition;
+
+        const auto anchor = processor.getResolvedGridAnchorSeconds();
+        const auto sampleSeconds = samplePosition / sr;
+        const auto nearestBarSeconds = anchor + std::round ((sampleSeconds - anchor) / barPeriod) * barPeriod;
+        return juce::jlimit (0.0,
+                             (double) juce::jmax (0, sampleData->buffer.getNumSamples()),
+                             nearestBarSeconds * sr);
+    }
+
     void followTriggeredChopIfNeeded()
     {
         const auto triggerRevision = processor.getChopTriggerRevision();
@@ -2708,26 +2772,29 @@ private:
             return;
 
         const auto visibleRange = getVisibleRange (sampleData->buffer.getNumSamples());
-        const float anchorX = displayXForSamplePosition (
-            (double) (edgeDragKind == 1 ? chop->endSample : chop->startSample),
-            visibleRange, displayBounds);
-        const float liveX   = displayXForSamplePosition (edgeDragLiveSample, visibleRange, displayBounds);
+        const double ghostStartSample = juce::jmin ((double) (edgeDragKind == 1 ? chop->endSample : chop->startSample),
+                                                    edgeDragLiveSample);
+        const double ghostEndSample = juce::jmax ((double) (edgeDragKind == 1 ? chop->endSample : chop->startSample),
+                                                  edgeDragLiveSample);
+        const float ghostStartX = displayXForSamplePosition (ghostStartSample, visibleRange, displayBounds);
+        const float ghostEndX = displayXForSamplePosition (ghostEndSample, visibleRange, displayBounds);
 
         juce::Graphics::ScopedSaveState state (g);
         juce::Path clipPath;
         clipPath.addRoundedRectangle (displayBounds, 4.0f);
         g.reduceClipRegion (clipPath);
 
-        const auto ghostBounds = juce::Rectangle<float> (juce::jmin (anchorX, liveX),
+        const auto ghostBounds = juce::Rectangle<float> (juce::jmin (ghostStartX, ghostEndX),
                                                           displayBounds.getY(),
-                                                          std::abs (liveX - anchorX),
+                                                          std::abs (ghostEndX - ghostStartX),
                                                           displayBounds.getHeight());
 
         fillRectGradient (g, ghostBounds, juce::Colour (0xff00f57a).withAlpha (0.24f),
                           juce::Colour (0xff00f57a).withAlpha (0.10f));
 
-        g.setColour (juce::Colour (0xff00f57a).withAlpha (0.95f));
-        g.drawLine (liveX, displayBounds.getY() + 2.0f, liveX, displayBounds.getBottom() - 2.0f, 2.0f);
+        g.setColour ((edgeDragBarSnap ? juce::Colour (0xffff6900) : juce::Colour (0xff00f57a)).withAlpha (0.95f));
+        g.drawLine (ghostBounds.getX(), displayBounds.getY() + 2.0f, ghostBounds.getX(), displayBounds.getBottom() - 2.0f, 2.0f);
+        g.drawLine (ghostBounds.getRight(), displayBounds.getY() + 2.0f, ghostBounds.getRight(), displayBounds.getBottom() - 2.0f, 2.0f);
     }
 
     void paintChops (juce::Graphics& g, juce::Rectangle<float> displayBounds)
@@ -3506,6 +3573,7 @@ private:
     int    edgeDragChopId    = -1;
     int    edgeDragKind      = 0;
     double edgeDragLiveSample = 0.0;
+    bool   edgeDragBarSnap = false;
     static constexpr float kEdgeHitTestPixels = 6.0f;
 };
 
@@ -4569,12 +4637,6 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     for (auto* component : sections)
         contentComponent.addAndMakeVisible (*component);
 
-    cue::configureButton (saveCorrectionButton, "Save Correction", cue::textPrimary);
-    saveCorrectionButton.getProperties().set ("cueStyle", "helpButton");
-    saveCorrectionButton.setTooltip ("Save a corrected BPM for the current sample.");
-    saveCorrectionButton.onClick = [this] { showCorrectionDialog(); };
-    contentComponent.addAndMakeVisible (saveCorrectionButton);
-
     panelShadowEffect.setShadowProperties (defaultShadow);
     waveformDisplayComponent->setComponentEffect (&panelShadowEffect);
     transportSectionComponent->setComponentEffect (&panelShadowEffect);
@@ -4645,74 +4707,6 @@ void AudioPluginAudioProcessorEditor::loadSampleFromFile()
         if (file.existsAsFile())
             processorRef.loadAudioFile (file);
     });
-}
-
-void AudioPluginAudioProcessorEditor::showCorrectionDialog()
-{
-    const auto sampleData = processorRef.getLoadedSample();
-    const auto analysis = processorRef.getTempoAnalysis();
-
-    if (sampleData == nullptr || analysis == nullptr || analysis->estimatedBpm <= 0.0
-        || sampleData->buffer.getNumSamples() <= 0 || sampleData->sampleRate <= 0.0)
-    {
-        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
-                                                "No Sample",
-                                                "Load a sample first.",
-                                                "OK",
-                                                this);
-        return;
-    }
-
-    const auto detectedBpm = analysis->estimatedBpm;
-    auto* alert = new juce::AlertWindow ("Save Tempo Correction",
-                                         "Detected BPM: " + juce::String (detectedBpm, 2)
-                                             + "\n\nEnter the correct BPM:",
-                                         juce::AlertWindow::NoIcon,
-                                         this);
-
-    alert->addTextEditor ("correctedBpm", juce::String (detectedBpm, 2), {});
-    alert->addButton ("Save", 1, juce::KeyPress (juce::KeyPress::returnKey));
-    alert->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
-
-    juce::Component::SafePointer<AudioPluginAudioProcessorEditor> safeThis (this);
-    juce::Component::SafePointer<juce::AlertWindow> safeAlert (alert);
-
-    alert->enterModalState (true,
-                            juce::ModalCallbackFunction::create (
-                                [safeThis, safeAlert, sampleData, detectedBpm] (int result)
-                                {
-                                    if (result != 1 || safeThis == nullptr || safeAlert == nullptr)
-                                        return;
-
-                                    const auto correctedBpm = safeAlert->getTextEditorContents ("correctedBpm").getDoubleValue();
-                                    if (correctedBpm <= 0.0)
-                                    {
-                                        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
-                                                                                "Invalid BPM",
-                                                                                "Enter a positive BPM value.",
-                                                                                "OK",
-                                                                                safeThis);
-                                        return;
-                                    }
-
-                                    auto sourceFile = sampleData->sourceFile;
-                                    if (sourceFile.getFullPathName().isEmpty() && sampleData->filePath.isNotEmpty())
-                                        sourceFile = juce::File (sampleData->filePath);
-
-                                    saveTempoCorrection (sourceFile,
-                                                         sampleData->buffer,
-                                                         detectedBpm,
-                                                         correctedBpm,
-                                                         sampleData->sampleRate);
-
-                                    juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
-                                                                            "Saved",
-                                                                            "Correction saved. Total saved: "
-                                                                                + juce::String (countSavedCorrections()),
-                                                                            "OK",
-                                                                            safeThis);
-                                }),
-                            true);
 }
 
 void AudioPluginAudioProcessorEditor::changeListenerCallback (juce::ChangeBroadcaster* source)
@@ -4786,7 +4780,6 @@ void AudioPluginAudioProcessorEditor::resized()
     contentComponent.setBounds (0, 0, cue::editorWidth, cue::editorHeight);
 
     headerComponent->setBounds (96, 32, 1246, 77);
-    saveCorrectionButton.setBounds (1140, 42, 150, 28);
     waveformDisplayComponent->setBounds (96, 133, 782, 411);
     transportSectionComponent->setBounds (96, 552, 782, 236);
     utilityStripComponent->setBounds (910, 133, 120, 655);
