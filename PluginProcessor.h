@@ -152,6 +152,8 @@ public:
 
     bool isPlaying() const noexcept;
     double getPlaybackSamplePosition() const noexcept;
+    int getLastTriggeredChopId() const noexcept;
+    uint64_t getChopTriggerRevision() const noexcept;
     float getOutputMeterLevel() const noexcept;
     float getTimeStretchRatio() const noexcept;
     float getPitchSemitones() const noexcept;
@@ -408,6 +410,8 @@ private:
     std::atomic<double> hostSampleRate { 44100.0 };
     std::atomic<double> playbackSamplePosition { 0.0 };
     std::atomic<bool> playbackActive { false };
+    std::atomic<int> lastTriggeredChopId { -1 };
+    std::atomic<uint64_t> chopTriggerRevision { 0 };
     std::atomic<float> outputMeterLevel { 0.0f };
     std::atomic<float> timeStretchRatio { 1.0f };
     std::atomic<float> pitchSemitones { 0.0f };

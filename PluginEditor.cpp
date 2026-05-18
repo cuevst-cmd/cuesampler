@@ -224,14 +224,7 @@ juce::TextLayout createTooltipLayout (const juce::String& text, juce::Colour col
 
 bool shouldRunRealtimeUi (const juce::Component& component) noexcept
 {
-    if (! component.isShowing())
-        return false;
-
-    if (auto* topLevel = component.getTopLevelComponent())
-        if (auto* peer = topLevel->getPeer())
-            return peer->isFocused();
-
-    return true;
+    return component.isShowing();
 }
 
 juce::String getCueStyle (const juce::Component& component)
@@ -1363,6 +1356,7 @@ public:
                     "Drag an audio file here to load it.");
         processor.sampleChangeBroadcaster.addChangeListener (this);
         processor.editChangeBroadcaster.addChangeListener (this);
+        lastObservedChopTriggerRevision = processor.getChopTriggerRevision();
         updatePeakCache();
         rebuildWaveformPath();
         startTimerHz (waveformRefreshHz);
@@ -2471,6 +2465,8 @@ private:
             }
         }
 
+        followTriggeredChopIfNeeded();
+
         const auto currentPlayheadPosition = processor.getPlaybackSamplePosition();
         const auto targetHoverAlpha = isHoveringDisplay ? 1.0f : 0.0f;
         hoverAnimationAlpha += (targetHoverAlpha - hoverAnimationAlpha) * 0.22f;
@@ -2556,6 +2552,65 @@ private:
         const auto relativePosition = (float) ((samplePosition - (double) visibleRange.sampleOffset)
                                              / (double) juce::jmax (1, visibleRange.visibleSamples));
         return displayBounds.getX() + relativePosition * displayBounds.getWidth();
+    }
+
+    void followTriggeredChopIfNeeded()
+    {
+        const auto triggerRevision = processor.getChopTriggerRevision();
+        if (triggerRevision == lastObservedChopTriggerRevision)
+            return;
+
+        lastObservedChopTriggerRevision = triggerRevision;
+        scrollToChop (processor.getLastTriggeredChopId());
+    }
+
+    void scrollToChop (int chopId)
+    {
+        if (chopId < 0)
+            return;
+
+        const auto sampleData = processor.getLoadedSample();
+        const auto chopState = processor.getChopState();
+        if (sampleData == nullptr || chopState == nullptr)
+            return;
+
+        const int numSamples = sampleData->buffer.getNumSamples();
+        if (numSamples <= 0)
+            return;
+
+        const AudioPluginAudioProcessor::ChopDefinition* targetChop = nullptr;
+        for (const auto& chop : chopState->chops)
+        {
+            if (chop.id == chopId)
+            {
+                targetChop = &chop;
+                break;
+            }
+        }
+
+        if (targetChop == nullptr)
+            return;
+
+        const auto visibleRange = getVisibleRange (numSamples);
+        const int maxOffset = juce::jmax (0, numSamples - visibleRange.visibleSamples);
+        if (maxOffset <= 0)
+            return;
+
+        const double chopStart = (double) juce::jlimit (0, numSamples, targetChop->startSample);
+        const double chopEnd = (double) juce::jlimit (0, numSamples, targetChop->endSample);
+        const double visibleSamples = (double) juce::jmax (1, visibleRange.visibleSamples);
+        const double chopLength = juce::jmax (1.0, chopEnd - chopStart);
+        const double targetOffset = chopLength >= visibleSamples * 0.8
+                                  ? chopStart - visibleSamples * 0.1
+                                  : ((chopStart + chopEnd) * 0.5) - visibleSamples * 0.5;
+        const float targetScroll = juce::jlimit (0.0f, 1.0f, (float) (targetOffset / (double) maxOffset));
+
+        if (std::abs (targetScroll - scrollPosition) < 0.0005f)
+            return;
+
+        setScroll (targetScroll);
+        if (onScrollChanged)
+            onScrollChanged (targetScroll);
     }
 
     void updateHoverState (juce::Point<float> position)
@@ -3161,7 +3216,7 @@ private:
                 drawGridLine (x,
                               displayBounds.getY() + 4.0f,
                               displayBounds.getBottom() - 4.0f,
-                              juce::Colour (0xff8fd9ff).withAlpha (0.74f),
+                              juce::Colour (0xffff6900).withAlpha (0.82f),
                               1.9f);
             }
         }
@@ -3427,6 +3482,7 @@ private:
     double analysisSelectionCurrentSample = 0.0;
     double lastPaintedPlayheadSample = -1.0;
     uint64_t lastTempoUiRevision = 0;
+    uint64_t lastObservedChopTriggerRevision = 0;
     int scanAnimFrame = 0;
 
     // Hold-to-export drag state
@@ -3661,8 +3717,10 @@ public:
         drawPanelHole (g, { bottomPanel.getX() + 13.0f, bottomPanel.getBottom() - 13.0f }, 6.0f);
         drawPanelHole (g, { bottomPanel.getRight() - 13.0f, bottomPanel.getBottom() - 13.0f }, 6.0f);
 
-        auto badgeBounds = juce::Rectangle<float> (122.0f, 18.0f)
-            .withCentre ({ (float) getWidth() * 0.5f, (topPanel.getBottom() + bottomPanel.getY()) * 0.5f });
+        auto badgeBounds = juce::Rectangle<float> (bottomPanel.getX() + 20.0f,
+                                                   (topPanel.getBottom() + bottomPanel.getY()) * 0.5f - 9.0f,
+                                                   122.0f,
+                                                   18.0f);
         fillRoundedGradient (g, badgeBounds, shellDark.brighter (0.12f), shellDark.darker (0.18f), 6.0f);
         g.setColour (borderLight);
         g.drawRoundedRectangle (badgeBounds.reduced (0.5f), 6.0f, 1.0f);

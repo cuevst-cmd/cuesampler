@@ -2748,6 +2748,8 @@ void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg,
     vs.fadeTarget = 1.0f;
     vs.fadeStep = 0.0f;
     heldMidiNote.store (msg.getNoteNumber(), std::memory_order_release);
+    lastTriggeredChopId.store (chop.id, std::memory_order_release);
+    chopTriggerRevision.fetch_add (1, std::memory_order_acq_rel);
 
     if (syncToHost.load() && blockHasHostPpq && blockHostTransportPlaying && hostBpm.load() > 0.0)
     {
@@ -3890,6 +3892,9 @@ void AudioPluginAudioProcessor::startPlayback() noexcept
 
         stopSample = (double) selectedChop->endSample;
         loopStartSample = cueStartSample;
+
+        lastTriggeredChopId.store (selectedChop->id, std::memory_order_release);
+        chopTriggerRevision.fetch_add (1, std::memory_order_acq_rel);
     }
     else
     {
@@ -3984,6 +3989,16 @@ bool AudioPluginAudioProcessor::isPlaying() const noexcept
 double AudioPluginAudioProcessor::getPlaybackSamplePosition() const noexcept
 {
     return playbackSamplePosition.load (std::memory_order_acquire);
+}
+
+int AudioPluginAudioProcessor::getLastTriggeredChopId() const noexcept
+{
+    return lastTriggeredChopId.load (std::memory_order_acquire);
+}
+
+uint64_t AudioPluginAudioProcessor::getChopTriggerRevision() const noexcept
+{
+    return chopTriggerRevision.load (std::memory_order_acquire);
 }
 
 float AudioPluginAudioProcessor::getOutputMeterLevel() const noexcept
