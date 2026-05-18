@@ -39,3 +39,6 @@ JuceLibraryCode/
 # *.wav
 # *.aif
 # *.mp3
+
+# API Keys and Secrets
+APIKeys.h

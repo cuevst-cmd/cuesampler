@@ -4,6 +4,12 @@
 #include <juce_core/juce_core.h>
 #include <string>
 
+#if __has_include("APIKeys.h")
+    #include "APIKeys.h"
+#else
+    namespace APIKeys { static constexpr const char* AcoustIdApiKey = ""; }
+#endif
+
 class AudioFingerprinter
 {
 public:
@@ -18,7 +24,7 @@ public:
         std::string artist;
     };
 
-    static constexpr const char* kAcoustIdApiKey = "eJk2XKFZNi";
+    static constexpr const char* kAcoustIdApiKey = APIKeys::AcoustIdApiKey;
 
     // Performs a blocking online lookup from audio fingerprint to musical key.
     OnlineResult lookup (const juce::AudioBuffer<float>& buffer, double sampleRate);

@@ -1,0 +1,7 @@
+#pragma once
+
+namespace APIKeys
+{
+    // Replace this with your actual AcoustID API key
+    static constexpr const char* AcoustIdApiKey = "YOUR_API_KEY_HERE";
+}
