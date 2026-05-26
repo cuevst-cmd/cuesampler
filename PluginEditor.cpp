@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <functional>
+#include <map>
 
 namespace cue
 {
@@ -293,6 +294,218 @@ juce::Path createRailPath (juce::Rectangle<float> area, bool isLeftRail, float r
     path.closeSubPath();
     return path;
 }
+
+class SmoothAnimatedSwitchButton final : public juce::TextButton, private juce::Timer
+{
+public:
+    SmoothAnimatedSwitchButton()
+        : juce::TextButton()
+    {
+        currentPosition = getToggleState() ? 1.0f : 0.0f;
+        targetPosition = currentPosition;
+    }
+
+    ~SmoothAnimatedSwitchButton() override
+    {
+        stopTimer();
+    }
+
+    float getCurrentAnimationPosition() const noexcept { return currentPosition; }
+    float getClickRipple() const noexcept { return clickRipple; }
+    float getHoverAlpha() const noexcept { return hoverAlpha; }
+
+    void clicked() override
+    {
+        juce::TextButton::clicked();
+        clickRipple = 1.0f;
+        if (! isTimerRunning())
+            startTimerHz (60);
+    }
+
+    void mouseEnter (const juce::MouseEvent& e) override
+    {
+        juce::TextButton::mouseEnter (e);
+        if (! isTimerRunning())
+            startTimerHz (60);
+    }
+
+    void mouseExit (const juce::MouseEvent& e) override
+    {
+        juce::TextButton::mouseExit (e);
+        if (! isTimerRunning())
+            startTimerHz (60);
+    }
+
+    void buttonStateChanged() override
+    {
+        juce::TextButton::buttonStateChanged();
+        
+        const float target = getToggleState() ? 1.0f : 0.0f;
+        if (std::abs (target - targetPosition) > 0.001f)
+        {
+            targetPosition = target;
+            if (! isShowing())
+            {
+                currentPosition = target;
+                velocity = 0.0f;
+            }
+            else
+            {
+                if (! isTimerRunning())
+                    startTimerHz (60);
+            }
+        }
+    }
+
+private:
+    void timerCallback() override
+    {
+        constexpr float stiffness = 320.0f;
+        constexpr float damping = 28.0f;
+        constexpr float dt = 0.0167f;
+
+        float force = (targetPosition - currentPosition) * stiffness - velocity * damping;
+        velocity += force * dt;
+        currentPosition += velocity * dt;
+
+        bool positionDone = std::abs (currentPosition - targetPosition) < 0.002f && std::abs (velocity) < 0.02f;
+        if (positionDone)
+        {
+            currentPosition = targetPosition;
+            velocity = 0.0f;
+        }
+
+        currentPosition = juce::jlimit (-0.08f, 1.08f, currentPosition);
+
+        if (clickRipple > 0.0f)
+        {
+            clickRipple -= 0.06f;
+            if (clickRipple < 0.0f)
+                clickRipple = 0.0f;
+        }
+
+        const float hoverTarget = isMouseOver() ? 1.0f : 0.0f;
+        hoverAlpha += (hoverTarget - hoverAlpha) * 0.18f;
+
+        bool hoverDone = std::abs (hoverAlpha - hoverTarget) < 0.005f;
+        if (hoverDone)
+            hoverAlpha = hoverTarget;
+
+        if (positionDone && clickRipple <= 0.0f && hoverDone)
+        {
+            stopTimer();
+        }
+
+        repaint();
+        if (auto* parent = getParentComponent())
+            parent->repaint();
+    }
+
+    float currentPosition = 0.0f;
+    float targetPosition = 0.0f;
+    float velocity = 0.0f;
+    float clickRipple = 0.0f;
+    float hoverAlpha = 0.0f;
+};
+
+class SmoothHoverButton : public juce::TextButton, private juce::Timer
+{
+public:
+    SmoothHoverButton() : juce::TextButton() {}
+    ~SmoothHoverButton() override { stopTimer(); }
+
+    float getHoverAlpha() const noexcept { return hoverAlpha; }
+
+    void mouseEnter (const juce::MouseEvent& e) override
+    {
+        juce::TextButton::mouseEnter (e);
+        if (! isTimerRunning())
+            startTimerHz (60);
+    }
+
+    void mouseExit (const juce::MouseEvent& e) override
+    {
+        juce::TextButton::mouseExit (e);
+        if (! isTimerRunning())
+            startTimerHz (60);
+    }
+
+private:
+    void timerCallback() override
+    {
+        const float target = isMouseOver() ? 1.0f : 0.0f;
+        hoverAlpha += (target - hoverAlpha) * 0.18f;
+
+        if (std::abs (hoverAlpha - target) < 0.005f)
+        {
+            hoverAlpha = target;
+            stopTimer();
+        }
+
+        repaint();
+    }
+
+    float hoverAlpha = 0.0f;
+};
+
+class OptResetSlider : public juce::Slider, private juce::Timer
+{
+public:
+    OptResetSlider() : juce::Slider() {}
+    ~OptResetSlider() override { stopTimer(); }
+
+    void captureCurrentValueAsDefault() noexcept
+    {
+        defaultValue = getValue();
+        hasDefaultValue = true;
+    }
+
+    float getHoverAlpha() const noexcept { return hoverAlpha; }
+
+    void mouseEnter (const juce::MouseEvent& e) override
+    {
+        juce::Slider::mouseEnter (e);
+        if (! isTimerRunning())
+            startTimerHz (60);
+    }
+
+    void mouseExit (const juce::MouseEvent& e) override
+    {
+        juce::Slider::mouseExit (e);
+        if (! isTimerRunning())
+            startTimerHz (60);
+    }
+
+    void mouseDown (const juce::MouseEvent& event) override
+    {
+        if (hasDefaultValue && event.mods.isAltDown())
+        {
+            setValue (defaultValue, juce::sendNotificationSync);
+            return;
+        }
+
+        juce::Slider::mouseDown (event);
+    }
+
+private:
+    void timerCallback() override
+    {
+        const float target = isMouseOverOrDragging() ? 1.0f : 0.0f;
+        hoverAlpha += (target - hoverAlpha) * 0.18f;
+
+        if (std::abs (hoverAlpha - target) < 0.005f)
+        {
+            hoverAlpha = target;
+            stopTimer();
+        }
+
+        repaint();
+    }
+
+    double defaultValue = 0.0;
+    bool hasDefaultValue = false;
+    float hoverAlpha = 0.0f;
+};
 } // namespace
 
 class CueSamplerLookAndFeel final : public juce::LookAndFeel_V4
@@ -328,6 +541,15 @@ public:
         layout.draw (g, bounds.reduced (11.0f, 8.0f));
     }
 
+    float getHoverAlpha (juce::Button& button, bool isMouseOverButton)
+    {
+        if (auto* hb = dynamic_cast<SmoothHoverButton*> (&button))
+            return hb->getHoverAlpha();
+        if (auto* ab = dynamic_cast<SmoothAnimatedSwitchButton*> (&button))
+            return ab->getHoverAlpha();
+        return isMouseOverButton ? 1.0f : 0.0f;
+    }
+
     void drawButtonBackground (juce::Graphics& g, juce::Button& button,
                                const juce::Colour& backgroundColour,
                                bool isMouseOverButton, bool isButtonDown) override
@@ -343,8 +565,9 @@ public:
 
             if (style == "transportSquare")
             {
-                if (isMouseOverButton)
-                    drawSoftDropShadow (g, bounds, 10.0f, false, 3.0f, 0.0f, 12.0f, accentOrange);
+                float hover = getHoverAlpha (button, isMouseOverButton);
+                if (hover > 0.01f)
+                    drawSoftDropShadow (g, bounds, 10.0f, false, 1.5f + 1.5f * hover, 3.0f * (1.0f - hover), 4.0f + 8.0f * hover, accentOrange.withAlpha (hover));
                 else
                     drawSoftDropShadow (g, bounds, 10.0f, false, 1.5f, 3.0f, 4.0f);
 
@@ -352,66 +575,166 @@ public:
                                                juce::Colour (0xff1a1a1a), bounds.getCentreX(), bounds.getBottom(), false);
                 g.setGradientFill (gradient);
                 g.fillRoundedRectangle (bounds, 10.0f);
-                g.setColour (isMouseOverButton ? accentOrange.withAlpha (0.35f) : borderMid);
+                g.setColour (borderMid.interpolatedWith (accentOrange.withAlpha (0.35f), hover));
                 g.drawRoundedRectangle (bounds, 10.0f, 2.0f);
-                g.setColour (isMouseOverButton ? accentOrange.withAlpha (0.12f) : juce::Colours::white.withAlpha (0.06f));
+                g.setColour (juce::Colours::white.withAlpha (0.06f).interpolatedWith (accentOrange.withAlpha (0.12f), hover));
                 g.drawRoundedRectangle (bounds.reduced (1.0f), 9.0f, 1.0f);
                 return;
             }
 
             if (style == "halfTime")
             {
-                if (isMouseOverButton)
-                    drawSoftDropShadow (g, bounds, 8.0f, false, 3.0f, 0.0f, 12.0f, accentOrange);
-                else
-                    drawSoftDropShadow (g, bounds, 8.0f, false, 1.2f, 2.0f, 3.0f);
+                float position = button.getToggleState() ? 1.0f : 0.0f;
+                float ripple = 0.0f;
+                float hover = getHoverAlpha (button, isMouseOverButton);
+                if (auto* animatedButton = dynamic_cast<SmoothAnimatedSwitchButton*> (&button))
+                {
+                    position = animatedButton->getCurrentAnimationPosition();
+                    ripple = animatedButton->getClickRipple();
+                }
+                float clampedPos = juce::jlimit (0.0f, 1.0f, position);
 
-                auto base = juce::Colour (0xff252525);
-                if (button.getToggleState())
-                    base = accentOrange.withAlpha (0.32f).interpolatedWith (juce::Colour (0xff252525), 0.45f);
-                if (isMouseOverButton)
-                    base = base.brighter (0.05f);
+                if (hover > 0.01f || clampedPos > 0.01f)
+                {
+                    const float glowAlpha = hover * 0.15f + 0.85f * clampedPos;
+                    drawSoftDropShadow (g, bounds, 8.0f, false, 1.2f + 1.8f * clampedPos, 2.0f * (1.0f - clampedPos), 3.0f + 9.0f * clampedPos, accentOrange.withAlpha (glowAlpha));
+                }
+                else
+                {
+                    drawSoftDropShadow (g, bounds, 8.0f, false, 1.2f, 2.0f, 3.0f);
+                }
+
+                auto baseOff = juce::Colour (0xff252525);
+                auto baseOn = accentOrange.withAlpha (0.32f).interpolatedWith (juce::Colour (0xff252525), 0.45f);
+                auto base = baseOff.interpolatedWith (baseOn, clampedPos);
+                base = base.brighter (0.05f * hover);
 
                 fillRoundedGradient (g, bounds, base.brighter (0.03f), base.darker (0.08f), 8.0f);
-                g.setColour (isMouseOverButton ? accentOrange.withAlpha (0.35f) : borderDark);
+                g.setColour (borderDark.interpolatedWith (accentOrange.withAlpha (0.35f), std::max (clampedPos, hover)));
                 g.drawRoundedRectangle (bounds, 8.0f, 1.0f);
-                g.setColour (isMouseOverButton ? accentOrange.withAlpha (0.12f) : juce::Colours::white.withAlpha (0.05f));
+                g.setColour (juce::Colours::white.withAlpha (0.05f).interpolatedWith (accentOrange.withAlpha (0.12f), std::max (clampedPos, hover)));
                 g.drawRoundedRectangle (bounds.reduced (1.0f), 7.0f, 1.0f);
 
-                auto slot = juce::Rectangle<float> (12.0f, 4.0f).withCentre ({ bounds.getCentreX(), bounds.getY() + 7.5f });
-                const auto slotTop = button.getToggleState() ? accentOrange.brighter (0.22f) : blackPanel.brighter (0.08f);
-                const auto slotBottom = button.getToggleState() ? accentOrange.darker (0.18f) : blackPanel.darker (0.25f);
-                fillRoundedGradient (g, slot, slotTop, slotBottom, 2.0f);
+                // Draw circular LED
+                float ledRadius = 3.5f;
+                auto ledCentre = juce::Point<float> (bounds.getCentreX(), bounds.getY() + 11.0f);
+                auto ledBounds = juce::Rectangle<float> (ledRadius * 2.0f, ledRadius * 2.0f).withCentre (ledCentre);
+
+                // LED Outer Glow (bloom) when ON
+                if (clampedPos > 0.01f)
+                {
+                    g.setColour (accentOrange.withAlpha (0.45f * clampedPos));
+                    g.fillEllipse (ledBounds.expanded (3.0f * clampedPos));
+                }
+
+                // LED Base color
+                auto ledOff = juce::Colour (0xff1a1a1a);
+                auto ledOn = accentOrange.brighter (0.2f);
+                auto ledColor = ledOff.interpolatedWith (ledOn, clampedPos);
+
+                fillRoundedGradient (g, ledBounds, ledColor.brighter (0.15f), ledColor.darker (0.15f), ledRadius);
+
+                // LED Inner shine
+                if (clampedPos > 0.1f)
+                {
+                    auto shineBounds = juce::Rectangle<float> (2.0f, 2.0f).withCentre ({ ledCentre.x - 1.0f, ledCentre.y - 1.0f });
+                    g.setColour (juce::Colours::white.withAlpha (0.7f * clampedPos));
+                    g.fillEllipse (shineBounds);
+                }
+
+                // LED Border / housing
                 g.setColour (juce::Colours::black.withAlpha (0.6f));
-                g.drawRoundedRectangle (slot, 2.0f, 1.0f);
+                g.drawEllipse (ledBounds, 1.0f);
+
+                // Tactile Click Ripple
+                if (ripple > 0.01f)
+                {
+                    auto center = bounds.getCentre();
+                    float maxRadius = std::max (bounds.getWidth(), bounds.getHeight()) * 0.7f;
+                    float currentRadius = maxRadius * (1.0f - ripple);
+                    float rippleAlpha = ripple * 0.35f;
+                    g.setColour (accentOrange.withAlpha (rippleAlpha));
+                    g.drawEllipse (center.x - currentRadius, center.y - currentRadius,
+                                   currentRadius * 2.0f, currentRadius * 2.0f, 1.5f + 2.0f * ripple);
+                }
                 return;
             }
 
             if (style == "utilitySync")
             {
-                if (isMouseOverButton)
-                    drawSoftDropShadow (g, bounds, 8.0f, false, 3.0f, 0.0f, 12.0f, accentOrange);
-                else
-                    drawSoftDropShadow (g, bounds, 8.0f, false, 1.2f, 2.0f, 3.0f);
+                float position = button.getToggleState() ? 1.0f : 0.0f;
+                float ripple = 0.0f;
+                float hover = getHoverAlpha (button, isMouseOverButton);
+                if (auto* animatedButton = dynamic_cast<SmoothAnimatedSwitchButton*> (&button))
+                {
+                    position = animatedButton->getCurrentAnimationPosition();
+                    ripple = animatedButton->getClickRipple();
+                }
+                float clampedPos = juce::jlimit (0.0f, 1.0f, position);
 
-                auto base = juce::Colour (0xff252525);
-                if (button.getToggleState())
-                    base = accentOrange.withAlpha (0.32f).interpolatedWith (juce::Colour (0xff252525), 0.45f);
-                if (isMouseOverButton)
-                    base = base.brighter (0.05f);
+                if (hover > 0.01f || clampedPos > 0.01f)
+                {
+                    const float glowAlpha = hover * 0.15f + 0.85f * clampedPos;
+                    drawSoftDropShadow (g, bounds, 8.0f, false, 1.2f + 1.8f * clampedPos, 2.0f * (1.0f - clampedPos), 3.0f + 9.0f * clampedPos, accentOrange.withAlpha (glowAlpha));
+                }
+                else
+                {
+                    drawSoftDropShadow (g, bounds, 8.0f, false, 1.2f, 2.0f, 3.0f);
+                }
+
+                auto baseOff = juce::Colour (0xff252525);
+                auto baseOn = accentOrange.withAlpha (0.32f).interpolatedWith (juce::Colour (0xff252525), 0.45f);
+                auto base = baseOff.interpolatedWith (baseOn, clampedPos);
+                base = base.brighter (0.05f * hover);
 
                 fillRoundedGradient (g, bounds, base.brighter (0.02f), base.darker (0.06f), 8.0f);
-                g.setColour (isMouseOverButton ? accentOrange.withAlpha (0.35f) : borderDark);
+                g.setColour (borderDark.interpolatedWith (accentOrange.withAlpha (0.35f), std::max (clampedPos, hover)));
                 g.drawRoundedRectangle (bounds, 8.0f, 1.0f);
-                g.setColour (isMouseOverButton ? accentOrange.withAlpha (0.12f) : juce::Colours::white.withAlpha (0.05f));
+                g.setColour (juce::Colours::white.withAlpha (0.05f).interpolatedWith (accentOrange.withAlpha (0.12f), std::max (clampedPos, hover)));
                 g.drawRoundedRectangle (bounds.reduced (1.0f), 7.0f, 1.0f);
 
-                auto slot = juce::Rectangle<float> (16.0f, 4.0f).withCentre ({ bounds.getCentreX(), bounds.getY() + 10.0f });
-                const auto slotTop = button.getToggleState() ? accentOrange.brighter (0.22f) : blackPanel.brighter (0.08f);
-                const auto slotBottom = button.getToggleState() ? accentOrange.darker (0.18f) : blackPanel.darker (0.25f);
-                fillRoundedGradient (g, slot, slotTop, slotBottom, 2.0f);
-                g.setColour (juce::Colours::black.withAlpha (0.65f));
-                g.drawRoundedRectangle (slot, 2.0f, 1.0f);
+                // Draw circular LED
+                float ledRadius = 4.0f;
+                auto ledCentre = juce::Point<float> (bounds.getCentreX(), bounds.getY() + 14.0f);
+                auto ledBounds = juce::Rectangle<float> (ledRadius * 2.0f, ledRadius * 2.0f).withCentre (ledCentre);
+
+                // LED Outer Glow (bloom) when ON
+                if (clampedPos > 0.01f)
+                {
+                    g.setColour (accentOrange.withAlpha (0.45f * clampedPos));
+                    g.fillEllipse (ledBounds.expanded (4.0f * clampedPos));
+                }
+
+                // LED Base color
+                auto ledOff = juce::Colour (0xff1a1a1a);
+                auto ledOn = accentOrange.brighter (0.2f);
+                auto ledColor = ledOff.interpolatedWith (ledOn, clampedPos);
+
+                fillRoundedGradient (g, ledBounds, ledColor.brighter (0.15f), ledColor.darker (0.15f), ledRadius);
+
+                // LED Inner shine
+                if (clampedPos > 0.1f)
+                {
+                    auto shineBounds = juce::Rectangle<float> (2.0f, 2.0f).withCentre ({ ledCentre.x - 1.0f, ledCentre.y - 1.0f });
+                    g.setColour (juce::Colours::white.withAlpha (0.7f * clampedPos));
+                    g.fillEllipse (shineBounds);
+                }
+
+                // LED Border / housing
+                g.setColour (juce::Colours::black.withAlpha (0.6f));
+                g.drawEllipse (ledBounds, 1.0f);
+
+                // Tactile Click Ripple
+                if (ripple > 0.01f)
+                {
+                    auto center = bounds.getCentre();
+                    float maxRadius = std::max (bounds.getWidth(), bounds.getHeight()) * 0.7f;
+                    float currentRadius = maxRadius * (1.0f - ripple);
+                    float rippleAlpha = ripple * 0.35f;
+                    g.setColour (accentOrange.withAlpha (rippleAlpha));
+                    g.drawEllipse (center.x - currentRadius, center.y - currentRadius,
+                                   currentRadius * 2.0f, currentRadius * 2.0f, 1.5f + 2.0f * ripple);
+                }
                 return;
             }
 
@@ -431,45 +754,60 @@ public:
                 g.setGradientFill (innerShadow);
                 g.fillRoundedRectangle (trackBounds.reduced (1.0f), 3.0f);
 
-                if (button.getToggleState())
+                float position = button.getToggleState() ? 1.0f : 0.0f;
+                float hover = getHoverAlpha (button, isMouseOverButton);
+                if (auto* animatedButton = dynamic_cast<SmoothAnimatedSwitchButton*> (&button))
                 {
-                    g.setColour (accentOrange.withAlpha (0.15f));
+                    position = animatedButton->getCurrentAnimationPosition();
+                }
+
+                float clampedPos = juce::jlimit (0.0f, 1.0f, position);
+
+                if (clampedPos > 0.0f)
+                {
+                    g.setColour (accentOrange.withAlpha (0.15f * clampedPos));
                     g.fillRoundedRectangle (trackBounds.reduced (1.0f), 3.0f);
                 }
 
                 auto thumbWidth = trackBounds.getWidth() * 0.5f;
                 auto thumbBounds = trackBounds.withWidth (thumbWidth).reduced (1.0f);
                 
-                if (button.getToggleState())
-                    thumbBounds.setX (trackBounds.getRight() - thumbWidth + 1.0f);
-                else
-                    thumbBounds.setX (trackBounds.getX() + 1.0f);
+                // Allow a tiny bounce beyond track bounds (mechanical impact feel)
+                float drawPosForThumb = juce::jlimit (-0.03f, 1.03f, position);
+                float startX = trackBounds.getX() + 1.0f;
+                float endX = trackBounds.getRight() - thumbWidth + 1.0f;
+                float currentX = startX + (endX - startX) * drawPosForThumb;
+                thumbBounds.setX (currentX);
 
-                auto thumbColour = button.getToggleState() ? accentOrange.darker(0.1f) : juce::Colour(0xff444444);
-                if (isMouseOverButton)
-                    thumbColour = thumbColour.brighter (0.1f);
+                auto offThumbColour = juce::Colour (0xff444444);
+                auto onThumbColour = accentOrange.darker (0.1f);
+                auto thumbColour = offThumbColour.interpolatedWith (onThumbColour, clampedPos);
+                thumbColour = thumbColour.brighter (0.1f * hover);
 
                 juce::ColourGradient thumbGrad (thumbColour.brighter (0.1f), thumbBounds.getCentreX(), thumbBounds.getY(),
                                                 thumbColour.darker (0.2f), thumbBounds.getCentreX(), thumbBounds.getBottom(), false);
                 g.setGradientFill (thumbGrad);
                 g.fillRoundedRectangle (thumbBounds, 3.0f);
 
-                g.setColour (button.getToggleState() ? accentOrange.brighter(0.2f) : borderLight.brighter(0.2f));
+                auto offBorderColour = borderLight.brighter (0.2f);
+                auto onBorderColour = accentOrange.brighter (0.2f);
+                g.setColour (offBorderColour.interpolatedWith (onBorderColour, clampedPos));
                 g.drawRoundedRectangle (thumbBounds, 3.0f, 1.0f);
 
                 g.setColour (juce::Colours::black.withAlpha (0.6f));
                 float centreX = thumbBounds.getCentreX();
                 float gripY = thumbBounds.getY() + 3.0f;
                 float gripH = thumbBounds.getHeight() - 6.0f;
-                g.fillRect (centreX - 2.0f, gripY, 1.0f, gripH);
-                g.fillRect (centreX, gripY, 1.0f, gripH);
-                g.fillRect (centreX + 2.0f, gripY, 1.0f, gripH);
+                g.fillRect (juce::Rectangle<float> (centreX - 2.0f, gripY, 1.0f, gripH));
+                g.fillRect (juce::Rectangle<float> (centreX, gripY, 1.0f, gripH));
+                g.fillRect (juce::Rectangle<float> (centreX + 2.0f, gripY, 1.0f, gripH));
 
                 return;
             }
 
-            if (isMouseOverButton)
-                drawSoftDropShadow (g, bounds, 4.0f, false, 3.0f, 0.0f, 12.0f, accentOrange);
+            float hover = getHoverAlpha (button, isMouseOverButton);
+            if (hover > 0.01f)
+                drawSoftDropShadow (g, bounds, 4.0f, false, 1.3f + 1.7f * hover, 2.0f * (1.0f - hover), 3.0f + 9.0f * hover, accentOrange.withAlpha (hover));
             else
                 drawSoftDropShadow (g, bounds, 4.0f, false, 1.3f, 2.0f, 3.0f);
 
@@ -477,9 +815,9 @@ public:
                                            juce::Colour (0xff1c1c1c), bounds.getCentreX(), bounds.getBottom(), false);
             g.setGradientFill (gradient);
             g.fillRoundedRectangle (bounds, 4.0f);
-            g.setColour (isMouseOverButton ? accentOrange.withAlpha (0.35f) : borderDark);
+            g.setColour (borderDark.interpolatedWith (accentOrange.withAlpha (0.35f), hover));
             g.drawRoundedRectangle (bounds, 4.0f, 1.0f);
-            g.setColour (isMouseOverButton ? accentOrange.withAlpha (0.12f) : juce::Colours::white.withAlpha (0.05f));
+            g.setColour (juce::Colours::white.withAlpha (0.05f).interpolatedWith (accentOrange.withAlpha (0.12f), hover));
             g.drawRoundedRectangle (bounds.reduced (1.0f), 3.0f, 1.0f);
             return;
         }
@@ -488,24 +826,23 @@ public:
         auto corner = juce::jlimit (4.0f, 10.0f, bounds.getHeight() * 0.18f);
 
         auto base = backgroundColour;
-
-        if (isMouseOverButton)
-            base = base.brighter (0.08f);
+        float hover = getHoverAlpha (button, isMouseOverButton);
+        base = base.brighter (0.08f * hover);
 
         if (isButtonDown)
             base = base.darker (0.15f);
 
-        if (isMouseOverButton)
-            drawSoftDropShadow (g, bounds, corner, false, 3.0f, 0.0f, 12.0f, accentOrange);
+        if (hover > 0.01f)
+            drawSoftDropShadow (g, bounds, corner, false, 1.2f + 1.8f * hover, 2.0f * (1.0f - hover), 3.0f + 9.0f * hover, accentOrange.withAlpha (hover));
         else
             drawSoftDropShadow (g, bounds, corner, false, 1.2f, 2.0f, 3.0f);
 
         fillRoundedGradient (g, bounds, base.brighter (0.1f), base.darker (0.28f), corner);
 
-        g.setColour (isMouseOverButton ? accentOrange.withAlpha (0.35f) : borderDark);
+        g.setColour (borderDark.interpolatedWith (accentOrange.withAlpha (0.35f), hover));
         g.drawRoundedRectangle (bounds, corner, 1.0f);
 
-        g.setColour (isMouseOverButton ? accentOrange.withAlpha (0.12f) : juce::Colours::white.withAlpha (0.08f));
+        g.setColour (juce::Colours::white.withAlpha (0.08f).interpolatedWith (accentOrange.withAlpha (0.12f), hover));
         g.drawRoundedRectangle (bounds.reduced (1.0f), juce::jmax (1.0f, corner - 1.0f), 1.0f);
     }
 
@@ -546,15 +883,25 @@ public:
 
         if (style == "halfTime")
         {
-            g.setColour (button.getToggleState() ? textPrimary : juce::Colour (0xff777777));
+            float position = button.getToggleState() ? 1.0f : 0.0f;
+            if (auto* animatedButton = dynamic_cast<SmoothAnimatedSwitchButton*> (&button))
+                position = animatedButton->getCurrentAnimationPosition();
+            float clampedPos = juce::jlimit (0.0f, 1.0f, position);
+
+            auto textOff = juce::Colour (0xff777777);
+            auto textOn = textPrimary;
+            g.setColour (textOff.interpolatedWith (textOn, clampedPos));
             g.setFont (heavyFont (8.0f));
-            g.drawFittedText (button.getButtonText(), bounds.withTrimmedTop (10), juce::Justification::centred, 2);
+            g.drawFittedText (button.getButtonText(), bounds.withTrimmedTop (18), juce::Justification::centred, 2);
             return;
         }
 
         if (style == "flatAction")
         {
-            g.setColour (juce::Colour (0xff99a1af));
+            float hover = getHoverAlpha (button, false);
+            auto textOff = juce::Colour (0xff99a1af);
+            auto textOn = textPrimary;
+            g.setColour (textOff.interpolatedWith (textOn, hover));
             g.setFont (heavyFont (14.0f));
             g.drawFittedText (button.getButtonText(), bounds, juce::Justification::centred, 1);
             return;
@@ -562,8 +909,10 @@ public:
 
         if (style == "helpButton")
         {
-            g.setColour (button.findColour (button.getToggleState() ? juce::TextButton::textColourOnId
-                                                                     : juce::TextButton::textColourOffId));
+            float hover = getHoverAlpha (button, false);
+            auto baseColour = button.findColour (button.getToggleState() ? juce::TextButton::textColourOnId
+                                                                         : juce::TextButton::textColourOffId);
+            g.setColour (baseColour.interpolatedWith (accentOrange, hover));
             g.setFont (heavyFont (18.0f));
             g.drawFittedText (button.getButtonText(), bounds.translated (0, -1), juce::Justification::centred, 1);
             return;
@@ -571,9 +920,16 @@ public:
 
         if (style == "utilitySync")
         {
-            g.setColour (button.getToggleState() ? textPrimary : juce::Colour (0xff777777));
+            float position = button.getToggleState() ? 1.0f : 0.0f;
+            if (auto* animatedButton = dynamic_cast<SmoothAnimatedSwitchButton*> (&button))
+                position = animatedButton->getCurrentAnimationPosition();
+            float clampedPos = juce::jlimit (0.0f, 1.0f, position);
+
+            auto textOff = juce::Colour (0xff777777);
+            auto textOn = textPrimary;
+            g.setColour (textOff.interpolatedWith (textOn, clampedPos));
             g.setFont (heavyFont (10.0f));
-            g.drawFittedText (button.getButtonText(), bounds.withTrimmedTop (18), juce::Justification::centred, 2);
+            g.drawFittedText (button.getButtonText(), bounds.withTrimmedTop (24), juce::Justification::centred, 2);
             return;
         }
 
@@ -584,7 +940,8 @@ public:
 
         if (style == "waveScaleStep")
         {
-            g.setColour (textPrimary.withAlpha (0.9f));
+            float hover = getHoverAlpha (button, false);
+            g.setColour (textPrimary.withAlpha (0.9f).interpolatedWith (accentOrange, hover));
             g.setFont (heavyFont (20.0f));
             g.drawFittedText (button.getButtonText(), bounds.translated (0, -1),
                               juce::Justification::centred, 1);
@@ -592,31 +949,41 @@ public:
         }
 
         auto fontSize = juce::jlimit (7.0f, 15.0f, (float) bounds.getHeight() * 0.32f);
-
-        g.setColour (button.findColour (button.getToggleState() ? juce::TextButton::textColourOnId
-                                                                 : juce::TextButton::textColourOffId));
+        float hover = getHoverAlpha (button, false);
+        auto baseColor = button.findColour (button.getToggleState() ? juce::TextButton::textColourOnId
+                                                                     : juce::TextButton::textColourOffId);
+        g.setColour (baseColor.interpolatedWith (accentOrange, hover));
         g.setFont (heavyFont (fontSize));
         g.drawFittedText (button.getButtonText(), bounds, juce::Justification::centred, 2);
+    }
+
+    float getSliderHoverAlpha (juce::Slider& slider, bool isMouseOverOrDragging)
+    {
+        if (auto* optSlider = dynamic_cast<OptResetSlider*> (&slider))
+            return optSlider->getHoverAlpha();
+        return isMouseOverOrDragging ? 1.0f : 0.0f;
     }
 
     void drawRotarySlider (juce::Graphics& g, int x, int y, int width, int height,
                            float sliderPosProportional, float rotaryStartAngle,
                            float rotaryEndAngle, juce::Slider& slider) override
     {
+        bool isMouseOverOrDragging = slider.isMouseOverOrDragging();
+        float hover = getSliderHoverAlpha (slider, isMouseOverOrDragging);
+
         if (getCueStyle (slider) == "effectSquareKnob")
         {
             juce::ignoreUnused (rotaryStartAngle, rotaryEndAngle);
 
             auto bounds = juce::Rectangle<float> ((float) x, (float) y, (float) width, (float) height).reduced (4.0f);
 
-            bool isHovered = slider.isMouseOverOrDragging();
-            if (isHovered)
-                drawSoftDropShadow (g, bounds, 0.0f, true, 2.5f, 0.0f, 9.0f, accentOrange);
+            if (hover > 0.01f)
+                drawSoftDropShadow (g, bounds, 0.0f, true, 1.2f + 1.3f * hover, 2.0f * (1.0f - hover), 3.0f + 6.0f * hover, accentOrange.withAlpha (hover));
             else
                 drawSoftDropShadow (g, bounds, 0.0f, true, 1.2f, 2.0f, 3.0f);
 
             fillEllipseGradient (g, bounds, borderMid.darker (0.18f), borderDark.darker (0.35f));
-            g.setColour (isHovered ? accentOrange.withAlpha (0.22f) : juce::Colours::white.withAlpha (0.06f));
+            g.setColour (juce::Colours::white.withAlpha (0.06f).interpolatedWith (accentOrange.withAlpha (0.22f), hover));
             g.drawEllipse (bounds.reduced (0.6f), 1.0f);
 
             auto innerCircle = bounds.reduced (4.0f);
@@ -626,8 +993,8 @@ public:
 
             auto pointerCentre = innerCircle.getCentre();
             auto localAngle = juce::jmap (sliderPosProportional, 0.0f, 1.0f,
-                                          -juce::MathConstants<float>::pi * 0.8f,
-                                          juce::MathConstants<float>::pi * 0.8f);
+                                           -juce::MathConstants<float>::pi * 0.8f,
+                                           juce::MathConstants<float>::pi * 0.8f);
 
             float radius = innerCircle.getWidth() * 0.5f;
             float indicatorLength = radius * 0.55f;
@@ -665,14 +1032,13 @@ public:
         {
             auto bounds = juce::Rectangle<float> ((float) x, (float) y, (float) width, (float) height).reduced (4.0f);
 
-            bool isHovered = slider.isMouseOverOrDragging();
-            if (isHovered)
-                drawSoftDropShadow (g, bounds, 0.0f, true, 2.5f, 0.0f, 9.0f, accentOrange);
+            if (hover > 0.01f)
+                drawSoftDropShadow (g, bounds, 0.0f, true, 1.2f + 1.3f * hover, 2.0f * (1.0f - hover), 3.0f + 6.0f * hover, accentOrange.withAlpha (hover));
             else
                 drawSoftDropShadow (g, bounds, 0.0f, true, 1.2f, 2.0f, 3.0f);
 
             fillEllipseGradient (g, bounds, borderMid.darker (0.18f), borderDark.darker (0.35f));
-            g.setColour (isHovered ? accentOrange.withAlpha (0.22f) : juce::Colours::white.withAlpha (0.05f));
+            g.setColour (juce::Colours::white.withAlpha (0.05f).interpolatedWith (accentOrange.withAlpha (0.22f), hover));
             g.drawEllipse (bounds.reduced (0.6f), 1.0f);
 
             auto innerCircle = bounds.reduced (4.0f);
@@ -721,14 +1087,13 @@ public:
             auto bounds = juce::Rectangle<float> ((float) x, (float) y, (float) width, (float) height).reduced (4.0f);
             auto accent = getCueAccent (slider, accentOrange);
 
-            bool isHovered = slider.isMouseOverOrDragging();
-            if (isHovered)
-                drawSoftDropShadow (g, bounds, 0.0f, true, 2.5f, 0.0f, 9.0f, accent);
+            if (hover > 0.01f)
+                drawSoftDropShadow (g, bounds, 0.0f, true, 1.2f + 1.3f * hover, 2.0f * (1.0f - hover), 3.0f + 6.0f * hover, accent.withAlpha (hover));
             else
                 drawSoftDropShadow (g, bounds, 0.0f, true, 1.2f, 2.0f, 3.0f);
 
             fillEllipseGradient (g, bounds, borderMid.darker (0.18f), borderDark.darker (0.35f));
-            g.setColour (isHovered ? accent.withAlpha (0.22f) : juce::Colours::white.withAlpha (0.06f));
+            g.setColour (juce::Colours::white.withAlpha (0.06f).interpolatedWith (accent.withAlpha (0.22f), hover));
             g.drawEllipse (bounds.reduced (0.6f), 1.0f);
 
             auto innerCircle = bounds.reduced (4.0f);
@@ -774,15 +1139,14 @@ public:
 
         auto bounds = juce::Rectangle<float> ((float) x, (float) y, (float) width, (float) height).reduced (3.0f);
 
-        bool isHovered = slider.isMouseOverOrDragging();
-        if (isHovered)
-            drawSoftDropShadow (g, bounds, 0.0f, true, 2.5f, 0.0f, 9.0f, accentOrange);
+        if (hover > 0.01f)
+            drawSoftDropShadow (g, bounds, 0.0f, true, 1.2f + 1.3f * hover, 2.0f * (1.0f - hover), 3.0f + 6.0f * hover, accentOrange.withAlpha (hover));
         else
             drawSoftDropShadow (g, bounds, 0.0f, true, 1.2f, 2.0f, 3.0f);
 
         fillEllipseGradient (g, bounds, borderMid.darker (0.18f), borderDark.darker (0.35f));
 
-        g.setColour (isHovered ? accentOrange.withAlpha (0.22f) : juce::Colours::white.withAlpha (0.06f));
+        g.setColour (juce::Colours::white.withAlpha (0.06f).interpolatedWith (accentOrange.withAlpha (0.22f), hover));
         g.drawEllipse (bounds.reduced (0.6f), 1.0f);
 
         auto inner = bounds.reduced (4.0f);
@@ -820,31 +1184,6 @@ public:
             g.strokePath (meterArc, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
         }
     }
-};
-
-class OptResetSlider final : public juce::Slider
-{
-public:
-    void captureCurrentValueAsDefault() noexcept
-    {
-        defaultValue = getValue();
-        hasDefaultValue = true;
-    }
-
-    void mouseDown (const juce::MouseEvent& event) override
-    {
-        if (hasDefaultValue && event.mods.isAltDown())
-        {
-            setValue (defaultValue, juce::sendNotificationSync);
-            return;
-        }
-
-        juce::Slider::mouseDown (event);
-    }
-
-private:
-    double defaultValue = 0.0;
-    bool hasDefaultValue = false;
 };
 
 class LabelledKnob final : public juce::Component
@@ -1360,7 +1699,7 @@ private:
     }
 
     AudioPluginAudioProcessor& processor;
-    juce::TextButton helpButton;
+    SmoothHoverButton helpButton;
     juce::Image logoImage;
 };
 
@@ -1368,13 +1707,14 @@ class WaveformDisplayComponent final : public juce::Component,
                                         public juce::ChangeListener,
                                         public juce::FileDragAndDropTarget,
                                         public juce::SettableTooltipClient,
+                                        private juce::ScrollBar::Listener,
                                         private juce::Timer
 {
 public:
     WaveformDisplayComponent (AudioPluginAudioProcessor& p)
-        : processor (p)
+        : processor (p),
+          horizontalScrollBar (false)
     {
-        setBufferedToImage (true);
         setTooltip ("Click a chop to select and preview it.  Double-click to toggle favourite (pink highlight).  "
                     "Drag a selected chop edge to resize the grid and update tempo.  "
                     "Shift-drag a selected chop edge to snap that edge to the nearest bar without changing tempo.  "
@@ -1396,12 +1736,17 @@ public:
         verticalPlusButton .getProperties().set ("cueStyle", "waveScaleStep");
         addAndMakeVisible (verticalMinusButton);
         addAndMakeVisible (verticalPlusButton);
+
+        horizontalScrollBar.addListener (this);
+        horizontalScrollBar.setAlwaysOnTop (true);
+        addAndMakeVisible (horizontalScrollBar);
     }
 
     ~WaveformDisplayComponent() override
     {
         processor.sampleChangeBroadcaster.removeChangeListener (this);
         processor.editChangeBroadcaster.removeChangeListener (this);
+        horizontalScrollBar.removeListener (this);
     }
 
     void changeListenerCallback (juce::ChangeBroadcaster* source) override
@@ -1409,13 +1754,14 @@ public:
         if (source == &processor.sampleChangeBroadcaster)
         {
             isSelectingAnalysisRegion = false;
-            waveformVerticalScale = defaultWaveformVerticalScale;
+            targetZoomLevel = zoomLevel = 0.0f;
+            targetScrollPosition = scrollPosition = 0.0f;
+            targetWaveformVerticalScale = waveformVerticalScale = defaultWaveformVerticalScale;
             updatePeakCache();
             rebuildWaveformPath();
+            updateHorizontalScrollBar();
         }
-        setBufferedToImage (false);  // force repaint
         repaint();
-        setBufferedToImage (true);
     }
 
     // ---- FileDragAndDropTarget ----
@@ -1499,9 +1845,7 @@ public:
                 edgeDragBarSnap   = event.mods.isShiftDown();
                 edgeDragLiveSample = sampleForDisplayPosition (event.position.x);
                 setMouseCursor (juce::MouseCursor::LeftRightResizeCursor);
-                setBufferedToImage (false);
                 repaint();
-                setBufferedToImage (true);
                 return;
             }
         }
@@ -1656,9 +2000,7 @@ public:
         }
 
         edgeDragLiveSample = newSample;
-        setBufferedToImage (false);
         repaint();
-        setBufferedToImage (true);
     }
 
     void commitEdgeDrag()
@@ -2018,9 +2360,7 @@ public:
         {
             commitEdgeDrag();
             updateCursorForMode (event.position);
-            setBufferedToImage (false);
             repaint();
-            setBufferedToImage (true);
             return;
         }
 
@@ -2085,12 +2425,9 @@ public:
                 const double newOffset    = cursorSample - relPos * (double) juce::jmax (1, newVisible - 1);
                 const float newScroll     = juce::jlimit (0.0f, 1.0f, (float) (newOffset / (double) newMaxOffset));
 
-                zoomLevel      = newZoom;
-                scrollPosition = newScroll;
-                rebuildWaveformPath();
-                setBufferedToImage (false);
-                repaint();
-                setBufferedToImage (true);
+                setZoom (newZoom);
+                setScroll (newScroll);
+                // Handled smoothly by timerCallback
 
                 if (onZoomChanged)   onZoomChanged   (newZoom);
                 if (onScrollChanged) onScrollChanged (newScroll);
@@ -2411,40 +2748,72 @@ public:
         const int xMinus = xPlus - btnGap - btnSize;
         verticalMinusButton.setBounds (xMinus, yTop, btnSize, btnSize);
         verticalPlusButton .setBounds (xPlus,  yTop, btnSize, btnSize);
+
+        horizontalScrollBar.setBounds (getHorizontalScrollBarBounds().toNearestInt());
+        updateHorizontalScrollBar();
     }
 
     void setZoom (float newZoom)
     {
-        zoomLevel = juce::jlimit (0.0f, 1.0f, newZoom);
-        rebuildWaveformPath();
-        setBufferedToImage (false);
-        repaint();
-        setBufferedToImage (true);
+        targetZoomLevel = juce::jlimit (0.0f, 1.0f, newZoom);
+        if (! isShowing())
+            zoomLevel = targetZoomLevel;
     }
 
     void setScroll (float newScroll)
     {
-        scrollPosition = juce::jlimit (0.0f, 1.0f, newScroll);
-        rebuildWaveformPath();
-        setBufferedToImage (false);
-        repaint();
-        setBufferedToImage (true);
+        targetScrollPosition = juce::jlimit (0.0f, 1.0f, newScroll);
+        if (! isShowing())
+            scrollPosition = targetScrollPosition;
     }
 
     std::function<void(float)> onZoomChanged;
     std::function<void(float)> onScrollChanged;
 
 private:
+    juce::Rectangle<float> getHorizontalScrollBarBounds() const
+    {
+        auto display = getDisplayBounds();
+        // Sits beautifully at the bottom of the display bounds
+        return { display.getX() + 4.0f, display.getBottom() - 14.0f, display.getWidth() - 8.0f, 10.0f };
+    }
+
+    void updateHorizontalScrollBar()
+    {
+        const auto sampleData = processor.getLoadedSample();
+        if (sampleData == nullptr || sampleData->buffer.getNumSamples() <= 0)
+        {
+            horizontalScrollBar.setVisible (false);
+            return;
+        }
+
+        const auto numSamples = sampleData->buffer.getNumSamples();
+        const auto visibleRange = getVisibleRange (numSamples);
+        const double visibleProportion = juce::jlimit (0.02, 1.0,
+            (double) visibleRange.visibleSamples / (double) numSamples);
+
+        const bool shouldBeVisible = visibleProportion < 0.99;
+        horizontalScrollBar.setVisible (shouldBeVisible);
+
+        if (shouldBeVisible)
+        {
+            updatingHorizontalScrollBar = true;
+            const double maxRangeStart = juce::jmax (0.0, 1.0 - visibleProportion);
+            const double currentRangeStart = scrollPosition * maxRangeStart;
+            horizontalScrollBar.setRangeLimits (0.0, 1.0);
+            horizontalScrollBar.setCurrentRange (currentRangeStart, visibleProportion);
+            updatingHorizontalScrollBar = false;
+        }
+    }
+
     void stepWaveformVerticalScale (float delta)
     {
-        const float next = juce::jlimit (0.25f, 4.0f, waveformVerticalScale + delta);
-        if (std::abs (next - waveformVerticalScale) < 1.0e-4f)
+        const float next = juce::jlimit (0.25f, 4.0f, targetWaveformVerticalScale + delta);
+        if (std::abs (next - targetWaveformVerticalScale) < 1.0e-4f)
             return;
-        waveformVerticalScale = next;
-        rebuildWaveformPath();
-        setBufferedToImage (false);
-        repaint();
-        setBufferedToImage (true);
+        targetWaveformVerticalScale = next;
+        if (! isShowing())
+            waveformVerticalScale = targetWaveformVerticalScale;
     }
 
     void initiateChopExportDrag (int chopId)
@@ -2475,9 +2844,7 @@ private:
 
         exportDragReady = false;
         setMouseCursor (juce::MouseCursor::NormalCursor);
-        setBufferedToImage (false);
         repaint();
-        setBufferedToImage (true);
     }
 
     void timerCallback() override
@@ -2495,13 +2862,92 @@ private:
             {
                 exportDragReady = true;
                 setMouseCursor (juce::MouseCursor::DraggingHandCursor);
-                setBufferedToImage (false);
                 repaint();
-                setBufferedToImage (true);
             }
         }
 
-        followTriggeredChopIfNeeded();
+        // Trigger pulse animation check
+        const auto triggerRevision = processor.getChopTriggerRevision();
+        if (triggerRevision != lastObservedChopTriggerRevision)
+        {
+            lastObservedChopTriggerRevision = triggerRevision;
+            const int triggeredId = processor.getLastTriggeredChopId();
+            if (triggeredId >= 0)
+                chopAnimations[triggeredId].currentTriggerPulse = 1.0f; // Strike pulse!
+            
+            scrollToChop (triggeredId, true); // Scroll exactly and instantly
+        }
+
+        // Animate scroll, zoom, and vertical scale (warning-free)
+        bool zoomChanged = false;
+        if (std::abs (zoomLevel - targetZoomLevel) > 0.0001f)
+        {
+            zoomLevel += (targetZoomLevel - zoomLevel) * 0.18f;
+            if (std::abs (zoomLevel - targetZoomLevel) <= 0.0001f)
+                zoomLevel = targetZoomLevel;
+            zoomChanged = true;
+        }
+
+        bool scrollChanged = false;
+        if (std::abs (scrollPosition - targetScrollPosition) > 0.0001f)
+        {
+            scrollPosition += (targetScrollPosition - scrollPosition) * 0.18f;
+            if (std::abs (scrollPosition - targetScrollPosition) <= 0.0001f)
+                scrollPosition = targetScrollPosition;
+            scrollChanged = true;
+        }
+
+        bool vertScaleChanged = false;
+        if (std::abs (waveformVerticalScale - targetWaveformVerticalScale) > 0.0001f)
+        {
+            waveformVerticalScale += (targetWaveformVerticalScale - waveformVerticalScale) * 0.18f;
+            if (std::abs (waveformVerticalScale - targetWaveformVerticalScale) <= 0.0001f)
+                waveformVerticalScale = targetWaveformVerticalScale;
+            vertScaleChanged = true;
+        }
+
+        if (zoomChanged || scrollChanged || vertScaleChanged)
+        {
+            rebuildWaveformPath();
+            updateHorizontalScrollBar();
+        }
+
+        // Update chop states (hover, selection, trigger decay)
+        bool anyChopAnimationActive = false;
+        if (const auto cs = processor.getChopState())
+        {
+            for (const auto& chop : cs->chops)
+            {
+                auto& anim = chopAnimations[chop.id];
+                
+                const float targetHover = (chop.id == hoveredChopId) ? 1.0f : 0.0f;
+                const float prevHover = anim.currentHoverAlpha;
+                anim.currentHoverAlpha += (targetHover - anim.currentHoverAlpha) * 0.20f;
+                if (std::abs (anim.currentHoverAlpha - targetHover) < 0.005f)
+                    anim.currentHoverAlpha = targetHover;
+
+                const float targetSelect = (chop.id == cs->selectedChopId) ? 1.0f : 0.0f;
+                const float prevSelect = anim.currentSelectAlpha;
+                anim.currentSelectAlpha += (targetSelect - anim.currentSelectAlpha) * 0.20f;
+                if (std::abs (anim.currentSelectAlpha - targetSelect) < 0.005f)
+                    anim.currentSelectAlpha = targetSelect;
+
+                const float prevPulse = anim.currentTriggerPulse;
+                if (anim.currentTriggerPulse > 0.0f)
+                {
+                    anim.currentTriggerPulse -= 0.05f; // decay over 20 frames
+                    if (anim.currentTriggerPulse < 0.0f)
+                        anim.currentTriggerPulse = 0.0f;
+                }
+
+                if (std::abs (anim.currentHoverAlpha - prevHover) > 0.005f
+                    || std::abs (anim.currentSelectAlpha - prevSelect) > 0.005f
+                    || std::abs (anim.currentTriggerPulse - prevPulse) > 0.005f)
+                {
+                    anyChopAnimationActive = true;
+                }
+            }
+        }
 
         const auto currentPlayheadPosition = processor.getPlaybackSamplePosition();
         const auto targetHoverAlpha = isHoveringDisplay ? 1.0f : 0.0f;
@@ -2520,7 +2966,9 @@ private:
                                 || lastTempoUiRevision != processor.getTempoUiRevision()
                                 || isScanning
                                 || exportDragReady
-                                || (holdChopId >= 0 && ! exportDragReady && holdTickCount > 0);
+                                || (holdChopId >= 0 && ! exportDragReady && holdTickCount > 0)
+                                || zoomChanged || scrollChanged || vertScaleChanged
+                                || anyChopAnimationActive;
 
         wasPlayingLastTick = processor.isPlaying();
         lastTempoUiRevision = processor.getTempoUiRevision();
@@ -2618,17 +3066,9 @@ private:
                              nearestBarSeconds * sr);
     }
 
-    void followTriggeredChopIfNeeded()
-    {
-        const auto triggerRevision = processor.getChopTriggerRevision();
-        if (triggerRevision == lastObservedChopTriggerRevision)
-            return;
+    void followTriggeredChopIfNeeded() {}
 
-        lastObservedChopTriggerRevision = triggerRevision;
-        scrollToChop (processor.getLastTriggeredChopId());
-    }
-
-    void scrollToChop (int chopId)
+    void scrollToChop (int chopId, bool forceInstant = false)
     {
         if (chopId < 0)
             return;
@@ -2664,15 +3104,29 @@ private:
         const double chopEnd = (double) juce::jlimit (0, numSamples, targetChop->endSample);
         const double visibleSamples = (double) juce::jmax (1, visibleRange.visibleSamples);
         const double chopLength = juce::jmax (1.0, chopEnd - chopStart);
+
+        const double visibleStart = (double) visibleRange.sampleOffset;
+        const double visibleEnd = visibleStart + visibleSamples;
+        const bool isFullyVisible = (chopStart >= visibleStart && chopEnd <= visibleEnd);
+        const bool isPartiallyVisible = (chopStart < visibleEnd && chopEnd > visibleStart);
+
+        // If the chop is already visible in the viewport, no scrolling is necessary!
+        if (isFullyVisible || (chopLength > visibleSamples && isPartiallyVisible))
+            return;
+
         const double targetOffset = chopLength >= visibleSamples * 0.8
                                   ? chopStart - visibleSamples * 0.1
                                   : ((chopStart + chopEnd) * 0.5) - visibleSamples * 0.5;
         const float targetScroll = juce::jlimit (0.0f, 1.0f, (float) (targetOffset / (double) maxOffset));
 
-        if (std::abs (targetScroll - scrollPosition) < 0.0005f)
-            return;
+        targetScrollPosition = targetScroll;
+        if (forceInstant)
+        {
+            scrollPosition = targetScroll;
+            rebuildWaveformPath();
+            updateHorizontalScrollBar();
+        }
 
-        setScroll (targetScroll);
         if (onScrollChanged)
             onScrollChanged (targetScroll);
     }
@@ -2823,48 +3277,67 @@ private:
             auto chopBounds = juce::Rectangle<float> (juce::jmin (startX, endX), displayBounds.getY(),
                                                       std::abs (endX - startX), displayBounds.getHeight());
 
-            const bool isSelected = chop.id == chopState->selectedChopId;
-            const bool isHovered = chop.id == hoveredChopId;
-            const auto fillColour = isSelected ? juce::Colour (0xff00c950).withAlpha (0.22f)
-                                               : isHovered ? juce::Colour (0xff8fd9ff).withAlpha (0.14f)
-                                                           : juce::Colour (0xff3da5ff).withAlpha (0.08f);
-            const auto lineColour = isSelected ? juce::Colour (0xff00f57a).withAlpha (0.98f)
-                                               : isHovered ? juce::Colour (0xff8fd9ff).withAlpha (0.82f)
-                                                           : juce::Colour (0xff3da5ff).withAlpha (0.55f);
+            auto& anim = chopAnimations[chop.id];
+            const float hoverVal = anim.currentHoverAlpha;
+            const float selectVal = anim.currentSelectAlpha;
+            const float pulseVal = anim.currentTriggerPulse;
+            const bool isSelected = (chop.id == chopState->selectedChopId);
+            const bool isHovered = (chop.id == hoveredChopId);
+
+            const auto baseFill = juce::Colour (0xff3da5ff).withAlpha (0.08f);
+            const auto hoverFill = juce::Colour (0xff8fd9ff).withAlpha (0.14f);
+            const auto selectFill = juce::Colour (0xff00c950).withAlpha (0.22f);
+            const auto fillColour = baseFill.interpolatedWith (hoverFill, hoverVal).interpolatedWith (selectFill, selectVal);
+
+            const auto baseLine = juce::Colour (0xff3da5ff).withAlpha (0.55f);
+            const auto hoverLine = juce::Colour (0xff8fd9ff).withAlpha (0.82f);
+            const auto selectLine = juce::Colour (0xff00f57a).withAlpha (0.98f);
+            const auto lineColour = baseLine.interpolatedWith (hoverLine, hoverVal).interpolatedWith (selectLine, selectVal);
 
             fillRectGradient (g, chopBounds, fillColour.brighter (0.35f), fillColour.darker (0.25f));
 
-            if (isSelected)
+            if (selectVal > 0.01f)
             {
-                fillRectGradient (g, chopBounds.expanded (1.5f, 0.0f),
-                                  juce::Colour (0xff00f57a).withAlpha (0.18f),
-                                  juce::Colour (0xff00f57a).withAlpha (0.08f));
-                g.setColour (juce::Colour (0xff00f57a).withAlpha (0.22f));
-                g.drawRect (chopBounds.expanded (1.0f, -3.0f), 1.5f);
+                fillRectGradient (g, chopBounds.expanded (1.5f * selectVal, 0.0f),
+                                  juce::Colour (0xff00f57a).withAlpha (0.18f * selectVal),
+                                  juce::Colour (0xff00f57a).withAlpha (0.08f * selectVal));
+                g.setColour (juce::Colour (0xff00f57a).withAlpha (0.22f * selectVal));
+                g.drawRect (chopBounds.expanded (1.0f * selectVal, -3.0f), 1.5f);
             }
-            else if (isHovered)
+            else if (hoverVal > 0.01f)
             {
-                fillRectGradient (g, chopBounds.expanded (0.5f, 0.0f),
-                                  juce::Colour (0xff8fd9ff).withAlpha (0.15f),
-                                  juce::Colour (0xff8fd9ff).withAlpha (0.06f));
+                fillRectGradient (g, chopBounds.expanded (0.5f * hoverVal, 0.0f),
+                                  juce::Colour (0xff8fd9ff).withAlpha (0.15f * hoverVal),
+                                  juce::Colour (0xff8fd9ff).withAlpha (0.06f * hoverVal));
             }
 
-            if (isHovered)
+            // Real-Time Trigger Ripple Effect
+            if (pulseVal > 0.01f)
+            {
+                const auto pulseColour = chop.favorite ? juce::Colour (0xffff2db1) : accentOrange;
+                g.setColour (pulseColour.withAlpha (0.35f * pulseVal));
+                g.fillRect (chopBounds);
+
+                g.setColour (pulseColour.withAlpha (0.85f * pulseVal));
+                g.drawRect (chopBounds.expanded (3.0f * (1.0f - pulseVal), 0.0f), 1.5f + 2.0f * pulseVal);
+            }
+
+            if (hoverVal > 0.01f)
             {
                 const float cx = chopBounds.getCentreX();
                 const float cy = chopBounds.getCentreY();
-                const float maxR = juce::jmin (18.0f, chopBounds.getWidth() * 0.38f);
-                if (maxR >= 6.0f)
+                const float maxR = juce::jmin (18.0f, chopBounds.getWidth() * 0.38f) * (0.85f + 0.15f * hoverVal);
+                if (maxR >= 4.0f)
                 {
                     const float triH = maxR * 1.4f;
                     const float triW = maxR * 1.2f;
-                    g.setColour (juce::Colours::black.withAlpha (0.52f));
+                    g.setColour (juce::Colours::black.withAlpha (0.52f * hoverVal));
                     g.fillEllipse (cx - maxR, cy - maxR, maxR * 2.0f, maxR * 2.0f);
                     juce::Path tri;
                     tri.addTriangle (cx - triW * 0.33f, cy - triH * 0.5f,
                                      cx - triW * 0.33f, cy + triH * 0.5f,
                                      cx + triW * 0.67f, cy);
-                    g.setColour (juce::Colours::white.withAlpha (0.92f));
+                    g.setColour (juce::Colours::white.withAlpha (0.92f * hoverVal));
                     g.fillPath (tri);
                 }
             }
@@ -2880,8 +3353,9 @@ private:
                     ? juce::jlimit (0.0f, 1.0f, chop.gainDecibels / 12.0f)
                     : juce::jlimit (-1.0f, 0.0f, chop.gainDecibels / 24.0f);
                 const auto pitchNormalizedValue = juce::jlimit (-1.0f, 1.0f, chop.pitchSemitones / 12.0f);
-                const auto fillAlpha = isSelected ? 0.40f : isHovered ? 0.26f : 0.18f;
-                const auto borderAlpha = isSelected ? 0.8f : isHovered ? 0.55f : 0.38f;
+
+                const float fillAlpha = 0.18f + 0.08f * hoverVal + 0.14f * selectVal;
+                const float borderAlpha = 0.38f + 0.17f * hoverVal + 0.25f * selectVal;
 
                 auto paintOverlayBar = [&] (float normalizedValue, juce::Colour colour, float x)
                 {
@@ -3383,6 +3857,31 @@ private:
         g.drawLine (x, displayBounds.getY() + 4.0f, x, displayBounds.getBottom() - 4.0f, 2.0f);
     }
 
+    void scrollBarMoved (juce::ScrollBar* scrollBar, double newRangeStart) override
+    {
+        if (scrollBar != &horizontalScrollBar || updatingHorizontalScrollBar)
+            return;
+
+        const auto sampleData = processor.getLoadedSample();
+        if (sampleData == nullptr || sampleData->buffer.getNumSamples() <= 0)
+            return;
+
+        const auto visibleRange = getVisibleRange (sampleData->buffer.getNumSamples());
+        const double visibleProportion = juce::jlimit (0.02, 1.0,
+            (double) visibleRange.visibleSamples / (double) sampleData->buffer.getNumSamples());
+        const double maxRangeStart = juce::jmax (0.0, 1.0 - visibleProportion);
+        const float newScroll = maxRangeStart <= 0.0
+                              ? 0.0f
+                              : juce::jlimit (0.0f, 1.0f, (float) (newRangeStart / maxRangeStart));
+
+        scrollPosition = targetScrollPosition = newScroll;
+        rebuildWaveformPath();
+        updateHorizontalScrollBar();
+        repaint();
+        if (onScrollChanged)
+            onScrollChanged (newScroll);
+    }
+
     void rebuildWaveformPath()
     {
         waveformPath.clear();
@@ -3536,10 +4035,23 @@ private:
     bool isSelectingAnalysisRegion = false;
     bool isHoldingToPlay = false;
     float zoomLevel = 0.0f;
+    float targetZoomLevel = 0.0f;
     float scrollPosition = 0.0f;
+    float targetScrollPosition = 0.0f;
     float waveformVerticalScale = defaultWaveformVerticalScale;
-    juce::TextButton verticalMinusButton;
-    juce::TextButton verticalPlusButton;
+    float targetWaveformVerticalScale = defaultWaveformVerticalScale;
+
+    struct ChopAnimationState
+    {
+        float currentHoverAlpha = 0.0f;
+        float currentSelectAlpha = 0.0f;
+        float currentTriggerPulse = 0.0f;
+    };
+    std::map<int, ChopAnimationState> chopAnimations;
+    SmoothHoverButton verticalMinusButton;
+    SmoothHoverButton verticalPlusButton;
+    juce::ScrollBar horizontalScrollBar;
+    bool updatingHorizontalScrollBar = false;
     float hoveredDisplayX = 0.0f;
     int hoveredChopId = -1;
     float hoverAnimationAlpha = 0.0f;
@@ -3655,8 +4167,13 @@ public:
         barsButton.setTooltip ("Sets how many bars each chop covers - cycles 1 / 2 / 4 / 8. Larger = fewer, longer chops.");
         loadButton.setTooltip ("Open a file browser to load a new audio sample (WAV, AIFF, MP3, FLAC, OGG). You can also drag a file onto the waveform.");
 
-        for (auto* button : { &playButton, &pauseButton, &stopButton, &halfSpeedButton,
-                              &chopTransientsButton, &barsButton, &loadButton })
+        for (juce::TextButton* button : { static_cast<juce::TextButton*> (&playButton),
+                                          static_cast<juce::TextButton*> (&pauseButton),
+                                          static_cast<juce::TextButton*> (&stopButton),
+                                          static_cast<juce::TextButton*> (&halfSpeedButton),
+                                          static_cast<juce::TextButton*> (&chopTransientsButton),
+                                          static_cast<juce::TextButton*> (&barsButton),
+                                          static_cast<juce::TextButton*> (&loadButton) })
             addAndMakeVisible (*button);
 
         halfSpeedButton.setToggleState (processor.getHalfTimeEnabled(), juce::dontSendNotification);
@@ -4104,15 +4621,15 @@ private:
     }
 
     AudioPluginAudioProcessor& processor;
-    juce::TextButton playButton;
-    juce::TextButton pauseButton;
-    juce::TextButton stopButton;
-    juce::TextButton halfSpeedButton;
-    juce::TextButton chopTransientsButton;
-    juce::TextButton barsButton;
-    juce::TextButton loadButton;
-    juce::TextButton warpButton;
-    juce::TextButton clearWarpButton;
+    SmoothHoverButton playButton;
+    SmoothHoverButton pauseButton;
+    SmoothHoverButton stopButton;
+    SmoothAnimatedSwitchButton halfSpeedButton;
+    SmoothHoverButton chopTransientsButton;
+    SmoothHoverButton barsButton;
+    SmoothHoverButton loadButton;
+    SmoothHoverButton warpButton;
+    SmoothHoverButton clearWarpButton;
     juce::ComboBox   warpDivisionCombo;
 
     DisplayBox timeDisplay;
@@ -4215,7 +4732,7 @@ public:
     }
 
 private:
-    juce::TextButton syncButton;
+    SmoothAnimatedSwitchButton syncButton;
     LabelledKnob zoomKnob;
     LabelledKnob scrollKnob;
     LabelledKnob tempoKnob;
@@ -4269,20 +4786,40 @@ public:
                                                     markerSize,
                                                     markerSize);
 
-        if (switchButton.getToggleState())
+        float position = switchButton.getToggleState() ? 1.0f : 0.0f;
+        if (auto* animatedButton = dynamic_cast<SmoothAnimatedSwitchButton*> (&switchButton))
         {
-            drawSoftDropShadow (g, markerBounds, 0.0f, true, 2.4f, 0.0f, 4.0f);
-            fillEllipseGradient (g, markerBounds.reduced (1.0f),
-                                 accentOrange.brighter (0.45f), accentOrange.darker (0.18f));
-            g.setColour (accentOrange);
-            g.drawEllipse (markerBounds, 1.0f);
+            position = animatedButton->getCurrentAnimationPosition();
         }
-        else
+
+        float clampedPos = juce::jlimit (0.0f, 1.0f, position);
+
+        // LED marker underglow / drop shadow
+        if (position > 0.0f)
         {
-            fillEllipseGradient (g, markerBounds, panelDark.brighter (0.18f), panelDark.darker (0.2f));
-            g.setColour (textPrimary);
-            g.drawEllipse (markerBounds, 1.0f);
-            g.setColour (juce::Colours::black.withAlpha (0.8f));
+            drawSoftDropShadow (g, markerBounds, 0.0f, true, 2.4f * position, 0.0f, 4.0f, accentOrange.withAlpha (clampedPos));
+        }
+
+        auto offFillTop = panelDark.brighter (0.18f);
+        auto offFillBottom = panelDark.darker (0.2f);
+        auto onFillTop = accentOrange.brighter (0.45f);
+        auto onFillBottom = accentOrange.darker (0.18f);
+
+        auto currentFillTop = offFillTop.interpolatedWith (onFillTop, clampedPos);
+        auto currentFillBottom = offFillBottom.interpolatedWith (onFillBottom, clampedPos);
+
+        fillEllipseGradient (g, markerBounds, currentFillTop, currentFillBottom);
+
+        auto offBorder = textPrimary;
+        auto onBorder = accentOrange;
+        auto currentBorder = offBorder.interpolatedWith (onBorder, clampedPos);
+
+        g.setColour (currentBorder);
+        g.drawEllipse (markerBounds, 1.0f);
+
+        if (position < 1.0f)
+        {
+            g.setColour (juce::Colours::black.withAlpha (0.8f * (1.0f - clampedPos)));
             g.drawEllipse (markerBounds.reduced (0.5f), 1.0f);
         }
 
@@ -4298,10 +4835,16 @@ public:
         auto offLabelBounds = juce::Rectangle<int> (switchBounds.getX() - 24, switchBounds.getY() + 5, 16, 10);
         auto onLabelBounds = juce::Rectangle<int> (switchBounds.getRight() + 8, switchBounds.getY() + 5, 12, 10);
 
-        g.setColour (textMuted);
+        // OFF label fades out to 0.35 alpha when ON
+        auto offLabelColour = textPrimary.interpolatedWith (textMuted.withAlpha (0.35f), clampedPos);
+        g.setColour (offLabelColour);
         g.setFont (heavyFont (7.0f));
         g.drawText ("OFF", offLabelBounds, juce::Justification::centredLeft, false);
-        g.setColour (borderLight.darker (0.4f));
+
+        // ON label fades in from 0.35 alpha of textMuted to bright accentOrange when ON
+        auto onLabelColour = textMuted.withAlpha (0.35f).interpolatedWith (accentOrange.brighter (0.2f), clampedPos);
+        g.setColour (onLabelColour);
+        g.setFont (heavyFont (7.0f));
         g.drawText ("ON", onLabelBounds, juce::Justification::centredLeft, false);
 
         if (gainReductionReadoutVisible)
@@ -4361,7 +4904,7 @@ private:
     }
 
     juce::String title;
-    juce::TextButton switchButton;
+    SmoothAnimatedSwitchButton switchButton;
     LabelledKnob firstKnob;
     LabelledKnob secondKnob;
     juce::Rectangle<int> firstKnobBounds;
