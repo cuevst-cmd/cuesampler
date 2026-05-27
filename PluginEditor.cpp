@@ -1754,7 +1754,7 @@ public:
         if (source == &processor.sampleChangeBroadcaster)
         {
             isSelectingAnalysisRegion = false;
-            targetZoomLevel = zoomLevel = 0.0f;
+            targetZoomLevel = zoomLevel = 0.20f;
             targetScrollPosition = scrollPosition = 0.0f;
             targetWaveformVerticalScale = waveformVerticalScale = defaultWaveformVerticalScale;
             updatePeakCache();
@@ -1814,7 +1814,6 @@ public:
     void mouseExit (const juce::MouseEvent&) override
     {
         isHoveringDisplay = false;
-        hoveredDisplayX = 0.0f;
         hoveredChopId = -1;
         if (edgeDragChopId < 0)
             edgeHoverKind = 0;
@@ -2950,7 +2949,15 @@ private:
         }
 
         const auto currentPlayheadPosition = processor.getPlaybackSamplePosition();
-        const auto targetHoverAlpha = isHoveringDisplay ? 1.0f : 0.0f;
+        
+        const bool isUserInteracting = (edgeDragChopId >= 0)
+                                    || (warpDragChopId >= 0)
+                                    || isSelectingAnalysisRegion
+                                    || isHoldingToPlay
+                                    || exportDragReady
+                                    || exportDragFired;
+
+        const auto targetHoverAlpha = (isHoveringDisplay && ! isUserInteracting) ? 1.0f : 0.0f;
         hoverAnimationAlpha += (targetHoverAlpha - hoverAnimationAlpha) * 0.22f;
         if (std::abs (targetHoverAlpha - hoverAnimationAlpha) < 0.01f)
             hoverAnimationAlpha = targetHoverAlpha;
@@ -3135,7 +3142,9 @@ private:
     {
         const auto displayBounds = getDisplayBounds();
         isHoveringDisplay = displayBounds.contains (position);
-        hoveredDisplayX = juce::jlimit (displayBounds.getX(), displayBounds.getRight(), position.x);
+        
+        if (isHoveringDisplay)
+            hoveredDisplayX = juce::jlimit (displayBounds.getX(), displayBounds.getRight(), position.x);
 
         hoveredChopId = -1;
         if (isHoveringDisplay)
@@ -3267,8 +3276,12 @@ private:
         clipPath.addRoundedRectangle (displayBounds, 4.0f);
         g.reduceClipRegion (clipPath);
 
+        int chopIndex = 0;
         for (const auto& chop : chopState->chops)
         {
+            const bool isAlternativeChop = (chopIndex % 2 == 1);
+            ++chopIndex;
+
             if ((double) chop.endSample < visibleStart || (double) chop.startSample > visibleEnd)
                 continue;
 
@@ -3284,12 +3297,16 @@ private:
             const bool isSelected = (chop.id == chopState->selectedChopId);
             const bool isHovered = (chop.id == hoveredChopId);
 
-            const auto baseFill = juce::Colour (0xff3da5ff).withAlpha (0.08f);
+            const auto baseFill = isAlternativeChop
+                ? juce::Colour (0xffff4a6b).withAlpha (0.18f)   // Premium glowing rose-red (18% opacity)
+                : juce::Colour (0xff3da5ff).withAlpha (0.08f);  // Standard cyan-blue (8% opacity)
             const auto hoverFill = juce::Colour (0xff8fd9ff).withAlpha (0.14f);
             const auto selectFill = juce::Colour (0xff00c950).withAlpha (0.22f);
             const auto fillColour = baseFill.interpolatedWith (hoverFill, hoverVal).interpolatedWith (selectFill, selectVal);
 
-            const auto baseLine = juce::Colour (0xff3da5ff).withAlpha (0.55f);
+            const auto baseLine = isAlternativeChop
+                ? juce::Colour (0xffff4a6b).withAlpha (0.75f)   // Crisp rose-red border (75% opacity)
+                : juce::Colour (0xff3da5ff).withAlpha (0.55f);  // Standard cyan-blue border (55% opacity)
             const auto hoverLine = juce::Colour (0xff8fd9ff).withAlpha (0.82f);
             const auto selectLine = juce::Colour (0xff00f57a).withAlpha (0.98f);
             const auto lineColour = baseLine.interpolatedWith (hoverLine, hoverVal).interpolatedWith (selectLine, selectVal);
@@ -3773,7 +3790,7 @@ private:
         }
 
         const auto hoverX = juce::jlimit (displayBounds.getX(), displayBounds.getRight(), hoveredDisplayX);
-        const auto guideColour = accentOrange;
+        const auto guideColour = juce::Colour (0xffff2233); // Vibrant glowing neon red
         lastPaintedHoverAlpha = hoverAnimationAlpha;
         lastPaintedHoverX = hoverX;
 
@@ -3782,16 +3799,38 @@ private:
         clipPath.addRoundedRectangle (displayBounds, 4.0f);
         g.reduceClipRegion (clipPath);
 
-        g.setColour (guideColour.withAlpha (0.08f * hoverAnimationAlpha));
-        g.fillRect (juce::Rectangle<float> (hoverX - 5.0f, displayBounds.getY() + 4.0f, 10.0f, displayBounds.getHeight() - 8.0f));
-        g.setColour (guideColour.withAlpha (0.3f * hoverAnimationAlpha));
-        g.drawLine (hoverX, displayBounds.getY() + 6.0f, hoverX, displayBounds.getBottom() - 6.0f, 1.0f);
+        const float topY = displayBounds.getY() + 2.0f;
+        const float arrowHeight = 11.0f;
+        const float arrowWidth = 13.0f;
+        const float lineStartY = topY + arrowHeight;
 
-        auto handleBounds = juce::Rectangle<float> (12.0f, 12.0f).withCentre ({ hoverX, displayBounds.getY() + 14.0f });
-        g.setColour (guideColour.withAlpha (0.22f * hoverAnimationAlpha));
-        g.fillEllipse (handleBounds.expanded (4.0f));
-        g.setColour (guideColour.withAlpha (0.92f * hoverAnimationAlpha));
-        g.fillEllipse (handleBounds);
+        // Wide soft neon red laser glow
+        g.setColour (guideColour.withAlpha (0.05f * hoverAnimationAlpha));
+        g.fillRect (juce::Rectangle<float> (hoverX - 3.0f, lineStartY, 6.0f, displayBounds.getBottom() - 4.0f - lineStartY));
+
+        // High-opacity core neon red line
+        g.setColour (guideColour.withAlpha (0.75f * hoverAnimationAlpha));
+        g.drawLine (hoverX, lineStartY, hoverX, displayBounds.getBottom() - 4.0f, 1.2f);
+
+        // Sleek modern notched arrowhead pointing downwards at the top of the line
+        juce::Path arrowPath;
+        arrowPath.startNewSubPath (hoverX - arrowWidth * 0.5f, topY);
+        arrowPath.lineTo (hoverX, topY + arrowHeight * 0.25f);
+        arrowPath.lineTo (hoverX + arrowWidth * 0.5f, topY);
+        arrowPath.lineTo (hoverX, topY + arrowHeight);
+        arrowPath.closeSubPath();
+
+        // Subtle drop-shadow under the arrowhead for separation
+        g.setColour (juce::Colours::black.withAlpha (0.45f * hoverAnimationAlpha));
+        g.fillPath (arrowPath, juce::AffineTransform::translation (0.0f, 1.0f));
+
+        // Deep red fill
+        g.setColour (guideColour.withAlpha (0.95f * hoverAnimationAlpha));
+        g.fillPath (arrowPath);
+
+        // Bright white outline for crisp contrast and premium look
+        g.setColour (juce::Colours::white.withAlpha (0.9f * hoverAnimationAlpha));
+        g.strokePath (arrowPath, juce::PathStrokeType (1.0f));
     }
 
     void paintPlayhead (juce::Graphics& g, juce::Rectangle<float> displayBounds)

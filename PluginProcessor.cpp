@@ -3405,7 +3405,7 @@ void AudioPluginAudioProcessor::loadAudioFile (const juce::File& file)
         std::atomic_store (&chopState, std::make_shared<ChopState> ());
         loadedFileName = sampleData->fileName;
         sampleSampleRate = sampleData->sampleRate;
-        waveformZoom.store (0.15f, std::memory_order_release);
+        waveformZoom.store (0.20f, std::memory_order_release);
         waveformScroll.store (0.0f, std::memory_order_release);
         playbackActive.store (false, std::memory_order_release);
         playbackSamplePosition.store ((double) sampleData->leadingContentStartSample, std::memory_order_release);
