@@ -65,7 +65,7 @@ juce_add_plugin(CueSampler
     # NEEDS_MIDI_OUTPUT TRUE/FALSE              # Does the plugin need midi output?
     # IS_MIDI_EFFECT TRUE/FALSE                 # Is this plugin a MIDI effect?
     # EDITOR_WANTS_KEYBOARD_FOCUS TRUE/FALSE    # Does the editor need keyboard focus?
-    # COPY_PLUGIN_AFTER_BUILD TRUE/FALSE        # Should the plugin be installed to a default location after building?
+    COPY_PLUGIN_AFTER_BUILD TRUE                # Install the plugin to the default location after each build
     COMPANY_NAME "CUE SOFTWARE"
     BUNDLE_ID "com.cuesoftware.cuesampler"
     PLUGIN_MANUFACTURER_CODE Cues               # A four-character manufacturer id with at least one upper-case character
@@ -90,6 +90,7 @@ juce_add_plugin(CueSampler
 target_sources(CueSampler
     PRIVATE
         AudioFingerprinter.cpp
+        EditTelemetry.cpp
         KeyDetector.cpp
         PluginEditor.cpp
         PluginProcessor.cpp

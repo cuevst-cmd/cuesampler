@@ -10,7 +10,7 @@ constexpr int fftSize = 1 << fftOrder;
 constexpr int hopSize = fftSize / 4;
 constexpr double minFrequencyHz = 65.0;
 constexpr double maxFrequencyHz = 2093.0;
-constexpr double analysisSeconds = 6.0;
+constexpr double analysisSeconds = 30.0; // analyze a longer span; 6s often catches only an ambiguous intro
 constexpr double minAudioSeconds = 0.5;
 
 constexpr std::array<const char*, 12> noteNames
@@ -40,14 +40,18 @@ int wrapPitchClass (int value)
 }
 }
 
+// Temperley (2001) key profiles. These outperform the original Krumhansl-Kessler
+// profiles on real recordings and are published research values (no GPL/AGPL
+// library code involved). The correlate() step is scale-invariant, so only the
+// shape of these profiles matters.
 const std::array<double, 12> KeyDetector::majorProfile
 {
-    6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88
+    0.748, 0.060, 0.488, 0.082, 0.670, 0.460, 0.096, 0.715, 0.104, 0.366, 0.057, 0.400
 };
 
 const std::array<double, 12> KeyDetector::minorProfile
 {
-    6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17
+    0.712, 0.084, 0.474, 0.618, 0.049, 0.460, 0.105, 0.747, 0.404, 0.067, 0.133, 0.330
 };
 
 // Detects the most likely musical key from the supplied audio buffer.
@@ -125,6 +129,23 @@ KeyDetector::Result KeyDetector::detect (const juce::AudioBuffer<float>& buffer,
     result.camelot = bestIsMajor ? majorCamelot[static_cast<size_t> (bestRoot)]
                                  : minorCamelot[static_cast<size_t> (bestRoot)];
 
+    return result;
+}
+
+// Builds a fully-populated Result for an explicit key (user override).
+KeyDetector::Result KeyDetector::makeResult (int rootIndex, bool isMajor)
+{
+    Result result;
+
+    const auto root = wrapPitchClass (rootIndex);
+    result.valid      = true;
+    result.rootIndex  = root;
+    result.rootNote   = noteNames[static_cast<size_t> (root)];
+    result.isMajor    = isMajor;
+    result.key        = result.rootNote + (isMajor ? std::string() : std::string ("m"));
+    result.confidence = 1.0f;
+    result.camelot    = isMajor ? majorCamelot[static_cast<size_t> (root)]
+                                : minorCamelot[static_cast<size_t> (root)];
     return result;
 }
 

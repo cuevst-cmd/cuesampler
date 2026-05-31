@@ -207,6 +207,20 @@ AudioFingerprinter::OnlineResult AudioFingerprinter::lookup (const juce::AudioBu
 {
     int duration = 0;
     const auto fingerprint = generateFingerprint (buffer, sampleRate, duration);
+    return lookup (fingerprint, duration);
+}
+
+// Online lookup chain from a precomputed fingerprint.
+AudioFingerprinter::OnlineResult AudioFingerprinter::lookup (const std::string& fingerprint, int duration)
+{
     const auto mbid = lookupMbid (fingerprint, duration);
     return lookupKey (mbid);
+}
+
+// Local-only Chromaprint fingerprint (no network).
+std::string AudioFingerprinter::localFingerprint (const juce::AudioBuffer<float>& buffer,
+                                                  double sampleRate,
+                                                  int& durationOut)
+{
+    return generateFingerprint (buffer, sampleRate, durationOut);
 }

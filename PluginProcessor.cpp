@@ -1710,38 +1710,35 @@ public:
         if (shouldExit())
             return finish();
 
-        auto metadataResult = owner.tryReadKeyFromMetadata (sourceFile);
-        if (metadataResult.valid)
+        // Data flywheel: when telemetry is enabled, compute the content
+        // fingerprint up front so the jar can group events by sample, and stamp
+        // the sample context. (The online key lookup that used to provide a
+        // "truth" label was removed — AcousticBrainz, which mapped fingerprints
+        // to keys, was shut down. Ground-truth key labels now come from the
+        // user's key override instead.)
+        const bool wantTelemetry = owner.editTelemetry.isEnabled();
+        if (wantTelemetry)
         {
-            publishResult (std::move (metadataResult));
-            return jobHasFinished;
+            int fpDuration = 0;
+            const auto fingerprint = owner.audioFingerprinter.localFingerprint (buffer, sampleRate, fpDuration);
+            const auto durationSeconds = sampleRate > 0.0 ? (double) buffer.getNumSamples() / sampleRate : 0.0;
+            owner.editTelemetry.setSampleContext (fingerprint, durationSeconds, sampleRate, buffer.getNumChannels());
         }
 
-        if (shouldExit() || ! isCurrent())
-            return finish();
+        // Prefer an embedded key tag in the file metadata when present.
+        auto metadataResult = owner.tryReadKeyFromMetadata (sourceFile);
+        const bool haveMetadataKey = metadataResult.valid;
 
+        // Always compute the local FFT guess (it's also what we publish when no
+        // metadata key exists, and what telemetry logs against any truth).
         auto localResult = owner.keyDetector.detect (buffer, sampleRate);
-        if (! publishResult (std::move (localResult)))
-            return jobHasFinished;
 
-        if (shouldExit() || ! isCurrent())
-            return finish();
+        if (wantTelemetry)
+            owner.editTelemetry.recordKeyObservation (localResult.key, localResult.confidence,
+                                                      haveMetadataKey ? metadataResult.key : std::string(),
+                                                      std::string());
 
-        const auto onlineResult = owner.audioFingerprinter.lookup (buffer, sampleRate);
-        if (! onlineResult.found)
-            return finish();
-
-        auto onlineKeyResult = parseMetadataKeyString (juce::String (onlineResult.rootNote)
-                                                       + (onlineResult.isMajor ? juce::String() : "m"));
-
-        if (! onlineKeyResult.valid)
-            return finish();
-
-        onlineKeyResult.key = onlineResult.key;
-        onlineKeyResult.rootNote = onlineResult.rootNote;
-        onlineKeyResult.isMajor = onlineResult.isMajor;
-        onlineKeyResult.confidence = 1.0f;
-        publishResult (std::move (onlineKeyResult));
+        publishResult (haveMetadataKey ? std::move (metadataResult) : std::move (localResult));
         return jobHasFinished;
     }
 
@@ -1929,6 +1926,7 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
 AudioPluginAudioProcessor::~AudioPluginAudioProcessor()
 {
     cancelPendingUpdate();
+    editTelemetry.flush();
     keyDetectionGeneration.fetch_add (1, std::memory_order_acq_rel);
     restoreThreadPool.removeAllJobs (true, 2000);
     analysisThreadPool.removeAllJobs (true, 2000);
@@ -3390,6 +3388,10 @@ void AudioPluginAudioProcessor::loadAudioFile (const juce::File& file)
     chopAudioCache.clear();
     warpRenderGeneration.fetch_add (1, std::memory_order_acq_rel);
 
+    // Flush any pending telemetry for the previous sample and reset context;
+    // the new sample's fingerprint is set later by the key-detection job.
+    editTelemetry.clearSampleContext();
+
     if (auto sampleData = createLoadedSampleDataFromFile (file); sampleData != nullptr)
     {
         // Sample rate may have changed, so publish matching engines before
@@ -4141,6 +4143,13 @@ void AudioPluginAudioProcessor::setGridBpmTrim (float trimBpm)
         buildChopsFromAnalysis (*analysis);
         if (syncToHost.load (std::memory_order_acquire))
             updateHostSyncStretchRatio (*analysis, hostBpm.load (std::memory_order_acquire));
+
+        // Data flywheel: the user is correcting the detected tempo. Capture
+        // the algorithm's guess vs. the settled value (coalesced internally).
+        editTelemetry.recordBpmCorrection (analysis->estimatedBpm,
+                                           analysis->estimatedBpm + (double) trimBpm,
+                                           analysis->confidence,
+                                           analysis->likelyDrifting);
         notifyEditStateChanged();
     }
     touchTempoUiRevision();
@@ -4393,6 +4402,30 @@ KeyDetector::Result AudioPluginAudioProcessor::getDetectedKey() const
 {
     const std::lock_guard<std::mutex> lock (keyResultMutex);
     return detectedKeyResult;
+}
+
+void AudioPluginAudioProcessor::setUserKeyOverride (int rootIndex, bool isMajor)
+{
+    auto newResult = KeyDetector::makeResult (rootIndex, isMajor);
+
+    KeyDetector::Result previous;
+    {
+        const std::lock_guard<std::mutex> lock (keyResultMutex);
+        previous = detectedKeyResult;
+        detectedKeyResult = newResult;
+    }
+
+    // Cancel any in-flight detection so it can't overwrite the user's choice.
+    keyDetectionGeneration.fetch_add (1, std::memory_order_acq_rel);
+    keyDetectionInProgress.store (false, std::memory_order_release);
+
+    // Flywheel: the detector's key (previous) vs. the user's choice (truth).
+    editTelemetry.recordKeyCorrection (previous.valid ? previous.key : std::string(),
+                                       previous.confidence,
+                                       newResult.key);
+
+    // Refresh the UI readout.
+    tempoUiRevision.fetch_add (1, std::memory_order_acq_rel);
 }
 
 uint64_t AudioPluginAudioProcessor::getTempoUiRevision() const noexcept

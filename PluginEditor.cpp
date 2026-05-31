@@ -560,7 +560,8 @@ public:
             || style == "flatAction" || style == "utilitySync" || style == "effectSwitch")
         {
             auto bounds = button.getLocalBounds().toFloat().reduced (0.5f);
-            auto pressedOffset = isButtonDown ? 2.0f : 0.0f;
+            // effectSwitch is a left/right toggle, not a press button — no vertical "press down" dip.
+            auto pressedOffset = (isButtonDown && style != "effectSwitch") ? 2.0f : 0.0f;
             bounds = bounds.translated (0.0f, pressedOffset);
 
             if (style == "transportSquare")
@@ -1574,6 +1575,31 @@ public:
         helpButton.setTooltip ("Open the quick-start reference guide.");
         helpButton.onClick = [this] { if (onHelpRequested) onHelpRequested(); };
         addAndMakeVisible (helpButton);
+
+        // Opt-in data-sharing toggle. Lights up (toggle "on" colour) when the
+        // user has consented to share anonymous BPM/key detection data.
+        configureButton (dataButton, "DATA", textPrimary);
+        dataButton.getProperties().set ("cueStyle", "helpButton");
+        dataButton.setToggleState (processor.isTelemetryEnabled(), juce::dontSendNotification);
+        dataButton.setTooltip ("Help improve BPM & key detection by sharing anonymous "
+                               "correction data. No audio or file names are ever sent.");
+        dataButton.onClick = [this]
+        {
+            juce::PopupMenu menu;
+            menu.addItem (1, "Share anonymous data to improve BPM & key detection",
+                          true, processor.isTelemetryEnabled());
+            menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (dataButton),
+                                [this] (int result)
+                                {
+                                    if (result != 1)
+                                        return;
+                                    const bool newState = ! processor.isTelemetryEnabled();
+                                    processor.setTelemetryEnabled (newState);
+                                    dataButton.setToggleState (newState, juce::dontSendNotification);
+                                    dataButton.repaint();
+                                });
+        };
+        addAndMakeVisible (dataButton);
     }
 
     void resized() override
@@ -1581,7 +1607,10 @@ public:
         constexpr int buttonSize = 28;
         constexpr int rightMargin = 14;
         constexpr int topMargin = 10;
+        constexpr int dataWidth = 46;
+        constexpr int gap = 8;
         helpButton.setBounds (getWidth() - rightMargin - buttonSize, topMargin, buttonSize, buttonSize);
+        dataButton.setBounds (helpButton.getX() - gap - dataWidth, topMargin, dataWidth, buttonSize);
     }
 
     std::function<void()> onHelpRequested;
@@ -1700,6 +1729,7 @@ private:
 
     AudioPluginAudioProcessor& processor;
     SmoothHoverButton helpButton;
+    SmoothHoverButton dataButton;
     juce::Image logoImage;
 };
 
@@ -4279,7 +4309,8 @@ public:
         addAndMakeVisible (tempoDisplay);
         tempoDisplay.setClickHandler ([this] { showTempoEntryDialog(); });
         addAndMakeVisible (keyDisplay);
-        keyDisplay.setTooltip ("Shows detected musical key and Camelot code.");
+        keyDisplay.setTooltip ("Detected musical key + Camelot code. Click to correct it.");
+        keyDisplay.setClickHandler ([this] { showKeyOverrideMenu(); });
         addAndMakeVisible (startKnob);
         addAndMakeVisible (cueKnob);
         addAndMakeVisible (gainKnob);
@@ -4526,6 +4557,41 @@ private:
         tooltip << "\nUse the TEMPO trim knob (utility strip) to nudge the grid if chops feel slightly off-beat.";
 
         tempoDisplay.setTooltip (tooltip);
+    }
+
+    void showKeyOverrideMenu()
+    {
+        static const char* names[12] = { "C", "C#", "D", "D#", "E", "F",
+                                         "F#", "G", "G#", "A", "A#", "B" };
+
+        const auto current = processor.getDetectedKey();
+
+        juce::PopupMenu major, minor;
+        for (int i = 0; i < 12; ++i)
+        {
+            const bool tickMaj = current.valid && current.isMajor && current.rootIndex == i;
+            major.addItem (i + 1, names[i], true, tickMaj);
+
+            const bool tickMin = current.valid && ! current.isMajor && current.rootIndex == i;
+            minor.addItem (i + 13, juce::String (names[i]) + "m", true, tickMin);
+        }
+
+        juce::PopupMenu menu;
+        menu.addSectionHeader ("Correct key");
+        menu.addSubMenu ("Major", major);
+        menu.addSubMenu ("Minor", minor);
+
+        juce::Component::SafePointer<TransportSectionComponent> safeThis (this);
+        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (keyDisplay),
+                            [safeThis] (int result)
+                            {
+                                if (result <= 0 || safeThis == nullptr)
+                                    return;
+
+                                const bool isMajor = result <= 12;
+                                const int rootIndex = isMajor ? result - 1 : result - 13;
+                                safeThis->processor.setUserKeyOverride (rootIndex, isMajor);
+                            });
     }
 
     void showTempoEntryDialog()

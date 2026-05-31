@@ -5,6 +5,7 @@
 
 #include "AudioFingerprinter.h"
 #include "BeatThisAnalyzer.h"
+#include "EditTelemetry.h"
 #include "KeyDetector.h"
 #include "ChopAudioCache.h"
 #include "SSLBusCompressor.h"
@@ -170,6 +171,15 @@ public:
     bool isTempoAnalysisInProgress() const noexcept;
     bool isKeyDetectionInProgress() const noexcept;
     KeyDetector::Result getDetectedKey() const;
+
+    // Apply a user key override (rootIndex 0..11 = C..B). Replaces the displayed
+    // key and records a key_correction in the flywheel (user pick = ground truth).
+    void setUserKeyOverride (int rootIndex, bool isMajor);
+
+    // Opt-in data-flywheel consent. When enabled, anonymous BPM and key
+    // detection deltas are recorded locally (see EditTelemetry). Defaults off.
+    bool isTelemetryEnabled() const noexcept { return editTelemetry.isEnabled(); }
+    void setTelemetryEnabled (bool shouldEnable) { editTelemetry.setEnabled (shouldEnable); }
     std::shared_ptr<const TempoAnalysisData> getTempoAnalysis() const;
     std::shared_ptr<const TempoEditState> getTempoEditState() const;
     std::shared_ptr<const ChopState> getChopState() const;
@@ -295,6 +305,7 @@ private:
     std::unique_ptr<BeatThisAnalyzer> beatThisAnalyzer;
     KeyDetector keyDetector;
     AudioFingerprinter audioFingerprinter;
+    cuesampler::EditTelemetry editTelemetry;
     KeyDetector::Result detectedKeyResult;
     mutable std::mutex keyResultMutex;
 

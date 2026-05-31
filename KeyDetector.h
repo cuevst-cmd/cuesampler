@@ -22,6 +22,10 @@ public:
     // Detects the most likely musical key from an audio buffer using FFT chroma correlation.
     Result detect (const juce::AudioBuffer<float>& buffer, double sampleRate);
 
+    // Builds a fully-populated Result (note name, Camelot code, confidence 1.0)
+    // for an explicit key. Used for user key overrides. rootIndex is 0..11 (C..B).
+    static Result makeResult (int rootIndex, bool isMajor);
+
 private:
     static const std::array<double, 12> majorProfile;
     static const std::array<double, 12> minorProfile;
