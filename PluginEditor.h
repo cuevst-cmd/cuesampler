@@ -58,5 +58,10 @@ private:
     juce::DropShadow defaultShadow { juce::Colours::black.withAlpha (0.6f), 12, { 0, 5 } };
     juce::DropShadowEffect panelShadowEffect;
 
+    // Measures the real display refresh rate (60/120) so animations run at the
+    // display's native frame rate. See cue::observeVBlankInterval.
+    juce::VBlankAttachment vblankRateMeter;
+    double lastVBlankSeconds = 0.0;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioPluginAudioProcessorEditor)
 };

@@ -27,6 +27,46 @@ constexpr int maxZoomedScrollDragSensitivity = 13200;
 constexpr float zoomResponseMidpoint = 0.5f;
 constexpr float zoomMappedMidpoint = 0.75f;
 
+// --- Animation frame rate ---------------------------------------------------
+// Drive UI animations at the display's native refresh rate: 120 Hz on
+// ProMotion / high-refresh panels, 60 Hz otherwise, for maximum smoothness.
+//
+// JUCE only populates Displays::verticalFrequencyHz on Windows/Linux, so on
+// macOS we can't read the rate directly. Instead we measure it from the
+// editor's vblank callback (backed by CVDisplayLink, which ticks at the real
+// display rate). Defaults to 60 Hz until the first vblanks have been timed.
+inline int g_animationRefreshHz = 60;
+
+inline int animationFrameRateHz() noexcept { return g_animationRefreshHz; }
+
+// Fold one observed vblank interval (seconds) into the measured refresh rate.
+// Called from the editor's VBlankAttachment.
+inline void observeVBlankInterval (double dtSeconds)
+{
+    if (dtSeconds <= 0.0001 || dtSeconds > 0.5) // ignore stalls / first frame
+        return;
+
+    static double emaDt = 1.0 / 60.0;
+    emaDt += (dtSeconds - emaDt) * 0.1; // smooth out jitter
+    g_animationRefreshHz = (1.0 / emaDt) >= 90.0 ? 120 : 60;
+}
+
+// Re-express an exponential smoothing factor (authored at baseHz fps) so the
+// animation covers the same ground in the same wall-clock time at any rate.
+inline float frameRateLerp (float lerpAtBase, int hz, int baseHz = 60)
+{
+    if (hz <= 0 || hz == baseHz)
+        return lerpAtBase;
+    return 1.0f - std::pow (1.0f - lerpAtBase, (float) baseHz / (float) hz);
+}
+
+// Re-express a per-frame linear step/decay (authored at baseHz fps) for the
+// current frame rate, preserving its wall-clock duration.
+inline float frameRateStep (float stepAtBase, int hz, int baseHz = 60)
+{
+    return hz > 0 ? stepAtBase * ((float) baseHz / (float) hz) : stepAtBase;
+}
+
 constexpr float largeCorner = 16.0f;
 constexpr float mediumCorner = 14.0f;
 constexpr float smallCorner = 10.0f;
@@ -318,22 +358,19 @@ public:
     {
         juce::TextButton::clicked();
         clickRipple = 1.0f;
-        if (! isTimerRunning())
-            startTimerHz (60);
+        ensureAnimating();
     }
 
     void mouseEnter (const juce::MouseEvent& e) override
     {
         juce::TextButton::mouseEnter (e);
-        if (! isTimerRunning())
-            startTimerHz (60);
+        ensureAnimating();
     }
 
     void mouseExit (const juce::MouseEvent& e) override
     {
         juce::TextButton::mouseExit (e);
-        if (! isTimerRunning())
-            startTimerHz (60);
+        ensureAnimating();
     }
 
     void buttonStateChanged() override
@@ -351,18 +388,26 @@ public:
             }
             else
             {
-                if (! isTimerRunning())
-                    startTimerHz (60);
+                ensureAnimating();
             }
         }
     }
 
 private:
+    void ensureAnimating()
+    {
+        if (! isTimerRunning())
+        {
+            animHz = animationFrameRateHz();
+            startTimerHz (animHz);
+        }
+    }
+
     void timerCallback() override
     {
         constexpr float stiffness = 320.0f;
         constexpr float damping = 28.0f;
-        constexpr float dt = 0.0167f;
+        const float dt = 1.0f / (float) animHz; // real frame interval → rate-independent physics
 
         float force = (targetPosition - currentPosition) * stiffness - velocity * damping;
         velocity += force * dt;
@@ -379,13 +424,13 @@ private:
 
         if (clickRipple > 0.0f)
         {
-            clickRipple -= 0.06f;
+            clickRipple -= frameRateStep (0.06f, animHz);
             if (clickRipple < 0.0f)
                 clickRipple = 0.0f;
         }
 
         const float hoverTarget = isMouseOver() ? 1.0f : 0.0f;
-        hoverAlpha += (hoverTarget - hoverAlpha) * 0.18f;
+        hoverAlpha += (hoverTarget - hoverAlpha) * frameRateLerp (0.18f, animHz);
 
         bool hoverDone = std::abs (hoverAlpha - hoverTarget) < 0.005f;
         if (hoverDone)
@@ -406,6 +451,7 @@ private:
     float velocity = 0.0f;
     float clickRipple = 0.0f;
     float hoverAlpha = 0.0f;
+    int   animHz = 60;
 };
 
 class SmoothHoverButton : public juce::TextButton, private juce::Timer
@@ -419,22 +465,29 @@ public:
     void mouseEnter (const juce::MouseEvent& e) override
     {
         juce::TextButton::mouseEnter (e);
-        if (! isTimerRunning())
-            startTimerHz (60);
+        ensureAnimating();
     }
 
     void mouseExit (const juce::MouseEvent& e) override
     {
         juce::TextButton::mouseExit (e);
-        if (! isTimerRunning())
-            startTimerHz (60);
+        ensureAnimating();
     }
 
 private:
+    void ensureAnimating()
+    {
+        if (! isTimerRunning())
+        {
+            animHz = animationFrameRateHz();
+            startTimerHz (animHz);
+        }
+    }
+
     void timerCallback() override
     {
         const float target = isMouseOver() ? 1.0f : 0.0f;
-        hoverAlpha += (target - hoverAlpha) * 0.18f;
+        hoverAlpha += (target - hoverAlpha) * frameRateLerp (0.18f, animHz);
 
         if (std::abs (hoverAlpha - target) < 0.005f)
         {
@@ -446,6 +499,7 @@ private:
     }
 
     float hoverAlpha = 0.0f;
+    int   animHz = 60;
 };
 
 class OptResetSlider : public juce::Slider, private juce::Timer
@@ -465,15 +519,13 @@ public:
     void mouseEnter (const juce::MouseEvent& e) override
     {
         juce::Slider::mouseEnter (e);
-        if (! isTimerRunning())
-            startTimerHz (60);
+        ensureAnimating();
     }
 
     void mouseExit (const juce::MouseEvent& e) override
     {
         juce::Slider::mouseExit (e);
-        if (! isTimerRunning())
-            startTimerHz (60);
+        ensureAnimating();
     }
 
     void mouseDown (const juce::MouseEvent& event) override
@@ -488,10 +540,19 @@ public:
     }
 
 private:
+    void ensureAnimating()
+    {
+        if (! isTimerRunning())
+        {
+            animHz = animationFrameRateHz();
+            startTimerHz (animHz);
+        }
+    }
+
     void timerCallback() override
     {
         const float target = isMouseOverOrDragging() ? 1.0f : 0.0f;
-        hoverAlpha += (target - hoverAlpha) * 0.18f;
+        hoverAlpha += (target - hoverAlpha) * frameRateLerp (0.18f, animHz);
 
         if (std::abs (hoverAlpha - target) < 0.005f)
         {
@@ -505,6 +566,7 @@ private:
     double defaultValue = 0.0;
     bool hasDefaultValue = false;
     float hoverAlpha = 0.0f;
+    int   animHz = 60;
 };
 } // namespace
 
@@ -1754,7 +1816,8 @@ public:
         lastObservedChopTriggerRevision = processor.getChopTriggerRevision();
         updatePeakCache();
         rebuildWaveformPath();
-        startTimerHz (waveformRefreshHz);
+        animHz = animationFrameRateHz(); // 60/120 Hz for smooth playhead, scroll & zoom
+        startTimerHz (animHz);
 
         verticalMinusButton.setButtonText ("-");
         verticalPlusButton .setButtonText ("+");
@@ -2664,7 +2727,7 @@ public:
                         std::min (startX, endX), waveformBounds.getY(),
                         std::abs (endX - startX), waveformBounds.getHeight());
 
-                    const float progress = (float) holdTickCount / (float) kHoldTicksRequired;
+                    const float progress = (float) holdTickCount / (float) holdTicksRequired();
                     const juce::Colour amber (0xffffb300);
 
                     juce::Graphics::ScopedSaveState ss (g);
@@ -2878,6 +2941,12 @@ private:
 
     void timerCallback() override
     {
+        if (const int hz = animationFrameRateHz(); hz != animHz)
+        {
+            animHz = hz;
+            startTimerHz (animHz); // follow the measured display rate (60/120)
+        }
+
         if (! shouldRunRealtimeUi (*this))
             return;
 
@@ -2887,7 +2956,7 @@ private:
         // Accumulate hold ticks for drag-export detection
         if (holdChopId >= 0 && ! exportDragFired)
         {
-            if (++holdTickCount >= kHoldTicksRequired && ! exportDragReady)
+            if (++holdTickCount >= holdTicksRequired() && ! exportDragReady)
             {
                 exportDragReady = true;
                 setMouseCursor (juce::MouseCursor::DraggingHandCursor);
@@ -2911,7 +2980,7 @@ private:
         bool zoomChanged = false;
         if (std::abs (zoomLevel - targetZoomLevel) > 0.0001f)
         {
-            zoomLevel += (targetZoomLevel - zoomLevel) * 0.18f;
+            zoomLevel += (targetZoomLevel - zoomLevel) * frameRateLerp (0.18f, animHz, waveformRefreshHz);
             if (std::abs (zoomLevel - targetZoomLevel) <= 0.0001f)
                 zoomLevel = targetZoomLevel;
             zoomChanged = true;
@@ -2920,7 +2989,7 @@ private:
         bool scrollChanged = false;
         if (std::abs (scrollPosition - targetScrollPosition) > 0.0001f)
         {
-            scrollPosition += (targetScrollPosition - scrollPosition) * 0.18f;
+            scrollPosition += (targetScrollPosition - scrollPosition) * frameRateLerp (0.18f, animHz, waveformRefreshHz);
             if (std::abs (scrollPosition - targetScrollPosition) <= 0.0001f)
                 scrollPosition = targetScrollPosition;
             scrollChanged = true;
@@ -2929,7 +2998,7 @@ private:
         bool vertScaleChanged = false;
         if (std::abs (waveformVerticalScale - targetWaveformVerticalScale) > 0.0001f)
         {
-            waveformVerticalScale += (targetWaveformVerticalScale - waveformVerticalScale) * 0.18f;
+            waveformVerticalScale += (targetWaveformVerticalScale - waveformVerticalScale) * frameRateLerp (0.18f, animHz, waveformRefreshHz);
             if (std::abs (waveformVerticalScale - targetWaveformVerticalScale) <= 0.0001f)
                 waveformVerticalScale = targetWaveformVerticalScale;
             vertScaleChanged = true;
@@ -2951,20 +3020,20 @@ private:
                 
                 const float targetHover = (chop.id == hoveredChopId) ? 1.0f : 0.0f;
                 const float prevHover = anim.currentHoverAlpha;
-                anim.currentHoverAlpha += (targetHover - anim.currentHoverAlpha) * 0.20f;
+                anim.currentHoverAlpha += (targetHover - anim.currentHoverAlpha) * frameRateLerp (0.20f, animHz, waveformRefreshHz);
                 if (std::abs (anim.currentHoverAlpha - targetHover) < 0.005f)
                     anim.currentHoverAlpha = targetHover;
 
                 const float targetSelect = (chop.id == cs->selectedChopId) ? 1.0f : 0.0f;
                 const float prevSelect = anim.currentSelectAlpha;
-                anim.currentSelectAlpha += (targetSelect - anim.currentSelectAlpha) * 0.20f;
+                anim.currentSelectAlpha += (targetSelect - anim.currentSelectAlpha) * frameRateLerp (0.20f, animHz, waveformRefreshHz);
                 if (std::abs (anim.currentSelectAlpha - targetSelect) < 0.005f)
                     anim.currentSelectAlpha = targetSelect;
 
                 const float prevPulse = anim.currentTriggerPulse;
                 if (anim.currentTriggerPulse > 0.0f)
                 {
-                    anim.currentTriggerPulse -= 0.05f; // decay over 20 frames
+                    anim.currentTriggerPulse -= frameRateStep (0.05f, animHz, waveformRefreshHz); // ~0.67 s decay
                     if (anim.currentTriggerPulse < 0.0f)
                         anim.currentTriggerPulse = 0.0f;
                 }
@@ -2988,13 +3057,13 @@ private:
                                     || exportDragFired;
 
         const auto targetHoverAlpha = (isHoveringDisplay && ! isUserInteracting) ? 1.0f : 0.0f;
-        hoverAnimationAlpha += (targetHoverAlpha - hoverAnimationAlpha) * 0.22f;
+        hoverAnimationAlpha += (targetHoverAlpha - hoverAnimationAlpha) * frameRateLerp (0.22f, animHz, waveformRefreshHz);
         if (std::abs (targetHoverAlpha - hoverAnimationAlpha) < 0.01f)
             hoverAnimationAlpha = targetHoverAlpha;
 
         const bool isScanning = processor.isTempoAnalysisInProgress();
         if (isScanning)
-            ++scanAnimFrame;
+            scanAnimFrame += frameRateStep (1.0f, animHz, waveformRefreshHz);
 
         const auto shouldRepaint = processor.isPlaying() || wasPlayingLastTick
                                 || std::abs (currentPlayheadPosition - lastPaintedPlayheadSample) > 0.5
@@ -4131,14 +4200,15 @@ private:
     double lastPaintedPlayheadSample = -1.0;
     uint64_t lastTempoUiRevision = 0;
     uint64_t lastObservedChopTriggerRevision = 0;
-    int scanAnimFrame = 0;
+    float scanAnimFrame = 0.0f;
+    int   animHz = waveformRefreshHz;
 
     // Hold-to-export drag state
     int  holdChopId      = -1;
     int  holdTickCount   = 0;
     bool exportDragReady = false;
     bool exportDragFired = false;
-    static constexpr int kHoldTicksRequired = 2 * waveformRefreshHz; // 120 ticks @ 60 Hz = 2 s
+    int holdTicksRequired() const noexcept { return 2 * animHz; } // 2 s hold at the active frame rate
 
     // Warp-mode drag state (step 9). markerIndex < 0 means nothing being dragged.
     int  warpDragChopId      = -1;
@@ -5104,6 +5174,15 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     transportSectionComponent = std::make_unique<cue::TransportSectionComponent> (processorRef);
     utilityStripComponent = std::make_unique<cue::UtilityStripComponent>();
     effectsRackComponent = std::make_unique<cue::EffectsRackComponent>();
+
+    // Measure the real display refresh rate from the vblank so animations run
+    // at the display's native frame rate (120 Hz on ProMotion, 60 Hz otherwise).
+    vblankRateMeter = juce::VBlankAttachment (this, [this] (double nowSeconds)
+    {
+        if (lastVBlankSeconds > 0.0)
+            cue::observeVBlankInterval (nowSeconds - lastVBlankSeconds);
+        lastVBlankSeconds = nowSeconds;
+    });
 
     transportSectionComponent->getLoadButton().onClick = [this] { loadSampleFromFile(); };
     transportSectionComponent->getPlayButton().onClick = [this] { processorRef.startPlayback(); };

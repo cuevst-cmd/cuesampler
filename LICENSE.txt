@@ -1,0 +1,96 @@
+CUE SAMPLER — End User License Agreement (EULA)
+
+Last updated: May 31, 2026
+
+This End User License Agreement ("Agreement") is a legal agreement between you ("you," "your," or "Licensee") and Jerry Volpe, doing business as CUE Software ("we," "us," "our," or "Licensor"), for the CUE SAMPLER software plugin, including any associated files, documentation, and updates we choose to provide (collectively, the "Software").
+
+By downloading, installing, purchasing, or using the Software, you agree to be bound by this Agreement. If you do not agree, do not download, install, or use the Software.
+
+---
+
+1. License Grant
+
+Subject to your compliance with this Agreement and payment of the applicable fee, we grant you a non-exclusive, non-transferable, revocable license to install and use the Software for your own personal or commercial music-production purposes.
+
+You may install and use the Software on computers that you own or control.
+
+2. Restrictions
+
+You may not:
+
+- Sell, rent, lease, sublicense, distribute, or otherwise transfer the Software or your license to any third party;
+- Share, publish, or distribute your license key, download link, or account credentials;
+- Copy the Software except for a single reasonable backup copy;
+- Reverse engineer, decompile, disassemble, or attempt to derive the source code of the Software, except to the extent this restriction is prohibited by applicable law;
+- Modify, adapt, translate, or create derivative works based on the Software;
+- Remove, alter, or obscure any proprietary notices, labels, or marks on the Software;
+- Use the Software in any unlawful manner or in violation of any applicable law or regulation.
+
+3. Beta Software
+
+You acknowledge that the Software is provided as a BETA release. This means:
+
+- The Software is still in development and may contain errors, bugs, defects, or other issues;
+- The Software may behave unexpectedly, crash, fail to function, or cause your host application (DAW) to crash;
+- The Software may change, be discontinued, or become unavailable at any time without notice;
+- You use the Software at your own risk and are solely responsible for backing up your projects, audio, and data before use.
+
+We make no promise that any particular feature will be added, completed, maintained, or supported.
+
+4. Updates
+
+We may, at our sole discretion, release updates, bug fixes, or new versions of the Software. We are under no obligation to provide any updates, upgrades, support, or maintenance. Any updates we do provide are governed by this Agreement unless accompanied by a separate license. Your purchase does not entitle you to lifetime updates or any guaranteed future versions.
+
+5. Payment and No Refunds
+
+The Software is a paid digital product delivered electronically.
+
+ALL SALES ARE FINAL. NO REFUNDS WILL BE PROVIDED. Because the Software is a digital good delivered immediately upon purchase, you are not entitled to a refund, exchange, or credit for any reason, including but not limited to dissatisfaction, lack of use, incompatibility with your system, or defects associated with the beta nature of the Software.
+
+Where applicable law grants you a mandatory statutory right to a refund or withdrawal that cannot be waived, that right is not affected by this section. By purchasing and downloading the Software, where permitted, you expressly request immediate delivery and acknowledge that this may end any statutory right of withdrawal.
+
+6. Data Collection and Privacy
+
+The Software includes an optional data-sharing feature that is turned OFF by default. No usage data is collected from or transmitted by the Software unless you affirmatively enable this feature using the in-plugin toggle, and you may disable it again at any time. When enabled, the Software collects and transmits limited, anonymous technical data (such as a random installation identifier, a one-way hash of loaded audio, and tempo/key detection results and corrections) solely to improve the Software's detection accuracy. The Software does not collect or transmit your actual audio recordings.
+
+Your use of the Software, and any data collected through it, is governed by our Privacy Policy, available at https://cuesampler.com/privacy, which is incorporated into this Agreement by reference. By using the Software, you acknowledge the data practices described in the Privacy Policy.
+
+7. Ownership
+
+The Software is licensed, not sold. We and our licensors retain all right, title, and interest in and to the Software, including all intellectual property rights. This Agreement does not grant you any rights to our trademarks, logos, or service marks.
+
+8. No Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE," WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, WE DISCLAIM ALL WARRANTIES, INCLUDING BUT NOT LIMITED TO THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. WE DO NOT WARRANT THAT THE SOFTWARE WILL BE UNINTERRUPTED, ERROR-FREE, SECURE, OR FREE OF HARMFUL COMPONENTS, OR THAT DEFECTS WILL BE CORRECTED.
+
+9. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL WE BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES, OR FOR ANY LOSS OF PROFITS, DATA, AUDIO, PROJECTS, GOODWILL, OR OTHER INTANGIBLE LOSSES, ARISING OUT OF OR RELATING TO YOUR USE OF OR INABILITY TO USE THE SOFTWARE, EVEN IF WE HAVE BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+IN ANY CASE, OUR TOTAL CUMULATIVE LIABILITY ARISING OUT OF OR RELATING TO THIS AGREEMENT OR THE SOFTWARE SHALL NOT EXCEED THE AMOUNT YOU ACTUALLY PAID FOR THE SOFTWARE.
+
+Some jurisdictions do not allow the exclusion or limitation of certain warranties or liabilities, so some of the above may not apply to you.
+
+10. Termination
+
+This Agreement is effective until terminated. Your rights under this Agreement will terminate automatically and without notice if you fail to comply with any of its terms. Upon termination, you must cease all use of the Software and delete all copies in your possession. Sections 6 through 12 survive termination.
+
+11. Governing Law
+
+This Agreement shall be governed by and construed in accordance with the laws of the State of New York, United States, without regard to its conflict-of-law principles. You agree that any dispute arising under this Agreement shall be subject to the exclusive jurisdiction of the state and federal courts located in New York.
+
+12. Entire Agreement
+
+This Agreement constitutes the entire agreement between you and us regarding the Software and supersedes all prior or contemporaneous understandings. If any provision of this Agreement is held to be unenforceable, the remaining provisions will remain in full force and effect.
+
+13. Contact
+
+Questions about this Agreement may be sent to:
+
+CUE Software
+Email: cue@cuesampler.com
+Website: https://cuesampler.com
+
+---
+
+By installing or using CUE SAMPLER, you acknowledge that you have read, understood, and agree to be bound by this Agreement.
