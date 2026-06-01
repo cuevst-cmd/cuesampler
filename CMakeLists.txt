@@ -11,6 +11,11 @@ include(FetchContent)
 
 if(APPLE)
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Build for both architectures" FORCE)
+    # Minimum supported macOS. Without this, the binary inherits the build
+    # machine's SDK version as its floor (macOS 26), which makes the plugin
+    # refuse to load on older systems. macOS 15.0 is our supported floor; the
+    # bundled onnxruntime (minos 13.3) is satisfied by this.
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS version" FORCE)
 endif()
 
 set(BUILD_TOOLS OFF CACHE BOOL "" FORCE)
