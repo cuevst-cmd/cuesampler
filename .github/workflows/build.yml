@@ -1,0 +1,72 @@
+name: Build CUE Sampler
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel an in-progress run when a newer commit is pushed to the same ref.
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ windows-latest, macos-latest ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        # JUCE / Bungee / ONNX are pulled by CMake FetchContent, not submodules,
+        # so no submodule checkout is needed.
+
+      - name: Install CMake + Ninja
+        uses: lukka/get-cmake@latest
+
+      - name: Set up MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Generate APIKeys.h
+        shell: bash
+        env:
+          API_KEYS_H: ${{ secrets.API_KEYS_H }}
+        run: |
+          if [ -n "$API_KEYS_H" ]; then
+            printf '%s' "$API_KEYS_H" > APIKeys.h
+            echo "APIKeys.h written from the API_KEYS_H secret."
+          else
+            cp APIKeys.h.example APIKeys.h
+            echo "No API_KEYS_H secret set — using APIKeys.h.example (placeholder keys)."
+          fi
+
+      - name: Configure
+        run: >
+          cmake -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCUE_COPY_PLUGIN_AFTER_BUILD=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: List build artefacts
+        shell: bash
+        run: find build/CueSampler_artefacts -maxdepth 4 -name "*.vst3" -o -name "*.component" -o -name "*.exe" -o -name "*.app" 2>/dev/null || true
+
+      - name: Upload artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cue-sampler-${{ matrix.os }}
+          if-no-files-found: error
+          path: |
+            build/CueSampler_artefacts/Release/VST3/**
+            build/CueSampler_artefacts/Release/AU/**
+            build/CueSampler_artefacts/Release/Standalone/**

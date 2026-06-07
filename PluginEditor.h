@@ -14,6 +14,7 @@ class TransportSectionComponent;
 class UtilityStripComponent;
 class EffectsRackComponent;
 class StartKnobComponent;
+class UpdateBannerComponent;
 }
 
 //==============================================================================
@@ -37,6 +38,10 @@ public:
 private:
     float getUiScale() const noexcept;
 
+    // Reveals the "new version available" banner from the update checker's
+    // result. Idempotent: only builds/shows the banner once per session.
+    void showUpdateBannerIfNeeded();
+
     void paintSideRail (juce::Graphics&, juce::Rectangle<int>, bool isLeftRail) const;
     void paintScrew (juce::Graphics&, juce::Point<float>) const;
 
@@ -52,6 +57,7 @@ private:
     std::unique_ptr<cue::EffectsRackComponent> effectsRackComponent;
 
     std::unique_ptr<cue::HelpOverlayComponent> helpOverlayComponent;
+    std::unique_ptr<cue::UpdateBannerComponent> updateBannerComponent;
     std::unique_ptr<juce::FileChooser> fileChooser;
 
     juce::TooltipWindow tooltipWindow { this, 500 };

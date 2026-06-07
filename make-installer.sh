@@ -22,7 +22,10 @@ AU="build/CueSampler_artefacts/Release/AU/CUE SAMPLER.component"
 STAGE="$(mktemp -d)"
 OUT="dist"
 UNSIGNED="$STAGE/unsigned.pkg"
-SIGNED="$OUT/CUE SAMPLER ${VERSION}.pkg"
+# URL-safe filename (no spaces) so GitHub Release asset links don't need %20
+# escaping. The installer UI title still reads "CUE SAMPLER" (from the
+# distribution.xml <title>), independent of this filename.
+SIGNED="$OUT/CUESAMPLER-${VERSION}.pkg"
 mkdir -p "$OUT"
 
 # --- Stage the bundles into their real install locations -------------------
@@ -89,7 +92,18 @@ echo "==> Stapling ticket to installer..."
 xcrun stapler staple "$SIGNED"
 xcrun stapler validate "$SIGNED"
 
+# --- Emit a SHA-256 sidecar for the in-app updater to verify the download -----
+SHA_FILE="${SIGNED}.sha256"
+shasum -a 256 "$SIGNED" | awk '{print $1}' > "$SHA_FILE"
+echo "==> SHA-256: $(cat "$SHA_FILE")"
+
 rm -rf "$STAGE"
 echo
 echo "Done: $SIGNED"
+echo "      $SHA_FILE"
+echo
+echo "Publish to GitHub Releases (tag drives the version users compare against):"
+echo "  gh release create v${VERSION} \\"
+echo "    \"$SIGNED\" \"$SHA_FILE\" \\"
+echo "    --title \"CUE SAMPLER ${VERSION}\" --notes \"...\""
 spctl -a -vvv -t install "$SIGNED" 2>&1 || true

@@ -6,6 +6,7 @@
 #include "AudioFingerprinter.h"
 #include "BeatThisAnalyzer.h"
 #include "EditTelemetry.h"
+#include "UpdateChecker.h"
 #include "KeyDetector.h"
 #include "ChopAudioCache.h"
 #include "SSLBusCompressor.h"
@@ -123,6 +124,18 @@ public:
     void setPitchSemitones (float newSemitones) noexcept;
     void setSyncToHost (bool shouldSync) noexcept;
     void setHalfTimeEnabled (bool shouldEnable) noexcept;
+
+    // MIDI octave shift, in octaves, applied to the chop note mapping so users
+    // whose keyboard lacks octave buttons can reach all chops. 0 = default
+    // (C2 -> chop 1). Clamped to [midiOctaveOffsetMin, midiOctaveOffsetMax].
+    void setMidiOctaveOffset (int octaves) noexcept;
+    int  getMidiOctaveOffset() const noexcept;
+
+    // Lowest MIDI note that triggers chop 1 with the current octave shift.
+    int  getMidiRootNote() const noexcept;
+
+    static constexpr int midiOctaveOffsetMin = -3;
+    static constexpr int midiOctaveOffsetMax = 4;
     void setGridBpmTrim (float trimBpm);
     void setGridStartOffset (float offsetSeconds);
     void setWaveformZoom (float zoomValue) noexcept;
@@ -180,6 +193,10 @@ public:
     // detection deltas are recorded locally (see EditTelemetry). Defaults off.
     bool isTelemetryEnabled() const noexcept { return editTelemetry.isEnabled(); }
     void setTelemetryEnabled (bool shouldEnable) { editTelemetry.setEnabled (shouldEnable); }
+
+    // In-app software update checker (GitHub Releases). The editor reads its
+    // result to show a "new version available" banner. See UpdateChecker.
+    cuesampler::UpdateChecker& getUpdateChecker() noexcept { return updateChecker; }
     std::shared_ptr<const TempoAnalysisData> getTempoAnalysis() const;
     std::shared_ptr<const TempoEditState> getTempoEditState() const;
     std::shared_ptr<const ChopState> getChopState() const;
@@ -257,6 +274,13 @@ public:
     void setSelectedChopPitchSemitones (float pitchSemitones);
     void toggleSelectedChopFavorite();
 
+    // Edit undo. Snapshots the chop list + grid trim/offset/bars before each
+    // destructive chop edit so the user can step back through their changes.
+    // (DAW-level parameter automation is undone by the host; this covers the
+    // non-parameter chop/grid edit state.) Message-thread facing.
+    bool canUndoEdit() const noexcept;
+    void undoLastEdit();
+
     // Renders a chop to a 24-bit WAV in the OS temp directory with all parameters baked in.
     // applySync stretches the audio to match the current DAW tempo when sync is enabled.
     // Called from the message thread. Returns an invalid File on failure.
@@ -299,6 +323,7 @@ private:
         bool restoredSyncToHost = false;
         bool restoredHalfTime = false;
         int restoredBarsPerChop = 1;
+        int restoredMidiOctaveOffset = 0;
         double restoredPlaybackPosition = 0.0;
     };
 
@@ -306,6 +331,7 @@ private:
     KeyDetector keyDetector;
     AudioFingerprinter audioFingerprinter;
     cuesampler::EditTelemetry editTelemetry;
+    cuesampler::UpdateChecker updateChecker;
     KeyDetector::Result detectedKeyResult;
     mutable std::mutex keyResultMutex;
 
@@ -381,6 +407,31 @@ private:
     std::shared_ptr<TempoEditState> tempoEditState;
     std::shared_ptr<ChopState> chopState;
 
+    // Undo history for chop/grid edits. Each snapshot is the full editable
+    // state captured *before* a destructive edit. Guarded by editUndoLock so
+    // it can be cleared from the (possibly background) sample-restore path as
+    // well as the message thread.
+    struct EditUndoSnapshot
+    {
+        std::shared_ptr<ChopState> chopState;
+        float gridBpmTrim = 0.0f;
+        float gridStartOffset = 0.0f;
+        int   chopBarsCount = 1;
+    };
+
+    // Captures the current edit state before a mutation. A non-empty
+    // coalesceKey collapses a rapid run of same-kind edits (e.g. a knob/edge
+    // drag) into a single undo step.
+    void pushEditUndoSnapshot (const juce::String& coalesceKey);
+    void clearEditUndoHistory();
+
+    mutable juce::CriticalSection editUndoLock;
+    std::vector<EditUndoSnapshot> editUndoStack;
+    juce::String editUndoCoalesceKey;
+    double editUndoLastSnapshotMs = 0.0;
+    static constexpr size_t maxEditUndoDepth = 64;
+    static constexpr double editUndoCoalesceWindowMs = 600.0;
+
     VoiceState voices[2];
     int activeVoiceIdx = 0;
 
@@ -436,6 +487,7 @@ private:
     std::atomic<float> gridBpmTrim { 0.0f };
     std::atomic<int> chopBarsCount { 1 };
     std::atomic<int> heldMidiNote { -1 };
+    std::atomic<int> midiOctaveOffset { 0 };
     std::atomic<float> gridStartOffset { 0.0f };
     std::atomic<float> waveformZoom { 0.25f };
     std::atomic<float> waveformScroll { 0.0f };

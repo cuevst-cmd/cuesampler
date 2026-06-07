@@ -1,0 +1,53 @@
+diff --git a/bungee/Stream.h b/bungee/Stream.h
+index 61bb572..576fd66 100644
+--- a/bungee/Stream.h
++++ b/bungee/Stream.h
+@@ -93,6 +93,15 @@ class Stream
+ 			assert(muteHead >= (inputChunk.end - inputChunk.begin) || muteTail <= 0);
+ 			stretcher.analyseGrain(buffer.data() - muteHead, channelStride, muteHead, muteTail);
+ 		}
++
++		void reset()
++		{
++			// Zero the buffer content to eliminate stale audio from the previous note.
++			// Do NOT touch begin/end — they are absolute position counters; resetting them
++			// to 0 would make subsequent grain-centre calculations negative, causing a crash.
++			std::fill(buffer.begin(), buffer.end(), 0.f);
++			inputChunk = {};
++		}
+ 	};
+ 
+ 	const int channelCount;
+@@ -120,6 +129,32 @@ public:
+ 		request.position = std::numeric_limits<double>::quiet_NaN();
+ 	}
+ 
++	/**
++	 * @brief Reset the stream to its initial state, ready for a new note/playback position.
++	 * @details Completes the pending grain cycle so the Stretcher's internal call-sequence
++	 * counter returns to 0 (specifyGrain expected next). Without this, calling process()
++	 * again after reset would trigger a "called in wrong order" abort inside specifyGrain.
++	 * Then clears the input ring buffer and all output state.
++	 */
++	void reset()
++	{
++		// Each process() call ends with specifyGrain having been called (expected = 1).
++		// We must complete the cycle (analyseGrain + synthesiseGrain) to bring expected
++		// back to 0 before the next note's specifyGrain call.
++		if (!std::isnan(request.position))
++		{
++			inputBuffer.analyseGrain();
++			inputBuffer.stretcher.synthesiseGrain(outputChunk);
++			outputChunkConsumed = 0;
++		}
++
++		request.position = std::numeric_limits<double>::quiet_NaN();
++		outputChunk = {};
++		outputChunkConsumed = 0;
++		framesNeeded = 0.;
++		inputBuffer.reset();
++	}
++
+ 	/**
+ 	 * @brief Process a segment of audio.
+ 	 *

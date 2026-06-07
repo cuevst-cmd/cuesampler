@@ -9,6 +9,11 @@ cmake_minimum_required(VERSION 3.22)
 project(CUESAMPLER VERSION 0.0.1)
 include(FetchContent)
 
+# Copy the built plugin into the OS plugin directory after each build. On by
+# default for local dev; CI sets -DCUE_COPY_PLUGIN_AFTER_BUILD=OFF so it never
+# tries to write to a system location (e.g. Program Files) on the runner.
+option(CUE_COPY_PLUGIN_AFTER_BUILD "Install plugin to the default OS plugin dir after build" ON)
+
 if(APPLE)
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Build for both architectures" FORCE)
     # Minimum supported macOS. Without this, the binary inherits the build
@@ -38,15 +43,51 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # included JUCE directly in your source tree (perhaps as a submodule), you'll need to tell CMake to
 # include that subdirectory as part of the build.
 
-add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../JUCE" "${CMAKE_CURRENT_BINARY_DIR}/JUCE")
+# JUCE — pinned to the version used locally (8.0.12). Fetched on a clean
+# checkout / CI so no sibling ../JUCE folder is required.
+FetchContent_Declare(JUCE
+    GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
+    GIT_TAG 8.0.12
+    GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(JUCE)
 
-set(BUNGEE_SOURCE_DIR "/Users/jerryvolpe/Documents/AutoChopSampler/cmake-build-debug/_deps/bungee-src")
-if (NOT EXISTS "${BUNGEE_SOURCE_DIR}/CMakeLists.txt")
-    message(FATAL_ERROR "Local Bungee source tree not found at ${BUNGEE_SOURCE_DIR}")
-endif()
-
+# Bungee (time-stretch) — pinned to the exact commit previously used locally.
+# Bungee vendors Eigen as a git submodule under submodules/eigen, which
+# FetchContent initialises by default. No GIT_SHALLOW here: shallow clones
+# can't reliably fetch an arbitrary commit SHA.
+#
+# PATCH_COMMAND applies our local Stream::reset() addition (see
+# patches/bungee-stream-reset.patch) on top of pristine upstream. The plugin
+# depends on it; keeping it as a patch avoids maintaining a Bungee fork.
 set(BUNGEE_BUILD_SHARED_LIBRARY OFF CACHE BOOL "" FORCE)
-add_subdirectory("${BUNGEE_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/bungee")
+FetchContent_Declare(bungee
+    GIT_REPOSITORY https://github.com/bungee-audio-stretch/bungee.git
+    GIT_TAG 7354c0c62652dd85af90fddfeec307881f3b4252
+    PATCH_COMMAND ${CMAKE_COMMAND}
+        -DSRC_DIR=<SOURCE_DIR>
+        -DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/bungee-stream-reset.patch
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/patches/apply_bungee_patch.cmake)
+FetchContent_MakeAvailable(bungee)
+
+# ONNX Runtime 1.20.1 — official prebuilt package, downloaded per-platform.
+# Not committed to the repo (binaries are gitignored). The archive has no
+# CMakeLists.txt, so FetchContent_MakeAvailable just populates it.
+if(APPLE)
+    FetchContent_Declare(onnxruntime
+        URL https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-osx-universal2-1.20.1.tgz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+elseif(WIN32)
+    FetchContent_Declare(onnxruntime
+        URL https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-win-x64-1.20.1.zip
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+endif()
+FetchContent_MakeAvailable(onnxruntime)
+set(ONNXRUNTIME_ROOT "${onnxruntime_SOURCE_DIR}")
+if(APPLE)
+    set(ORT_LINK_LIB "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.1.20.1.dylib")
+elseif(WIN32)
+    set(ORT_LINK_LIB "${ONNXRUNTIME_ROOT}/lib/onnxruntime.lib")
+endif()
 
 # If you are building a VST2 or AAX plugin, CMake needs to be told where to find these SDKs on your
 # system. This setup should be done before calling `juce_add_plugin`.
@@ -70,7 +111,7 @@ juce_add_plugin(CueSampler
     # NEEDS_MIDI_OUTPUT TRUE/FALSE              # Does the plugin need midi output?
     # IS_MIDI_EFFECT TRUE/FALSE                 # Is this plugin a MIDI effect?
     # EDITOR_WANTS_KEYBOARD_FOCUS TRUE/FALSE    # Does the editor need keyboard focus?
-    COPY_PLUGIN_AFTER_BUILD TRUE                # Install the plugin to the default location after each build
+    COPY_PLUGIN_AFTER_BUILD ${CUE_COPY_PLUGIN_AFTER_BUILD}  # Install to the default plugin dir after each build (off in CI)
     COMPANY_NAME "CUE SOFTWARE"
     BUNDLE_ID "com.cuesoftware.cuesampler"
     PLUGIN_MANUFACTURER_CODE Cues               # A four-character manufacturer id with at least one upper-case character
@@ -96,6 +137,7 @@ target_sources(CueSampler
     PRIVATE
         AudioFingerprinter.cpp
         EditTelemetry.cpp
+        UpdateChecker.cpp
         KeyDetector.cpp
         PluginEditor.cpp
         PluginProcessor.cpp
@@ -117,7 +159,10 @@ target_compile_definitions(CueSampler
         # JUCE_WEB_BROWSER and JUCE_USE_CURL would be on by default, but you might not need them.
         JUCE_WEB_BROWSER=0  # If you remove this, add `NEEDS_WEB_BROWSER TRUE` to the `juce_add_plugin` call
         JUCE_USE_CURL=0     # If you remove this, add `NEEDS_CURL TRUE` to the `juce_add_plugin` call
-        JUCE_VST3_CAN_REPLACE_VST2=0)
+        JUCE_VST3_CAN_REPLACE_VST2=0
+        # Running version for the in-app update checker (compared against the
+        # newest GitHub Release). Single source of truth: project(... VERSION).
+        CUE_VERSION_STRING="${PROJECT_VERSION}")
 
 # If your target needs extra binary assets, you can add them here. The first argument is the name of
 # a new static library target that will include all the binary resources. There is an optional
@@ -145,7 +190,7 @@ target_link_libraries(CueSampler
         juce::juce_dsp
         chromaprint
         bungee_library
-        "${CMAKE_CURRENT_SOURCE_DIR}/libs/onnxruntime/lib/libonnxruntime.dylib"
+        "${ORT_LINK_LIB}"
     PUBLIC
         juce::juce_recommended_config_flags
         juce::juce_recommended_lto_flags
@@ -153,18 +198,19 @@ target_link_libraries(CueSampler
 
 target_include_directories(CueSampler
     PRIVATE
-        "${BUNGEE_SOURCE_DIR}"
-        "${BUNGEE_SOURCE_DIR}/submodules/eigen"
+        "${bungee_SOURCE_DIR}"
+        "${bungee_SOURCE_DIR}/submodules/eigen"
         "${chromaprint_SOURCE_DIR}/src"
-        "${CMAKE_CURRENT_SOURCE_DIR}/libs/onnxruntime/include")
+        "${ONNXRUNTIME_ROOT}/include")
 
 # ── Self-contained VST3 bundle ────────────────────────────────────────────────
 # Copies libonnxruntime into Contents/MacOS/ (so @loader_path resolves it) and
 # ONNX model files into Contents/Resources/, then patches the binary's dylib
 # reference to use @loader_path.  The resulting .vst3 can be zipped and sent to
 # beta testers with no external dependencies.
-set(ONNX_DYLIB "${CMAKE_CURRENT_SOURCE_DIR}/libs/onnxruntime/lib/libonnxruntime.1.20.1.dylib")
+set(ONNX_DYLIB "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.1.20.1.dylib")
 
+if(APPLE)
 add_custom_command(TARGET CueSampler_VST3 POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory
         "$<TARGET_FILE_DIR:CueSampler_VST3>/../Resources"
@@ -229,3 +275,26 @@ add_custom_command(TARGET CueSampler_AU POST_BUILD
 
     COMMENT "Bundling libonnxruntime + ONNX model into AU and re-signing"
 )
+
+elseif(WIN32)
+    # Windows: no install_name/codesign step. Just stage onnxruntime.dll and the
+    # ONNX model next to each runnable binary. findOnnxModel() in
+    # PluginProcessor.cpp looks "next to the binary" (fallback #2), and Windows
+    # resolves a DLL's dependencies from its own directory, so this is enough for
+    # the .vst3 / Standalone to run self-contained.
+    foreach(_fmt VST3 Standalone)
+        if(TARGET CueSampler_${_fmt})
+            add_custom_command(TARGET CueSampler_${_fmt} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${ONNXRUNTIME_ROOT}/lib/onnxruntime.dll"
+                    "$<TARGET_FILE_DIR:CueSampler_${_fmt}>/onnxruntime.dll"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${CMAKE_CURRENT_SOURCE_DIR}/assets/beat_this.onnx"
+                    "$<TARGET_FILE_DIR:CueSampler_${_fmt}>/beat_this.onnx"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${CMAKE_CURRENT_SOURCE_DIR}/assets/beat_this.onnx.data"
+                    "$<TARGET_FILE_DIR:CueSampler_${_fmt}>/beat_this.onnx.data"
+                COMMENT "Windows: staging onnxruntime.dll + ONNX model next to CueSampler_${_fmt}")
+        endif()
+    endforeach()
+endif() # APPLE / WIN32 — platform-specific bundling

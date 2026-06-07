@@ -1638,6 +1638,16 @@ public:
         helpButton.onClick = [this] { if (onHelpRequested) onHelpRequested(); };
         addAndMakeVisible (helpButton);
 
+        // Steps back through chop/grid edits (add/delete/resize/transient-chop,
+        // cue/gain/pitch, warp markers, tempo trim & start). Disabled when there
+        // is nothing to undo.
+        configureButton (undoButton, "UNDO", textPrimary);
+        undoButton.getProperties().set ("cueStyle", "helpButton");
+        undoButton.setTooltip ("Undo the last chop edit.");
+        undoButton.setEnabled (processor.canUndoEdit());
+        undoButton.onClick = [this] { processor.undoLastEdit(); };
+        addAndMakeVisible (undoButton);
+
         // Opt-in data-sharing toggle. Lights up (toggle "on" colour) when the
         // user has consented to share anonymous BPM/key detection data.
         configureButton (dataButton, "DATA", textPrimary);
@@ -1670,9 +1680,11 @@ public:
         constexpr int rightMargin = 14;
         constexpr int topMargin = 10;
         constexpr int dataWidth = 46;
+        constexpr int undoWidth = 54;
         constexpr int gap = 8;
         helpButton.setBounds (getWidth() - rightMargin - buttonSize, topMargin, buttonSize, buttonSize);
         dataButton.setBounds (helpButton.getX() - gap - dataWidth, topMargin, dataWidth, buttonSize);
+        undoButton.setBounds (dataButton.getX() - gap - undoWidth, topMargin, undoWidth, buttonSize);
     }
 
     std::function<void()> onHelpRequested;
@@ -1783,6 +1795,11 @@ public:
 private:
     void timerCallback() override
     {
+        // Keep the undo button's enabled state in sync even when the realtime
+        // meter animation is throttled (e.g. plugin window hidden).
+        if (const bool canUndo = processor.canUndoEdit(); canUndo != undoButton.isEnabled())
+            undoButton.setEnabled (canUndo);
+
         if (! shouldRunRealtimeUi (*this))
             return;
 
@@ -1792,6 +1809,7 @@ private:
     AudioPluginAudioProcessor& processor;
     SmoothHoverButton helpButton;
     SmoothHoverButton dataButton;
+    SmoothHoverButton undoButton;
     juce::Image logoImage;
 };
 
@@ -4360,6 +4378,27 @@ public:
         };
         addAndMakeVisible (clearWarpButton);
 
+        configureButton (octDownButton, "OCT -", textPrimary.withAlpha (0.85f));
+        configureButton (octUpButton,   "OCT +", textPrimary.withAlpha (0.85f));
+        octDownButton.getProperties().set ("cueStyle", "flatAction");
+        octUpButton.getProperties().set ("cueStyle", "flatAction");
+        octDownButton.setTooltip ("Shift the MIDI note mapping down one octave. Use this to reach the chops if your keyboard has no octave buttons.");
+        octUpButton.setTooltip ("Shift the MIDI note mapping up one octave. Use this to reach the chops if your keyboard has no octave buttons.");
+        octDownButton.onClick = [this]
+        {
+            processor.setMidiOctaveOffset (processor.getMidiOctaveOffset() - 1);
+            updateOctaveControls();
+            repaint();
+        };
+        octUpButton.onClick = [this]
+        {
+            processor.setMidiOctaveOffset (processor.getMidiOctaveOffset() + 1);
+            updateOctaveControls();
+            repaint();
+        };
+        addAndMakeVisible (octDownButton);
+        addAndMakeVisible (octUpButton);
+
         warpDivisionCombo.setTooltip ("Snap newly placed warp markers to this grid division.");
         warpDivisionCombo.addItem ("BAR",  AudioPluginAudioProcessor::WarpDivision_Bar       + 1);
         warpDivisionCombo.addItem ("BEAT", AudioPluginAudioProcessor::WarpDivision_Beat      + 1);
@@ -4458,8 +4497,8 @@ public:
 
         g.setColour (textMuted.brighter (0.18f).withAlpha (0.62f));
         g.setFont (heavyFont (9.6f).withExtraKerningFactor (0.06f));
-        g.drawText ("MIDI: C2 = chop 1,  D2 = chop 2 ...",
-                    juce::Rectangle<int> (452, (int) bottomPanel.getY() + 94, 328, 13),
+        g.drawText (getMidiMappingText(),
+                    juce::Rectangle<int> (570, (int) bottomPanel.getY() + 94, 198, 13),
                     juce::Justification::centred, false);
 
         drawHelperText (g, "Load audio - tempo/key are detected automatically",
@@ -4508,6 +4547,12 @@ public:
         warpButton.setBounds (468, warpRowY, 80, 22);
         clearWarpButton.setBounds (556, warpRowY, 80, 22);
         warpDivisionCombo.setBounds (644, warpRowY, 80, 22);
+
+        // Octave shift buttons sit side by side, with the (dynamic) MIDI
+        // mapping hint to their right.
+        const int octRowY = bottomPanel.getY() + 91;
+        octDownButton.setBounds (468, octRowY, 44, 18);
+        octUpButton.setBounds (516, octRowY, 44, 18);
     }
 
     juce::TextButton& getLoadButton() noexcept { return loadButton; }
@@ -4538,6 +4583,7 @@ private:
         updateTempoDisplay();
         updateKeyDisplay();
         updateChopControls();
+        updateOctaveControls();
     }
 
     void syncWarpAccentState()
@@ -4784,6 +4830,28 @@ private:
         pitchKnob.getSlider().setValue ((double) selectedChop->pitchSemitones, juce::dontSendNotification);
     }
 
+    // Note name in the plugin's convention (MIDI 36 = C2, i.e. octave = note / 12 - 1).
+    static juce::String midiNoteName (int noteNumber)
+    {
+        static const char* names[12] = { "C", "C#", "D", "D#", "E", "F",
+                                         "F#", "G", "G#", "A", "A#", "B" };
+        const int octave = noteNumber / 12 - 1;
+        return juce::String (names[((noteNumber % 12) + 12) % 12]) + juce::String (octave);
+    }
+
+    juce::String getMidiMappingText() const
+    {
+        const int root = processor.getMidiRootNote();
+        return "MIDI: " + midiNoteName (root) + " = chop 1,  "
+                        + midiNoteName (root + 2) + " = chop 2 ...";
+    }
+
+    void updateOctaveControls()
+    {
+        octDownButton.setEnabled (processor.getMidiOctaveOffset() > AudioPluginAudioProcessor::midiOctaveOffsetMin);
+        octUpButton.setEnabled   (processor.getMidiOctaveOffset() < AudioPluginAudioProcessor::midiOctaveOffsetMax);
+    }
+
     juce::Rectangle<int> getTopPanelBounds() const
     {
         return getLocalBounds().removeFromTop (102);
@@ -4805,6 +4873,8 @@ private:
     SmoothHoverButton loadButton;
     SmoothHoverButton warpButton;
     SmoothHoverButton clearWarpButton;
+    SmoothHoverButton octDownButton;
+    SmoothHoverButton octUpButton;
     juce::ComboBox   warpDivisionCombo;
 
     DisplayBox timeDisplay;
@@ -5156,6 +5226,64 @@ private:
     EffectModuleComponent bitCrusher;
     EffectModuleComponent compressor;
 };
+
+// Slim notification strip shown at the top of the editor when the update checker
+// finds a newer GitHub Release. "Update" opens the download in the browser (a
+// loaded plugin can't replace itself); "Later" suppresses this version.
+class UpdateBannerComponent final : public juce::Component
+{
+public:
+    std::function<void()> onDownload;
+    std::function<void()> onDismiss;
+
+    UpdateBannerComponent()
+    {
+        downloadButton.setButtonText ("UPDATE");
+        downloadButton.onClick = [this] { if (onDownload) onDownload(); };
+        addAndMakeVisible (downloadButton);
+
+        laterButton.setButtonText ("LATER");
+        laterButton.onClick = [this] { if (onDismiss) onDismiss(); };
+        addAndMakeVisible (laterButton);
+    }
+
+    void setVersion (const juce::String& version)
+    {
+        message = "New version " + version + " available";
+        repaint();
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        auto bounds = getLocalBounds().toFloat().reduced (1.0f);
+        cue::fillRoundedGradient (g, bounds, juce::Colour (0xff2c2c2c),
+                                  juce::Colour (0xff1b1b1b), 6.0f);
+        g.setColour (accentOrange.withAlpha (0.85f));
+        g.drawRoundedRectangle (bounds, 6.0f, 1.2f);
+
+        g.setColour (accentOrange);
+        g.fillRoundedRectangle (bounds.removeFromLeft (4.0f), 2.0f);
+
+        g.setColour (juce::Colours::white.withAlpha (0.92f));
+        g.setFont (cue::heavyFont (12.0f));
+        auto textArea = getLocalBounds().reduced (14, 0)
+                            .withTrimmedRight (laterButton.getWidth() + downloadButton.getWidth() + 24);
+        g.drawText (message, textArea, juce::Justification::centredLeft, true);
+    }
+
+    void resized() override
+    {
+        auto area = getLocalBounds().reduced (8, 6);
+        downloadButton.setBounds (area.removeFromRight (78));
+        area.removeFromRight (6);
+        laterButton.setBounds (area.removeFromRight (64));
+    }
+
+private:
+    juce::String message { "Update available" };
+    cue::SmoothHoverButton downloadButton;
+    cue::SmoothHoverButton laterButton;
+};
 } // namespace cue
 
 //==============================================================================
@@ -5380,6 +5508,23 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
         helpOverlayComponent->setVisible (nowVisible);
     };
 
+    // Software-update banner: a direct child of the editor (drawn over the
+    // scaled content), hidden until the checker reports a newer release.
+    updateBannerComponent = std::make_unique<cue::UpdateBannerComponent>();
+    updateBannerComponent->onDownload = [this]
+    {
+        const auto info = processorRef.getUpdateChecker().getResult();
+        const auto target = info.downloadUrl.isNotEmpty() ? info.downloadUrl : info.pageUrl;
+        if (target.isNotEmpty())
+            juce::URL (target).launchInDefaultBrowser();
+    };
+    updateBannerComponent->onDismiss = [this]
+    {
+        processorRef.getUpdateChecker().skipCurrentVersion();
+        updateBannerComponent->setVisible (false);
+    };
+    addChildComponent (*updateBannerComponent); // invisible by default
+
     setOpaque (true);
     setResizeLimits (juce::roundToInt ((float) cue::editorWidth * cue::minEditorScale),
                      juce::roundToInt ((float) cue::editorHeight * cue::minEditorScale),
@@ -5391,6 +5536,10 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     setSize (cue::editorWidth, cue::editorHeight);
     transportSectionComponent->refreshDisplays();
     startTimerHz (30);
+
+    // Show immediately if a cached result already flags an update; otherwise the
+    // 30 Hz timer will reveal it once the background check finishes.
+    showUpdateBannerIfNeeded();
 }
 
 AudioPluginAudioProcessorEditor::~AudioPluginAudioProcessorEditor()
@@ -5403,6 +5552,12 @@ AudioPluginAudioProcessorEditor::~AudioPluginAudioProcessorEditor()
 
 void AudioPluginAudioProcessorEditor::timerCallback()
 {
+    // Cheap atomic poll, always — reveals the banner when the background update
+    // check completes after the editor opened.
+    if (updateBannerComponent != nullptr && ! updateBannerComponent->isVisible()
+        && processorRef.getUpdateChecker().isUpdateAvailable())
+        showUpdateBannerIfNeeded();
+
     if (! cue::shouldRunRealtimeUi (*this))
         return;
 
@@ -5410,6 +5565,21 @@ void AudioPluginAudioProcessorEditor::timerCallback()
 
     const auto grDb = processorRef.getCompressorGainReductionDb();
     effectsRackComponent->getCompressorModule().setGainReductionDb (grDb);
+}
+
+void AudioPluginAudioProcessorEditor::showUpdateBannerIfNeeded()
+{
+    if (updateBannerComponent == nullptr || updateBannerComponent->isVisible())
+        return;
+
+    auto& checker = processorRef.getUpdateChecker();
+    if (! checker.isUpdateAvailable())
+        return;
+
+    updateBannerComponent->setVersion (checker.getResult().latestVersion);
+    updateBannerComponent->setVisible (true);
+    updateBannerComponent->toFront (false);
+    resized(); // position it now that it's visible
 }
 
 float AudioPluginAudioProcessorEditor::getUiScale() const noexcept
@@ -5512,6 +5682,16 @@ void AudioPluginAudioProcessorEditor::resized()
     utilityStripComponent->setBounds (910, 133, 120, 655);
     effectsRackComponent->setBounds (1062, 133, 278, 655);
     helpOverlayComponent->setBounds (96, 133, 782, 655);
+
+    // Update banner: centred strip near the top, drawn over the content. Sized
+    // in editor (unscaled) pixels since it is a direct child of the editor.
+    if (updateBannerComponent != nullptr && updateBannerComponent->isVisible())
+    {
+        const int bannerW = juce::jmin (460, getWidth() - 40);
+        const int bannerH = 34;
+        updateBannerComponent->setBounds ((getWidth() - bannerW) / 2, 10, bannerW, bannerH);
+        updateBannerComponent->toFront (false);
+    }
 }
 
 void AudioPluginAudioProcessorEditor::paintSideRail (juce::Graphics& g,
