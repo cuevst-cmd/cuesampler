@@ -134,6 +134,10 @@ public:
     // Lowest MIDI note that triggers chop 1 with the current octave shift.
     int  getMidiRootNote() const noexcept;
 
+    // Mirrors the incoming MIDI stream for the editor's on-screen keyboard,
+    // and injects notes played by clicking it back into processBlock.
+    juce::MidiKeyboardState keyboardState;
+
     static constexpr int midiOctaveOffsetMin = -3;
     static constexpr int midiOctaveOffsetMax = 4;
     void setGridBpmTrim (float trimBpm);

@@ -12,7 +12,7 @@ namespace cue
 namespace
 {
 constexpr int editorWidth = 1438;
-constexpr int editorHeight = 798;
+constexpr int editorHeight = 884; // 798 chassis + 86 keyboard strip
 constexpr float minEditorScale = 0.75f;
 constexpr float maxEditorScale = 1.5f;
 constexpr float defaultWaveformVerticalScale = 0.75f;
@@ -20,8 +20,10 @@ constexpr int sideRailWidth = 64;
 constexpr int headerRefreshHz = 20;
 constexpr int waveformRefreshHz = 30;
 constexpr int transportRefreshHz = 20;
-constexpr int smallKnobDiameter = 50;
-constexpr int effectKnobDiameter = 64;
+// Unified knob size across the whole UI. Both names kept so call sites read
+// in context, but they intentionally hold the same value.
+constexpr int smallKnobDiameter = 66;
+constexpr int effectKnobDiameter = 66;
 constexpr int preciseMiniKnobDragSensitivity = 3200;
 constexpr int maxZoomedScrollDragSensitivity = 13200;
 constexpr float zoomResponseMidpoint = 0.5f;
@@ -151,6 +153,177 @@ void fillPathGradient (juce::Graphics& g, const juce::Path& path, juce::Rectangl
     g.fillPath (path);
 }
 
+// --- Smoked glass panels -----------------------------------------------------
+// Panels are dark-grey "liquid glass" sheets over the orange gradient
+// faceplate. True backdrop blur is too expensive per-frame, so each panel
+// draws the slice of a pre-blurred copy of the background that sits behind it,
+// then smokes it with a translucent grey tint and a subtle rim light.
+
+// Text colours for labels painted directly on glass surfaces.
+const juce::Colour glassText (0xfff2f3f5);
+const juce::Colour glassTextMuted (0xffb9bdc6);
+
+// Control glass (buttons): deeper and more opaque than the panels so
+// controls still read as a layer above them.
+const juce::Colour controlGlassTop (0xd824262a);
+const juce::Colour controlGlassBottom (0xe2131417);
+
+const juce::Image& getGlassBlurImage()
+{
+    static const juce::Image image = juce::ImageCache::getFromMemory (
+        CueSamplerBinaryData::cue_background_blur_png,
+        CueSamplerBinaryData::cue_background_blur_pngSize);
+    return image;
+}
+
+// --- Mode-tinted backgrounds -------------------------------------------------
+// HALF TIME shifts the accent to blue and WARP to purple (see getOrange()).
+// The orange faceplate follows by hue-rotating the background images toward
+// the active accent. Variants are built lazily on first use and cached for
+// the process lifetime; the main image is rebuilt at design resolution so the
+// rotation stays fast and the cache small.
+
+int accentModeIndex()
+{
+    return isWarpModeActive ? 2 : (isHalfTimeActive ? 1 : 0);
+}
+
+float hueRotationForMode (int mode)
+{
+    const auto orange = juce::Colour (0xffff6900);
+    const auto target = mode == 2 ? juce::Colour (0xffa855f7)
+                      : mode == 1 ? juce::Colour (0xff0088ff)
+                                  : orange;
+    return target.getHue() - orange.getHue();
+}
+
+juce::Image createHueRotatedCopy (const juce::Image& source, float hueDelta,
+                                  int targetWidth, int targetHeight)
+{
+    // rescaled() returns the source itself when the size matches, so copy
+    // explicitly: BitmapData below must never mutate the shared original.
+    auto image = (source.getWidth() == targetWidth && source.getHeight() == targetHeight)
+                     ? source.createCopy()
+                     : source.rescaled (targetWidth, targetHeight, juce::Graphics::highResamplingQuality);
+
+    juce::Image::BitmapData data (image, juce::Image::BitmapData::readWrite);
+
+    for (int py = 0; py < data.height; ++py)
+        for (int px = 0; px < data.width; ++px)
+            data.setPixelColour (px, py, data.getPixelColour (px, py).withRotatedHue (hueDelta));
+
+    return image;
+}
+
+// Background for the current accent mode; 'base' is the full-res orange image.
+const juce::Image& getModeTintedBackground (const juce::Image& base)
+{
+    const int mode = accentModeIndex();
+
+    if (mode == 0 || ! base.isValid())
+        return base;
+
+    static juce::Image cache[3];
+    auto& slot = cache[mode];
+
+    if (! slot.isValid())
+        slot = createHueRotatedCopy (base, hueRotationForMode (mode), editorWidth, editorHeight);
+
+    return slot;
+}
+
+const juce::Image& getGlassBlurImageForMode()
+{
+    const auto& base = getGlassBlurImage();
+    const int mode = accentModeIndex();
+
+    if (mode == 0 || ! base.isValid())
+        return base;
+
+    static juce::Image cache[3];
+    auto& slot = cache[mode];
+
+    if (! slot.isValid())
+        slot = createHueRotatedCopy (base, hueRotationForMode (mode), base.getWidth(), base.getHeight());
+
+    return slot;
+}
+
+// Maps a component-local area into the editor's design space (the 1438x798
+// coordinate system the background image covers). Walks up the parent chain,
+// so it works for nested children of contentComponent too.
+juce::Rectangle<float> designSpaceArea (const juce::Component& component, juce::Rectangle<float> localArea)
+{
+    auto area = localArea;
+
+    for (const auto* c = &component; c->getParentComponent() != nullptr; c = c->getParentComponent())
+        area += c->getPosition().toFloat();
+
+    return area;
+}
+
+// Draws the blurred-background slice behind a panel. Assumes the caller has
+// already clipped to the panel shape. localArea/designArea describe the same
+// rectangle in the two coordinate spaces.
+void drawGlassBackdrop (juce::Graphics& g, juce::Rectangle<float> localArea, juce::Rectangle<float> designArea)
+{
+    const auto& image = getGlassBlurImageForMode();
+
+    if (! image.isValid())
+        return;
+
+    const auto transform = juce::AffineTransform::scale ((float) editorWidth / (float) image.getWidth(),
+                                                         (float) editorHeight / (float) image.getHeight())
+                               .translated (localArea.getX() - designArea.getX(),
+                                            localArea.getY() - designArea.getY());
+    g.drawImageTransformed (image, transform);
+}
+
+// Smoke tint over an already-clipped, already-backdropped glass shape.
+void finishGlassSurface (juce::Graphics& g, juce::Rectangle<float> area)
+{
+    juce::ColourGradient smoke (juce::Colour (0xff3c3f45).withAlpha (0.55f), area.getCentreX(), area.getY(),
+                                juce::Colour (0xff202226).withAlpha (0.68f), area.getCentreX(), area.getBottom(), false);
+    smoke.addColour (0.18, juce::Colour (0xff35383d).withAlpha (0.58f));
+    g.setGradientFill (smoke);
+    g.fillRect (area);
+}
+
+void fillGlassRounded (juce::Graphics& g, const juce::Component& component,
+                       juce::Rectangle<float> area, float cornerSize)
+{
+    {
+        juce::Graphics::ScopedSaveState state (g);
+        juce::Path clip;
+        clip.addRoundedRectangle (area, cornerSize);
+        g.reduceClipRegion (clip);
+
+        drawGlassBackdrop (g, area, designSpaceArea (component, area));
+        finishGlassSurface (g, area);
+    }
+
+    g.setColour (juce::Colours::white.withAlpha (0.26f));
+    g.drawRoundedRectangle (area.reduced (0.5f), cornerSize, 1.0f);
+    g.setColour (juce::Colours::black.withAlpha (0.30f));
+    g.drawRoundedRectangle (area.expanded (0.5f), cornerSize + 0.5f, 1.0f);
+}
+
+// Path variant for non-rectangular glass (side rails). Assumes the graphics
+// context is already in design space, i.e. localArea == designArea.
+void fillGlassPath (juce::Graphics& g, const juce::Path& path, juce::Rectangle<float> designArea)
+{
+    {
+        juce::Graphics::ScopedSaveState state (g);
+        g.reduceClipRegion (path);
+
+        drawGlassBackdrop (g, designArea, designArea);
+        finishGlassSurface (g, designArea);
+    }
+
+    g.setColour (juce::Colours::white.withAlpha (0.22f));
+    g.strokePath (path, juce::PathStrokeType (1.0f));
+}
+
 float getEffectiveZoomLevel (float zoomControlValue) noexcept
 {
     const auto clampedZoom = juce::jlimit (0.0f, 1.0f, zoomControlValue);
@@ -221,20 +394,22 @@ void configureButton (juce::TextButton& button, const juce::String& text, juce::
 {
     button.setButtonText (text);
     button.setClickingTogglesState (false);
-    button.setColour (juce::TextButton::buttonColourId, blackPanel);
-    button.setColour (juce::TextButton::buttonOnColourId, panelDark.brighter (0.08f));
+    button.setColour (juce::TextButton::buttonColourId, juce::Colour (0xe017191c));
+    button.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xe62b2d31));
     button.setColour (juce::TextButton::textColourOffId, textColour);
     button.setColour (juce::TextButton::textColourOnId, textColour);
     button.setWantsKeyboardFocus (false);
     button.setMouseClickGrabsKeyboardFocus (false);
 }
 
+// Defaults to dark-on-glass; pass a light colour for hints inside dark screens.
 void drawHelperText (juce::Graphics& g, const juce::String& text,
                      juce::Rectangle<int> bounds,
                      juce::Justification justification = juce::Justification::centred,
-                     float fontHeight = 9.6f)
+                     float fontHeight = 9.6f,
+                     juce::Colour colour = glassTextMuted.withAlpha (0.95f))
 {
-    g.setColour (textFaint.brighter (0.14f).withAlpha (0.86f));
+    g.setColour (colour);
     g.setFont (heavyFont (fontHeight));
     g.drawFittedText (text, bounds, justification, 2);
 }
@@ -272,20 +447,26 @@ juce::String getCueIcon (const juce::Component& component)
     return component.getProperties().getWithDefault ("cueIcon", {}).toString();
 }
 
+// Recessed details in glass surfaces: translucent shading instead of the old
+// solid-black hardware look, so the orange backdrop keeps glowing through.
 void drawSlot (juce::Graphics& g, juce::Rectangle<float> bounds)
 {
-    fillRoundedGradient (g, bounds, blackPanel.brighter (0.08f), blackPanel.darker (0.25f), bounds.getWidth() * 0.5f);
-    g.setColour (juce::Colours::white.withAlpha (0.05f));
-    g.drawRoundedRectangle (bounds, bounds.getWidth() * 0.5f, 1.0f);
+    g.setColour (juce::Colours::black.withAlpha (0.24f));
+    g.fillRoundedRectangle (bounds, bounds.getWidth() * 0.5f);
+    g.setColour (juce::Colours::black.withAlpha (0.40f));
+    g.drawRoundedRectangle (bounds.reduced (0.5f), bounds.getWidth() * 0.5f, 1.0f);
+    g.setColour (juce::Colours::white.withAlpha (0.14f));
+    g.drawRoundedRectangle (bounds.translated (0.0f, 1.0f), bounds.getWidth() * 0.5f, 1.0f);
 }
 
 void drawPanelHole (juce::Graphics& g, juce::Point<float> centre, float diameter)
 {
     auto bounds = juce::Rectangle<float> (diameter, diameter).withCentre (centre);
-    g.setColour (juce::Colours::white.withAlpha (0.1f));
-    g.fillEllipse (bounds.translated (0.0f, -1.0f));
-    fillEllipseGradient (g, bounds, blackPanel.brighter (0.08f), blackPanel.darker (0.3f));
-    g.setColour (juce::Colours::black);
+    g.setColour (juce::Colours::white.withAlpha (0.14f));
+    g.fillEllipse (bounds.translated (0.0f, 1.0f));
+    g.setColour (juce::Colours::black.withAlpha (0.32f));
+    g.fillEllipse (bounds);
+    g.setColour (juce::Colours::black.withAlpha (0.45f));
     g.drawEllipse (bounds, 1.0f);
 }
 
@@ -335,6 +516,132 @@ juce::Path createRailPath (juce::Rectangle<float> area, bool isLeftRail, float r
     return path;
 }
 
+// --- Spun-metal knobs ----------------------------------------------------------
+// Reference-style rotary: a segmented LED value ring around a dark gunmetal
+// body with a spun/brushed face and a recessed indicator dot. JUCE has no
+// conic gradients, so the face sheen is rendered per-pixel once per size and
+// cached (at 2x, so it stays crisp at maxEditorScale).
+const juce::Image& getSpunMetalFace (int diameterPx)
+{
+    static std::map<int, juce::Image> cache;
+
+    if (auto it = cache.find (diameterPx); it != cache.end())
+        return it->second;
+
+    const int size = juce::jmax (8, diameterPx * 2);
+    juce::Image image (juce::Image::ARGB, size, size, true);
+    juce::Image::BitmapData data (image, juce::Image::BitmapData::writeOnly);
+
+    const float radius = (float) size * 0.5f;
+
+    for (int py = 0; py < size; ++py)
+    {
+        for (int px = 0; px < size; ++px)
+        {
+            const float dx = (float) px - radius + 0.5f;
+            const float dy = (float) py - radius + 0.5f;
+            const float r = std::sqrt (dx * dx + dy * dy) / radius;
+
+            if (r > 1.0f)
+            {
+                data.setPixelColour (px, py, juce::Colours::transparentBlack);
+                continue;
+            }
+
+            const float theta = std::atan2 (dy, dx);
+
+            // Anisotropic sheen: two highlight lobes plus a soft top light,
+            // darkening toward the rim like spun aluminium.
+            float b = 0.27f
+                    + 0.17f * std::pow (std::abs (std::cos (theta - 0.95f)), 3.0f)
+                    + 0.11f * std::pow (std::abs (std::cos (theta + 1.85f)), 7.0f)
+                    + 0.05f * (-dy / radius)
+                    + 0.015f * std::sin (r * 60.0f); // faint radial grooves
+
+            b *= 1.0f - 0.38f * juce::jlimit (0.0f, 1.0f, (r - 0.80f) / 0.20f);
+            b = juce::jlimit (0.0f, 1.0f, b);
+
+            const float alpha = juce::jlimit (0.0f, 1.0f, (1.0f - r) * radius); // ~1px edge AA
+            data.setPixelColour (px, py, juce::Colour::fromFloatRGBA (b, b * 1.02f, b * 1.05f, alpha));
+        }
+    }
+
+    return cache[diameterPx] = std::move (image);
+}
+
+// Angles follow the addCentredArc / getPointOnCircumference convention:
+// radians clockwise from 12 o'clock.
+void drawMetalKnob (juce::Graphics& g, juce::Rectangle<float> bounds,
+                    float pos01, float startAngle, float endAngle,
+                    juce::Colour accent, float hover)
+{
+    const auto centre = bounds.getCentre();
+    const float outerR = bounds.getWidth() * 0.5f;
+    const float valueAngle = juce::jmap (juce::jlimit (0.0f, 1.0f, pos01), startAngle, endAngle);
+
+    // Segmented value ring: lit up to the current value, unlit beyond.
+    const int numSegments = juce::jmax (16, juce::roundToInt (bounds.getWidth() * 0.36f));
+    const float tickThickness = juce::jmax (3.0f, bounds.getWidth() * 0.07f);
+    const float ringR = outerR - tickThickness * 0.5f - 0.5f;
+    const float segSpan = (endAngle - startAngle) / (float) numSegments;
+    constexpr float gapFrac = 0.34f;
+
+    for (int i = 0; i < numSegments; ++i)
+    {
+        const float a0 = startAngle + segSpan * ((float) i + gapFrac * 0.5f);
+        const float a1 = a0 + segSpan * (1.0f - gapFrac);
+
+        // Fractional lighting: the segment at the value boundary fades in
+        // proportionally instead of snapping, so fine-sensitivity drags
+        // (SCROLL) don't flicker the leading tick on and off.
+        const float lit = juce::jlimit (0.0f, 1.0f, (valueAngle - a0) / (a1 - a0));
+
+        juce::Path seg;
+        seg.addCentredArc (centre.x, centre.y, ringR, ringR, 0.0f, a0, a1, true);
+
+        if (lit > 0.0f)
+        {
+            // soft bloom behind the lit tick
+            g.setColour (accent.withAlpha ((0.22f + 0.16f * hover) * lit));
+            g.strokePath (seg, juce::PathStrokeType (tickThickness + 3.0f, juce::PathStrokeType::curved, juce::PathStrokeType::butt));
+        }
+
+        g.setColour (juce::Colours::black.withAlpha (0.50f)
+                         .interpolatedWith (accent.brighter (0.18f), lit));
+        g.strokePath (seg, juce::PathStrokeType (tickThickness, juce::PathStrokeType::curved, juce::PathStrokeType::butt));
+    }
+
+    // Body: drop shadow, dark bezel, spun-metal face.
+    const float bodyR = outerR - tickThickness - 3.5f;
+    auto bodyBounds = juce::Rectangle<float> (bodyR * 2.0f, bodyR * 2.0f).withCentre (centre);
+
+    if (hover > 0.01f)
+        drawSoftDropShadow (g, bodyBounds, 0.0f, true, 1.2f + 1.3f * hover, 2.0f * (1.0f - hover), 3.0f + 6.0f * hover, accent.withAlpha (hover));
+    else
+        drawSoftDropShadow (g, bodyBounds, 0.0f, true, 1.2f, 2.0f, 3.0f);
+
+    fillEllipseGradient (g, bodyBounds, juce::Colour (0xff232529), juce::Colour (0xff0c0d0f));
+
+    auto faceBounds = bodyBounds.reduced (bodyR * 0.16f);
+    g.drawImage (getSpunMetalFace (juce::roundToInt (faceBounds.getWidth())), faceBounds,
+                 juce::RectanglePlacement (juce::RectanglePlacement::stretchToFit));
+
+    g.setColour (juce::Colours::white.withAlpha (0.10f + 0.10f * hover));
+    g.drawEllipse (faceBounds.reduced (0.5f), 1.0f);
+
+    // Recessed indicator dot, rotating with the value.
+    const float dotR = juce::jmax (1.8f, faceBounds.getWidth() * 0.05f);
+    const auto dotCentre = centre.getPointOnCircumference (faceBounds.getWidth() * 0.34f, valueAngle);
+    auto dotBounds = juce::Rectangle<float> (dotR * 2.0f, dotR * 2.0f).withCentre (dotCentre);
+
+    g.setColour (juce::Colours::white.withAlpha (0.16f));
+    g.fillEllipse (dotBounds.translated (0.0f, 1.0f));
+    g.setColour (juce::Colour (0xff101113));
+    g.fillEllipse (dotBounds);
+    g.setColour (accent.withAlpha (0.30f + 0.45f * hover));
+    g.drawEllipse (dotBounds, 1.0f);
+}
+
 class SmoothAnimatedSwitchButton final : public juce::TextButton, private juce::Timer
 {
 public:
@@ -351,15 +658,7 @@ public:
     }
 
     float getCurrentAnimationPosition() const noexcept { return currentPosition; }
-    float getClickRipple() const noexcept { return clickRipple; }
     float getHoverAlpha() const noexcept { return hoverAlpha; }
-
-    void clicked() override
-    {
-        juce::TextButton::clicked();
-        clickRipple = 1.0f;
-        ensureAnimating();
-    }
 
     void mouseEnter (const juce::MouseEvent& e) override
     {
@@ -422,13 +721,6 @@ private:
 
         currentPosition = juce::jlimit (-0.08f, 1.08f, currentPosition);
 
-        if (clickRipple > 0.0f)
-        {
-            clickRipple -= frameRateStep (0.06f, animHz);
-            if (clickRipple < 0.0f)
-                clickRipple = 0.0f;
-        }
-
         const float hoverTarget = isMouseOver() ? 1.0f : 0.0f;
         hoverAlpha += (hoverTarget - hoverAlpha) * frameRateLerp (0.18f, animHz);
 
@@ -436,7 +728,7 @@ private:
         if (hoverDone)
             hoverAlpha = hoverTarget;
 
-        if (positionDone && clickRipple <= 0.0f && hoverDone)
+        if (positionDone && hoverDone)
         {
             stopTimer();
         }
@@ -449,7 +741,6 @@ private:
     float currentPosition = 0.0f;
     float targetPosition = 0.0f;
     float velocity = 0.0f;
-    float clickRipple = 0.0f;
     float hoverAlpha = 0.0f;
     int   animHz = 60;
 };
@@ -570,6 +861,65 @@ private:
 };
 } // namespace
 
+// Shared chassis for the glass toggle switches (HALF TIME, SYNC TO DAW): a
+// smoked-glass slab that warms toward the accent as the switch animates on,
+// with a status LED. One code path keeps hover/press/on states consistent
+// between the two switches.
+void drawGlassToggle (juce::Graphics& g, juce::Rectangle<float> bounds,
+                      float position, float hover, bool isDown,
+                      float ledRadius, float ledOffsetY)
+{
+    const float pos = juce::jlimit (0.0f, 1.0f, position);
+
+    if (hover > 0.01f || pos > 0.01f)
+    {
+        const float glowAlpha = hover * 0.15f + 0.85f * pos;
+        drawSoftDropShadow (g, bounds, 8.0f, false, 1.2f + 1.8f * pos, 2.0f * (1.0f - pos),
+                            3.0f + 9.0f * pos, accentOrange.withAlpha (glowAlpha));
+    }
+    else
+    {
+        drawSoftDropShadow (g, bounds, 8.0f, false, 1.2f, 2.0f, 3.0f);
+    }
+
+    auto baseOff = juce::Colour (0xff26282c);
+    auto baseOn = accentOrange.withAlpha (0.32f).interpolatedWith (baseOff, 0.45f);
+    auto base = baseOff.interpolatedWith (baseOn, pos).brighter (0.05f * hover);
+
+    if (isDown)
+        base = base.darker (0.12f);
+
+    fillRoundedGradient (g, bounds, base.brighter (0.03f).withAlpha (0.86f),
+                         base.darker (0.08f).withAlpha (0.90f), 8.0f);
+
+    g.setColour (borderDark.interpolatedWith (accentOrange.withAlpha (0.35f), std::max (pos, hover)));
+    g.drawRoundedRectangle (bounds, 8.0f, 1.0f);
+    g.setColour (juce::Colours::white.withAlpha (0.10f).interpolatedWith (accentOrange.withAlpha (0.16f), std::max (pos, hover)));
+    g.drawRoundedRectangle (bounds.reduced (1.0f), 7.0f, 1.0f);
+
+    // Status LED
+    auto ledCentre = juce::Point<float> (bounds.getCentreX(), bounds.getY() + ledOffsetY);
+    auto ledBounds = juce::Rectangle<float> (ledRadius * 2.0f, ledRadius * 2.0f).withCentre (ledCentre);
+
+    if (pos > 0.01f)
+    {
+        g.setColour (accentOrange.withAlpha (0.45f * pos));
+        g.fillEllipse (ledBounds.expanded (3.5f * pos));
+    }
+
+    auto ledColour = juce::Colour (0xff1a1a1a).interpolatedWith (accentOrange.brighter (0.2f), pos);
+    fillRoundedGradient (g, ledBounds, ledColour.brighter (0.15f), ledColour.darker (0.15f), ledRadius);
+
+    if (pos > 0.1f)
+    {
+        g.setColour (juce::Colours::white.withAlpha (0.7f * pos));
+        g.fillEllipse (juce::Rectangle<float> (2.0f, 2.0f).withCentre ({ ledCentre.x - 1.0f, ledCentre.y - 1.0f }));
+    }
+
+    g.setColour (juce::Colours::black.withAlpha (0.6f));
+    g.drawEllipse (ledBounds, 1.0f);
+}
+
 class CueSamplerLookAndFeel final : public juce::LookAndFeel_V4
 {
 public:
@@ -634,10 +984,15 @@ public:
                 else
                     drawSoftDropShadow (g, bounds, 10.0f, false, 1.5f, 3.0f, 4.0f);
 
-                juce::ColourGradient gradient (juce::Colour (0xff202020), bounds.getCentreX(), bounds.getY(),
-                                               juce::Colour (0xff1a1a1a), bounds.getCentreX(), bounds.getBottom(), false);
+                juce::ColourGradient gradient (controlGlassTop, bounds.getCentreX(), bounds.getY(),
+                                               controlGlassBottom, bounds.getCentreX(), bounds.getBottom(), false);
                 g.setGradientFill (gradient);
                 g.fillRoundedRectangle (bounds, 10.0f);
+                if (isButtonDown)
+                {
+                    g.setColour (juce::Colours::black.withAlpha (0.18f));
+                    g.fillRoundedRectangle (bounds, 10.0f);
+                }
                 g.setColour (borderMid.interpolatedWith (accentOrange.withAlpha (0.35f), hover));
                 g.drawRoundedRectangle (bounds, 10.0f, 2.0f);
                 g.setColour (juce::Colours::white.withAlpha (0.06f).interpolatedWith (accentOrange.withAlpha (0.12f), hover));
@@ -645,161 +1000,20 @@ public:
                 return;
             }
 
-            if (style == "halfTime")
+            if (style == "halfTime" || style == "utilitySync")
             {
                 float position = button.getToggleState() ? 1.0f : 0.0f;
-                float ripple = 0.0f;
                 float hover = getHoverAlpha (button, isMouseOverButton);
                 if (auto* animatedButton = dynamic_cast<SmoothAnimatedSwitchButton*> (&button))
-                {
                     position = animatedButton->getCurrentAnimationPosition();
-                    ripple = animatedButton->getClickRipple();
-                }
-                float clampedPos = juce::jlimit (0.0f, 1.0f, position);
 
-                if (hover > 0.01f || clampedPos > 0.01f)
-                {
-                    const float glowAlpha = hover * 0.15f + 0.85f * clampedPos;
-                    drawSoftDropShadow (g, bounds, 8.0f, false, 1.2f + 1.8f * clampedPos, 2.0f * (1.0f - clampedPos), 3.0f + 9.0f * clampedPos, accentOrange.withAlpha (glowAlpha));
-                }
-                else
-                {
-                    drawSoftDropShadow (g, bounds, 8.0f, false, 1.2f, 2.0f, 3.0f);
-                }
-
-                auto baseOff = juce::Colour (0xff252525);
-                auto baseOn = accentOrange.withAlpha (0.32f).interpolatedWith (juce::Colour (0xff252525), 0.45f);
-                auto base = baseOff.interpolatedWith (baseOn, clampedPos);
-                base = base.brighter (0.05f * hover);
-
-                fillRoundedGradient (g, bounds, base.brighter (0.03f), base.darker (0.08f), 8.0f);
-                g.setColour (borderDark.interpolatedWith (accentOrange.withAlpha (0.35f), std::max (clampedPos, hover)));
-                g.drawRoundedRectangle (bounds, 8.0f, 1.0f);
-                g.setColour (juce::Colours::white.withAlpha (0.05f).interpolatedWith (accentOrange.withAlpha (0.12f), std::max (clampedPos, hover)));
-                g.drawRoundedRectangle (bounds.reduced (1.0f), 7.0f, 1.0f);
-
-                // Draw circular LED
-                float ledRadius = 3.5f;
-                auto ledCentre = juce::Point<float> (bounds.getCentreX(), bounds.getY() + 11.0f);
-                auto ledBounds = juce::Rectangle<float> (ledRadius * 2.0f, ledRadius * 2.0f).withCentre (ledCentre);
-
-                // LED Outer Glow (bloom) when ON
-                if (clampedPos > 0.01f)
-                {
-                    g.setColour (accentOrange.withAlpha (0.45f * clampedPos));
-                    g.fillEllipse (ledBounds.expanded (3.0f * clampedPos));
-                }
-
-                // LED Base color
-                auto ledOff = juce::Colour (0xff1a1a1a);
-                auto ledOn = accentOrange.brighter (0.2f);
-                auto ledColor = ledOff.interpolatedWith (ledOn, clampedPos);
-
-                fillRoundedGradient (g, ledBounds, ledColor.brighter (0.15f), ledColor.darker (0.15f), ledRadius);
-
-                // LED Inner shine
-                if (clampedPos > 0.1f)
-                {
-                    auto shineBounds = juce::Rectangle<float> (2.0f, 2.0f).withCentre ({ ledCentre.x - 1.0f, ledCentre.y - 1.0f });
-                    g.setColour (juce::Colours::white.withAlpha (0.7f * clampedPos));
-                    g.fillEllipse (shineBounds);
-                }
-
-                // LED Border / housing
-                g.setColour (juce::Colours::black.withAlpha (0.6f));
-                g.drawEllipse (ledBounds, 1.0f);
-
-                // Tactile Click Ripple
-                if (ripple > 0.01f)
-                {
-                    auto center = bounds.getCentre();
-                    float maxRadius = std::max (bounds.getWidth(), bounds.getHeight()) * 0.7f;
-                    float currentRadius = maxRadius * (1.0f - ripple);
-                    float rippleAlpha = ripple * 0.35f;
-                    g.setColour (accentOrange.withAlpha (rippleAlpha));
-                    g.drawEllipse (center.x - currentRadius, center.y - currentRadius,
-                                   currentRadius * 2.0f, currentRadius * 2.0f, 1.5f + 2.0f * ripple);
-                }
+                const bool isHalfTime = style == "halfTime";
+                drawGlassToggle (g, bounds, position, hover, isButtonDown,
+                                 isHalfTime ? 3.5f : 4.0f,   // LED radius
+                                 isHalfTime ? 11.0f : 14.0f); // LED y-offset
                 return;
             }
 
-            if (style == "utilitySync")
-            {
-                float position = button.getToggleState() ? 1.0f : 0.0f;
-                float ripple = 0.0f;
-                float hover = getHoverAlpha (button, isMouseOverButton);
-                if (auto* animatedButton = dynamic_cast<SmoothAnimatedSwitchButton*> (&button))
-                {
-                    position = animatedButton->getCurrentAnimationPosition();
-                    ripple = animatedButton->getClickRipple();
-                }
-                float clampedPos = juce::jlimit (0.0f, 1.0f, position);
-
-                if (hover > 0.01f || clampedPos > 0.01f)
-                {
-                    const float glowAlpha = hover * 0.15f + 0.85f * clampedPos;
-                    drawSoftDropShadow (g, bounds, 8.0f, false, 1.2f + 1.8f * clampedPos, 2.0f * (1.0f - clampedPos), 3.0f + 9.0f * clampedPos, accentOrange.withAlpha (glowAlpha));
-                }
-                else
-                {
-                    drawSoftDropShadow (g, bounds, 8.0f, false, 1.2f, 2.0f, 3.0f);
-                }
-
-                auto baseOff = juce::Colour (0xff252525);
-                auto baseOn = accentOrange.withAlpha (0.32f).interpolatedWith (juce::Colour (0xff252525), 0.45f);
-                auto base = baseOff.interpolatedWith (baseOn, clampedPos);
-                base = base.brighter (0.05f * hover);
-
-                fillRoundedGradient (g, bounds, base.brighter (0.02f), base.darker (0.06f), 8.0f);
-                g.setColour (borderDark.interpolatedWith (accentOrange.withAlpha (0.35f), std::max (clampedPos, hover)));
-                g.drawRoundedRectangle (bounds, 8.0f, 1.0f);
-                g.setColour (juce::Colours::white.withAlpha (0.05f).interpolatedWith (accentOrange.withAlpha (0.12f), std::max (clampedPos, hover)));
-                g.drawRoundedRectangle (bounds.reduced (1.0f), 7.0f, 1.0f);
-
-                // Draw circular LED
-                float ledRadius = 4.0f;
-                auto ledCentre = juce::Point<float> (bounds.getCentreX(), bounds.getY() + 14.0f);
-                auto ledBounds = juce::Rectangle<float> (ledRadius * 2.0f, ledRadius * 2.0f).withCentre (ledCentre);
-
-                // LED Outer Glow (bloom) when ON
-                if (clampedPos > 0.01f)
-                {
-                    g.setColour (accentOrange.withAlpha (0.45f * clampedPos));
-                    g.fillEllipse (ledBounds.expanded (4.0f * clampedPos));
-                }
-
-                // LED Base color
-                auto ledOff = juce::Colour (0xff1a1a1a);
-                auto ledOn = accentOrange.brighter (0.2f);
-                auto ledColor = ledOff.interpolatedWith (ledOn, clampedPos);
-
-                fillRoundedGradient (g, ledBounds, ledColor.brighter (0.15f), ledColor.darker (0.15f), ledRadius);
-
-                // LED Inner shine
-                if (clampedPos > 0.1f)
-                {
-                    auto shineBounds = juce::Rectangle<float> (2.0f, 2.0f).withCentre ({ ledCentre.x - 1.0f, ledCentre.y - 1.0f });
-                    g.setColour (juce::Colours::white.withAlpha (0.7f * clampedPos));
-                    g.fillEllipse (shineBounds);
-                }
-
-                // LED Border / housing
-                g.setColour (juce::Colours::black.withAlpha (0.6f));
-                g.drawEllipse (ledBounds, 1.0f);
-
-                // Tactile Click Ripple
-                if (ripple > 0.01f)
-                {
-                    auto center = bounds.getCentre();
-                    float maxRadius = std::max (bounds.getWidth(), bounds.getHeight()) * 0.7f;
-                    float currentRadius = maxRadius * (1.0f - ripple);
-                    float rippleAlpha = ripple * 0.35f;
-                    g.setColour (accentOrange.withAlpha (rippleAlpha));
-                    g.drawEllipse (center.x - currentRadius, center.y - currentRadius,
-                                   currentRadius * 2.0f, currentRadius * 2.0f, 1.5f + 2.0f * ripple);
-                }
-                return;
-            }
 
             if (style == "effectSwitch")
             {
@@ -808,12 +1022,13 @@ public:
                 g.setColour (juce::Colours::white.withAlpha (0.05f));
                 g.fillRoundedRectangle (trackBounds.translated (0.0f, 1.0f), 4.0f);
 
-                fillRoundedGradient (g, trackBounds, blackPanel.brighter (0.08f), blackPanel.darker (0.25f), 4.0f);
-                g.setColour (juce::Colours::black);
+                fillRoundedGradient (g, trackBounds, blackPanel.brighter (0.08f).withAlpha (0.85f),
+                                     blackPanel.darker (0.25f).withAlpha (0.88f), 4.0f);
+                g.setColour (juce::Colours::black.withAlpha (0.8f));
                 g.drawRoundedRectangle (trackBounds, 4.0f, 1.0f);
 
-                juce::ColourGradient innerShadow (juce::Colour (0xff0a0a0a), trackBounds.getCentreX(), trackBounds.getY(),
-                                                  juce::Colour (0xff1a1a1a), trackBounds.getCentreX(), trackBounds.getBottom(), false);
+                juce::ColourGradient innerShadow (juce::Colour (0xd80a0a0a), trackBounds.getCentreX(), trackBounds.getY(),
+                                                  juce::Colour (0xd81a1a1a), trackBounds.getCentreX(), trackBounds.getBottom(), false);
                 g.setGradientFill (innerShadow);
                 g.fillRoundedRectangle (trackBounds.reduced (1.0f), 3.0f);
 
@@ -874,10 +1089,15 @@ public:
             else
                 drawSoftDropShadow (g, bounds, 4.0f, false, 1.3f, 2.0f, 3.0f);
 
-            juce::ColourGradient gradient (juce::Colour (0xff2a2a2a), bounds.getCentreX(), bounds.getY(),
-                                           juce::Colour (0xff1c1c1c), bounds.getCentreX(), bounds.getBottom(), false);
+            juce::ColourGradient gradient (juce::Colour (0xd62a2c30), bounds.getCentreX(), bounds.getY(),
+                                           juce::Colour (0xe01b1d20), bounds.getCentreX(), bounds.getBottom(), false);
             g.setGradientFill (gradient);
             g.fillRoundedRectangle (bounds, 4.0f);
+            if (isButtonDown)
+            {
+                g.setColour (juce::Colours::black.withAlpha (0.18f));
+                g.fillRoundedRectangle (bounds, 4.0f);
+            }
             g.setColour (borderDark.interpolatedWith (accentOrange.withAlpha (0.35f), hover));
             g.drawRoundedRectangle (bounds, 4.0f, 1.0f);
             g.setColour (juce::Colours::white.withAlpha (0.05f).interpolatedWith (accentOrange.withAlpha (0.12f), hover));
@@ -1031,221 +1251,16 @@ public:
                            float sliderPosProportional, float rotaryStartAngle,
                            float rotaryEndAngle, juce::Slider& slider) override
     {
-        bool isMouseOverOrDragging = slider.isMouseOverOrDragging();
-        float hover = getSliderHoverAlpha (slider, isMouseOverOrDragging);
-
-        if (getCueStyle (slider) == "effectSquareKnob")
-        {
-            juce::ignoreUnused (rotaryStartAngle, rotaryEndAngle);
-
-            auto bounds = juce::Rectangle<float> ((float) x, (float) y, (float) width, (float) height).reduced (4.0f);
-
-            if (hover > 0.01f)
-                drawSoftDropShadow (g, bounds, 0.0f, true, 1.2f + 1.3f * hover, 2.0f * (1.0f - hover), 3.0f + 6.0f * hover, accentOrange.withAlpha (hover));
-            else
-                drawSoftDropShadow (g, bounds, 0.0f, true, 1.2f, 2.0f, 3.0f);
-
-            fillEllipseGradient (g, bounds, borderMid.darker (0.18f), borderDark.darker (0.35f));
-            g.setColour (juce::Colours::white.withAlpha (0.06f).interpolatedWith (accentOrange.withAlpha (0.22f), hover));
-            g.drawEllipse (bounds.reduced (0.6f), 1.0f);
-
-            auto innerCircle = bounds.reduced (4.0f);
-            fillEllipseGradient (g, innerCircle, juce::Colour (0xff383838), juce::Colour (0xff171717));
-            g.setColour (borderMid);
-            g.drawEllipse (innerCircle, 1.0f);
-
-            auto pointerCentre = innerCircle.getCentre();
-            auto localAngle = juce::jmap (sliderPosProportional, 0.0f, 1.0f,
-                                           -juce::MathConstants<float>::pi * 0.8f,
-                                           juce::MathConstants<float>::pi * 0.8f);
-
-            float radius = innerCircle.getWidth() * 0.5f;
-            float indicatorLength = radius * 0.55f;
-            float indicatorOffsetY = radius - indicatorLength * 0.5f - 2.0f;
-            auto indicator = juce::Rectangle<float> (2.0f, indicatorLength)
-                                 .withCentre ({ pointerCentre.x, pointerCentre.y - indicatorOffsetY });
-                                 
-            juce::Path indicatorPath;
-            indicatorPath.addRoundedRectangle (indicator, 1.0f);
-            indicatorPath.applyTransform (juce::AffineTransform::rotation (localAngle, pointerCentre.x, pointerCentre.y));
-
-            g.fillPath (indicatorPath, juce::AffineTransform::translation (0.0f, 0.5f));
-            g.setColour (accentOrange);
-            g.fillPath (indicatorPath);
-            
-            juce::Path trackArc, meterArc;
-            float arcRadius = bounds.getWidth() * 0.5f + 2.0f;
-            float meterStart = -juce::MathConstants<float>::pi * 0.8f;
-            float meterEnd = juce::MathConstants<float>::pi * 0.8f;
-            
-            trackArc.addCentredArc (bounds.getCentreX(), bounds.getCentreY(), arcRadius, arcRadius, 0.0f, meterStart, meterEnd, true);
-            g.setColour (juce::Colours::black.withAlpha (0.4f));
-            g.strokePath (trackArc, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-
-            if (sliderPosProportional > 0.01f)
-            {
-                meterArc.addCentredArc (bounds.getCentreX(), bounds.getCentreY(), arcRadius, arcRadius, 0.0f, meterStart, localAngle, true);
-                g.setColour (accentOrange);
-                g.strokePath (meterArc, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-            }
-            return;
-        }
-
-        if (getCueStyle (slider) == "startTiltKnob")
-        {
-            auto bounds = juce::Rectangle<float> ((float) x, (float) y, (float) width, (float) height).reduced (4.0f);
-
-            if (hover > 0.01f)
-                drawSoftDropShadow (g, bounds, 0.0f, true, 1.2f + 1.3f * hover, 2.0f * (1.0f - hover), 3.0f + 6.0f * hover, accentOrange.withAlpha (hover));
-            else
-                drawSoftDropShadow (g, bounds, 0.0f, true, 1.2f, 2.0f, 3.0f);
-
-            fillEllipseGradient (g, bounds, borderMid.darker (0.18f), borderDark.darker (0.35f));
-            g.setColour (juce::Colours::white.withAlpha (0.05f).interpolatedWith (accentOrange.withAlpha (0.22f), hover));
-            g.drawEllipse (bounds.reduced (0.6f), 1.0f);
-
-            auto innerCircle = bounds.reduced (4.0f);
-            fillEllipseGradient (g, innerCircle, juce::Colour (0xff383838), juce::Colour (0xff171717));
-            g.setColour (borderMid);
-            g.drawEllipse (innerCircle, 1.0f);
-
-            auto pointerCentre = innerCircle.getCentre();
-            float radius = innerCircle.getWidth() * 0.5f;
-            float indicatorLength = radius * 0.55f;
-            float indicatorOffsetY = radius - indicatorLength * 0.5f - 2.0f;
-            auto pointer = juce::Rectangle<float> (2.0f, indicatorLength)
-                               .withCentre ({ pointerCentre.x, pointerCentre.y - indicatorOffsetY });
-                               
-            auto localAngle = juce::jmap (sliderPosProportional, 0.0f, 1.0f,
-                                          -juce::MathConstants<float>::pi * 0.8f,
-                                          juce::MathConstants<float>::pi * 0.8f);
-            juce::Path indicator;
-            indicator.addRoundedRectangle (pointer, 1.0f);
-            indicator.applyTransform (juce::AffineTransform::rotation (localAngle, pointerCentre.x, pointerCentre.y));
-
-            g.fillPath (indicator, juce::AffineTransform::translation (0.0f, 0.5f));
-            g.setColour (accentOrange);
-            g.fillPath (indicator);
-            
-            juce::Path trackArc, meterArc;
-            float arcRadius = bounds.getWidth() * 0.5f + 2.0f;
-            float meterStart = -juce::MathConstants<float>::pi * 0.8f;
-            float meterEnd = juce::MathConstants<float>::pi * 0.8f;
-            
-            trackArc.addCentredArc (bounds.getCentreX(), bounds.getCentreY(), arcRadius, arcRadius, 0.0f, meterStart, meterEnd, true);
-            g.setColour (juce::Colours::black.withAlpha (0.4f));
-            g.strokePath (trackArc, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-
-            if (sliderPosProportional > 0.01f)
-            {
-                meterArc.addCentredArc (bounds.getCentreX(), bounds.getCentreY(), arcRadius, arcRadius, 0.0f, meterStart, localAngle, true);
-                g.setColour (accentOrange);
-                g.strokePath (meterArc, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-            }
-            return;
-        }
-
-        if (getCueStyle (slider) == "miniColourKnob")
-        {
-            auto bounds = juce::Rectangle<float> ((float) x, (float) y, (float) width, (float) height).reduced (4.0f);
-            auto accent = getCueAccent (slider, accentOrange);
-
-            if (hover > 0.01f)
-                drawSoftDropShadow (g, bounds, 0.0f, true, 1.2f + 1.3f * hover, 2.0f * (1.0f - hover), 3.0f + 6.0f * hover, accent.withAlpha (hover));
-            else
-                drawSoftDropShadow (g, bounds, 0.0f, true, 1.2f, 2.0f, 3.0f);
-
-            fillEllipseGradient (g, bounds, borderMid.darker (0.18f), borderDark.darker (0.35f));
-            g.setColour (juce::Colours::white.withAlpha (0.06f).interpolatedWith (accent.withAlpha (0.22f), hover));
-            g.drawEllipse (bounds.reduced (0.6f), 1.0f);
-
-            auto innerCircle = bounds.reduced (4.0f);
-            fillEllipseGradient (g, innerCircle, juce::Colour (0xff383838), juce::Colour (0xff171717));
-            g.setColour (borderMid);
-            g.drawEllipse (innerCircle, 1.0f);
-
-            auto centre = innerCircle.getCentre();
-            float radius = innerCircle.getWidth() * 0.5f;
-            float indicatorLength = radius * 0.55f;
-            float indicatorOffsetY = radius - indicatorLength * 0.5f - 2.0f;
-            auto indicator = juce::Rectangle<float> (2.0f, indicatorLength)
-                                 .withCentre ({ centre.x, centre.y - indicatorOffsetY });
-                                 
-            auto localAngle = juce::jmap (sliderPosProportional, 0.0f, 1.0f,
-                                          -juce::MathConstants<float>::pi * 0.8f,
-                                          juce::MathConstants<float>::pi * 0.8f);
-            juce::Path indicatorPath;
-            indicatorPath.addRoundedRectangle (indicator, 1.0f);
-            indicatorPath.applyTransform (juce::AffineTransform::rotation (localAngle, centre.x, centre.y));
-
-            g.fillPath (indicatorPath, juce::AffineTransform::translation (0.0f, 0.5f));
-            g.setColour (accent);
-            g.fillPath (indicatorPath);
-            
-            juce::Path trackArc, meterArc;
-            float arcRadius = bounds.getWidth() * 0.5f + 2.0f;
-            float meterStart = -juce::MathConstants<float>::pi * 0.8f;
-            float meterEnd = juce::MathConstants<float>::pi * 0.8f;
-            
-            trackArc.addCentredArc (bounds.getCentreX(), bounds.getCentreY(), arcRadius, arcRadius, 0.0f, meterStart, meterEnd, true);
-            g.setColour (juce::Colours::black.withAlpha (0.4f));
-            g.strokePath (trackArc, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-
-            if (sliderPosProportional > 0.01f)
-            {
-                meterArc.addCentredArc (bounds.getCentreX(), bounds.getCentreY(), arcRadius, arcRadius, 0.0f, meterStart, localAngle, true);
-                g.setColour (accent);
-                g.strokePath (meterArc, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-            }
-            return;
-        }
+        const float hover = getSliderHoverAlpha (slider, slider.isMouseOverOrDragging());
 
         auto bounds = juce::Rectangle<float> ((float) x, (float) y, (float) width, (float) height).reduced (3.0f);
+        const float diameter = juce::jmin (bounds.getWidth(), bounds.getHeight());
+        bounds = bounds.withSizeKeepingCentre (diameter, diameter);
 
-        if (hover > 0.01f)
-            drawSoftDropShadow (g, bounds, 0.0f, true, 1.2f + 1.3f * hover, 2.0f * (1.0f - hover), 3.0f + 6.0f * hover, accentOrange.withAlpha (hover));
-        else
-            drawSoftDropShadow (g, bounds, 0.0f, true, 1.2f, 2.0f, 3.0f);
-
-        fillEllipseGradient (g, bounds, borderMid.darker (0.18f), borderDark.darker (0.35f));
-
-        g.setColour (juce::Colours::white.withAlpha (0.06f).interpolatedWith (accentOrange.withAlpha (0.22f), hover));
-        g.drawEllipse (bounds.reduced (0.6f), 1.0f);
-
-        auto inner = bounds.reduced (4.0f);
-        fillRoundedGradient (g, inner, panelDark.brighter (0.05f), panelDark.darker (0.2f), inner.getWidth() * 0.5f);
-        g.setColour (borderMid);
-        g.drawEllipse (inner, 1.0f);
-
-        auto centre = inner.getCentre();
-        auto radius = inner.getWidth() * 0.36f;
-        auto angle = rotaryStartAngle + sliderPosProportional * (rotaryEndAngle - rotaryStartAngle);
-        auto pointerEnd = centre.getPointOnCircumference (radius, angle - juce::MathConstants<float>::halfPi);
-
-        juce::Path pointer;
-        pointer.startNewSubPath (centre.x, centre.y);
-        pointer.lineTo (pointerEnd.x, pointerEnd.y);
-
-        g.setColour (accentOrange.withAlpha (0.35f));
-        g.strokePath (pointer, juce::PathStrokeType (4.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-
-        g.setColour (accentOrange);
-        g.strokePath (pointer, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-
-        g.fillEllipse (juce::Rectangle<float> (4.0f, 4.0f).withCentre (pointerEnd));
-        
-        juce::Path trackArc, meterArc;
-        float arcRadius = bounds.getWidth() * 0.5f + 1.5f;
-        trackArc.addCentredArc (bounds.getCentreX(), bounds.getCentreY(), arcRadius, arcRadius, 0.0f, rotaryStartAngle, rotaryEndAngle, true);
-        g.setColour (juce::Colours::black.withAlpha (0.4f));
-        g.strokePath (trackArc, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-
-        if (sliderPosProportional > 0.01f)
-        {
-            meterArc.addCentredArc (bounds.getCentreX(), bounds.getCentreY(), arcRadius, arcRadius, 0.0f, rotaryStartAngle, angle, true);
-            g.setColour (accentOrange);
-            g.strokePath (meterArc, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-        }
+        // All knob styles share the spun-metal look; per-knob accents (CUE /
+        // GAIN / PITCH minis) come through the cueAccent property.
+        drawMetalKnob (g, bounds, sliderPosProportional, rotaryStartAngle, rotaryEndAngle,
+                       getCueAccent (slider, accentOrange), hover);
     }
 };
 
@@ -1267,7 +1282,7 @@ public:
         slider.captureCurrentValueAsDefault();
         addAndMakeVisible (slider);
 
-        configureTextLabel (label, text, labelHeight, textMuted, juce::Justification::centred);
+        configureTextLabel (label, text, labelHeight, glassTextMuted, juce::Justification::centred);
         addAndMakeVisible (label);
     }
 
@@ -1288,6 +1303,36 @@ private:
     int diameter = 44;
 };
 
+// On-screen MIDI keyboard along the bottom strip: lights up with the notes
+// driving the chops (host MIDI or clicks — clicked keys are injected into the
+// processor's MIDI stream, so they trigger chops too). Pressed-key overlays
+// track the accent so HALF TIME / WARP recolour them with the rest of the UI.
+class GlassKeyboard final : public juce::MidiKeyboardComponent
+{
+public:
+    explicit GlassKeyboard (juce::MidiKeyboardState& state)
+        : juce::MidiKeyboardComponent (state, juce::MidiKeyboardComponent::horizontalKeyboard)
+    {
+        setOctaveForMiddleC (4); // note 36 reads "C2", matching the chop mapping
+        setAvailableRange (24, 107); // C1..B7
+        setScrollButtonsVisible (false);
+        setColour (juce::MidiKeyboardComponent::whiteNoteColourId, juce::Colour (0xffdfe1e4));
+        setColour (juce::MidiKeyboardComponent::blackNoteColourId, juce::Colour (0xff202226));
+        setColour (juce::MidiKeyboardComponent::keySeparatorLineColourId, juce::Colours::black.withAlpha (0.35f));
+        setColour (juce::MidiKeyboardComponent::shadowColourId, juce::Colours::black.withAlpha (0.35f));
+        setColour (juce::MidiKeyboardComponent::textLabelColourId, juce::Colour (0xff42454c));
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        // Refreshed per paint so mode changes recolour the overlays. setColour
+        // is a no-op (no repaint loop) when the value is unchanged.
+        setColour (juce::MidiKeyboardComponent::keyDownOverlayColourId, accentOrange.withAlpha (0.8f));
+        setColour (juce::MidiKeyboardComponent::mouseOverKeyOverlayColourId, accentOrange.withAlpha (0.28f));
+        juce::MidiKeyboardComponent::paint (g);
+    }
+};
+
 class StartKnobComponent final : public juce::Component
 {
 public:
@@ -1304,7 +1349,7 @@ public:
         slider.captureCurrentValueAsDefault();
         addAndMakeVisible (slider);
 
-        configureTextLabel (label, "GRID", 16.0f, textMuted, juce::Justification::centred);
+        configureTextLabel (label, "GRID", 16.0f, glassTextMuted, juce::Justification::centred);
         addAndMakeVisible (label);
     }
 
@@ -1777,16 +1822,18 @@ public:
         g.drawText ("SAMPLER", juce::Rectangle<int> (titleX, titleY, samplerTextWidth + 4, titleHeight),
                     juce::Justification::centredLeft, false);
 
+        // Header text sits directly on the orange background; white like the
+        // website headline (orange/grey are illegible here).
         const int dotX = titleX + samplerTextWidth;
-        g.setColour (accentOrange);
+        g.setColour (textPrimary);
         g.drawText (".", juce::Rectangle<int> (dotX, titleY, 20, titleHeight), juce::Justification::centredLeft, false);
 
         const int betaX = dotX + 18;
-        g.setColour (textMuted);
+        g.setColour (textPrimary.withAlpha (0.78f));
         g.setFont (heavyFont (16.0f));
         g.drawText ("(beta)", juce::Rectangle<int> (betaX, 35, 90, 20), juce::Justification::centredLeft, false);
 
-        g.setColour (textMuted.brighter (0.25f));
+        g.setColour (textPrimary.withAlpha (0.85f));
         g.setFont (heavyFont (12.0f));
         g.drawFittedText ("CUE SOFTWARE", juce::Rectangle<int> (bounds.getRight() - 125, 38, 125, 16),
                           juce::Justification::centredRight, 1);
@@ -2564,11 +2611,7 @@ public:
         auto bounds = getLocalBounds().toFloat();
         auto panelBounds = juce::Rectangle<float> (780.0f, 409.0f).withCentre (bounds.getCentre());
 
-        fillRoundedGradient (g, panelBounds, panelDark.brighter (0.1f), panelDark.darker (0.18f), mediumCorner);
-        g.setColour (borderDark);
-        g.drawRoundedRectangle (panelBounds.reduced (0.5f), mediumCorner, 1.0f);
-        g.setColour (juce::Colours::white.withAlpha (0.1f));
-        g.drawRoundedRectangle (panelBounds.reduced (1.0f), mediumCorner - 1.0f, 1.0f);
+        fillGlassRounded (g, *this, panelBounds, mediumCorner);
 
         const auto panelX = panelBounds.getX();
         const auto panelY = panelBounds.getY();
@@ -2660,7 +2703,8 @@ public:
             fillRoundedGradient (g, hintBar.toFloat(), juce::Colour (0xff171717).withAlpha (0.58f),
                                  juce::Colours::black.withAlpha (0.48f), 6.0f);
             drawHelperText (g, "Click chop: preview/select   Drag edge: resize tempo   Shift-drag edge: snap to bar",
-                            hintBar.reduced (10, 4), juce::Justification::centred, 10.8f);
+                            hintBar.reduced (10, 4), juce::Justification::centred, 10.8f,
+                            textFaint.brighter (0.14f).withAlpha (0.86f));
         }
         else
         {
@@ -2907,11 +2951,15 @@ private:
 
         if (shouldBeVisible)
         {
+            // dontSendNotification is load-bearing: the default async
+            // notification fires after the guard below is cleared, so the
+            // smoothed (lagging) position would echo back through
+            // scrollBarMoved and fight the SCROLL knob mid-drag.
             updatingHorizontalScrollBar = true;
             const double maxRangeStart = juce::jmax (0.0, 1.0 - visibleProportion);
             const double currentRangeStart = scrollPosition * maxRangeStart;
-            horizontalScrollBar.setRangeLimits (0.0, 1.0);
-            horizontalScrollBar.setCurrentRange (currentRangeStart, visibleProportion);
+            horizontalScrollBar.setRangeLimits (0.0, 1.0, juce::dontSendNotification);
+            horizontalScrollBar.setCurrentRange (currentRangeStart, visibleProportion, juce::dontSendNotification);
             updatingHorizontalScrollBar = false;
         }
     }
@@ -4454,27 +4502,19 @@ public:
     {
         auto topPanel = getTopPanelBounds().toFloat();
 
-        fillRoundedGradient (g, topPanel, panelDark.brighter (0.1f), panelDark.darker (0.18f), mediumCorner);
-        g.setColour (borderDark);
-        g.drawRoundedRectangle (topPanel.reduced (0.5f), mediumCorner, 1.0f);
-        g.setColour (juce::Colours::white.withAlpha (0.1f));
-        g.drawRoundedRectangle (topPanel.reduced (1.0f), mediumCorner - 1.0f, 1.0f);
+        fillGlassRounded (g, *this, topPanel, mediumCorner);
 
         drawPanelHole (g, { topPanel.getX() + 13.0f, topPanel.getY() + 13.0f }, 6.0f);
         drawPanelHole (g, { topPanel.getRight() - 13.0f, topPanel.getY() + 13.0f }, 6.0f);
         drawPanelHole (g, { topPanel.getX() + 13.0f, topPanel.getBottom() - 13.0f }, 6.0f);
         drawPanelHole (g, { topPanel.getRight() - 13.0f, topPanel.getBottom() - 13.0f }, 6.0f);
 
-        g.setColour (borderDark);
+        g.setColour (glassTextMuted.withAlpha (0.35f));
         g.fillRect (216, (int) std::round (topPanel.getCentreY() - 24.0f), 1, 48);
 
         auto bottomPanel = getBottomPanelBounds().toFloat();
 
-        fillRoundedGradient (g, bottomPanel, panelDark.brighter (0.1f), panelDark.darker (0.18f), mediumCorner);
-        g.setColour (borderDark);
-        g.drawRoundedRectangle (bottomPanel.reduced (0.5f), mediumCorner, 1.0f);
-        g.setColour (juce::Colours::white.withAlpha (0.1f));
-        g.drawRoundedRectangle (bottomPanel.reduced (1.0f), mediumCorner - 1.0f, 1.0f);
+        fillGlassRounded (g, *this, bottomPanel, mediumCorner);
 
         drawPanelHole (g, { bottomPanel.getX() + 13.0f, bottomPanel.getY() + 13.0f }, 6.0f);
         drawPanelHole (g, { bottomPanel.getRight() - 13.0f, bottomPanel.getY() + 13.0f }, 6.0f);
@@ -4485,17 +4525,15 @@ public:
                                                    (topPanel.getBottom() + bottomPanel.getY()) * 0.5f - 9.0f,
                                                    122.0f,
                                                    18.0f);
-        fillRoundedGradient (g, badgeBounds, shellDark.brighter (0.12f), shellDark.darker (0.18f), 6.0f);
-        g.setColour (borderLight);
-        g.drawRoundedRectangle (badgeBounds.reduced (0.5f), 6.0f, 1.0f);
+        fillGlassRounded (g, *this, badgeBounds, 6.0f);
 
-        g.setColour (juce::Colour (0xff99a1af));
+        g.setColour (glassText);
         g.setFont (heavyFont (10.8f).withExtraKerningFactor (0.08f));
         g.drawText ("CHOP CONTROLS",
                     badgeBounds.toNearestInt().withY ((int) std::round (badgeBounds.getY() - 1.0f)),
                     juce::Justification::centred, false);
 
-        g.setColour (textMuted.brighter (0.18f).withAlpha (0.62f));
+        g.setColour (glassTextMuted.withAlpha (0.85f));
         g.setFont (heavyFont (9.6f).withExtraKerningFactor (0.06f));
         g.drawText (getMidiMappingText(),
                     juce::Rectangle<int> (570, (int) bottomPanel.getY() + 94, 198, 13),
@@ -4503,14 +4541,6 @@ public:
 
         drawHelperText (g, "Load audio - tempo/key are detected automatically",
                         juce::Rectangle<int> (394, (int) topPanel.getBottom() - 23, 374, 16), juce::Justification::centred, 10.0f);
-        drawHelperText (g, "START nudges grid timing",
-                        juce::Rectangle<int> (282, (int) topPanel.getBottom() - 14, 146, 12), juce::Justification::centred, 9.0f);
-        drawHelperText (g, "CUE loops from inside the selected chop",
-                        juce::Rectangle<int> (18, (int) bottomPanel.getY() + 96, 156, 15), juce::Justification::centred, 9.5f);
-        drawHelperText (g, "GAIN and PITCH affect only the selected chop",
-                        juce::Rectangle<int> (168, (int) bottomPanel.getY() + 96, 198, 15), juce::Justification::centred, 9.5f);
-        drawHelperText (g, "BARS sets chop length before rebuild",
-                        juce::Rectangle<int> (452, (int) bottomPanel.getY() + 105, 328, 15), juce::Justification::centred, 9.5f);
     }
 
     void resized() override
@@ -4521,21 +4551,31 @@ public:
         pauseButton.setBounds (80, topCenterY - 24, 48, 48);
         stopButton.setBounds (144, topCenterY - 24, 48, 48);
         halfSpeedButton.setBounds (241, topCenterY - 24, 56, 48);
-        startKnob.setBounds (328, topCenterY - 34, smallKnobDiameter, 69);
+        startKnob.setBounds (322, topCenterY - 34, smallKnobDiameter, smallKnobDiameter + 19);
         timeDisplay.setBounds (413, topCenterY - 24, 160, 48);
         tempoDisplay.setBounds (589, topCenterY - 24, 80, 48);
         keyDisplay.setBounds (677, topCenterY - 24, 80, 48);
 
         auto bottomPanel = getBottomPanelBounds();
-        
-        auto knobRow = juce::Rectangle<int> (52, bottomPanel.getY() + 18, 254, 72);
+
+        // CUE/GAIN/PITCH live in the left bay, bounded on the right by the
+        // centred CHOP @ TRANS button. Centre the cluster (3 knobs + 2 gaps)
+        // both horizontally within that bay and vertically within the panel.
+        constexpr int knobGap = 52;
+        const int clusterWidth = 3 * smallKnobDiameter + 2 * knobGap;
+        const int chopTransientsX = (getWidth() - 148) / 2;
+        const int knobRowX = (chopTransientsX - clusterWidth) / 2;
+        const int knobRowH = smallKnobDiameter + 20; // knob + label
+        const int knobRowY = bottomPanel.getY() + (bottomPanel.getHeight() - knobRowH) / 2;
+
+        auto knobRow = juce::Rectangle<int> (knobRowX, knobRowY, clusterWidth, knobRowH);
         cueKnob.setBounds (knobRow.removeFromLeft (smallKnobDiameter));
-        knobRow.removeFromLeft (52);
+        knobRow.removeFromLeft (knobGap);
         gainKnob.setBounds (knobRow.removeFromLeft (smallKnobDiameter));
-        knobRow.removeFromLeft (52);
+        knobRow.removeFromLeft (knobGap);
         pitchKnob.setBounds (knobRow.removeFromLeft (smallKnobDiameter));
 
-        chopTransientsButton.setBounds ((getWidth() - 148) / 2, bottomPanel.getY() + 39, 148, 48);
+        chopTransientsButton.setBounds (chopTransientsX, bottomPanel.getY() + 39, 148, 48);
 
         auto buttonRow = juce::Rectangle<int> (468, bottomPanel.getY() + 33, 292, 60);
         barsButton.setBounds (buttonRow.removeFromLeft (140).withTrimmedTop (6).withHeight (48));
@@ -4939,11 +4979,7 @@ public:
     {
         auto bounds = getLocalBounds().toFloat().reduced (0.5f);
 
-        fillRoundedGradient (g, bounds, panelDark.brighter (0.1f), panelDark.darker (0.2f), largeCorner);
-        g.setColour (borderLight);
-        g.drawRoundedRectangle (bounds, largeCorner, 1.0f);
-        g.setColour (juce::Colours::white.withAlpha (0.04f));
-        g.drawRoundedRectangle (bounds.reduced (1.0f), largeCorner - 1.0f, 1.0f);
+        fillGlassRounded (g, *this, bounds, largeCorner);
 
         drawHelperText (g, "Follows DAW BPM",
                         juce::Rectangle<int> (10, 107, getWidth() - 20, 20), juce::Justification::centred, 9.8f);
@@ -5055,7 +5091,7 @@ public:
 
         fillEllipseGradient (g, markerBounds, currentFillTop, currentFillBottom);
 
-        auto offBorder = textPrimary;
+        auto offBorder = glassTextMuted;
         auto onBorder = accentOrange;
         auto currentBorder = offBorder.interpolatedWith (onBorder, clampedPos);
 
@@ -5068,7 +5104,7 @@ public:
             g.drawEllipse (markerBounds.reduced (0.5f), 1.0f);
         }
 
-        g.setColour (textPrimary);
+        g.setColour (glassText);
         g.setFont (titleFont);
         auto titleBounds = juce::Rectangle<int> ((int) std::round (rowX + markerSize + titleGap),
                                                  titleArea.getY(),
@@ -5081,13 +5117,13 @@ public:
         auto onLabelBounds = juce::Rectangle<int> (switchBounds.getRight() + 8, switchBounds.getY() + 5, 12, 10);
 
         // OFF label fades out to 0.35 alpha when ON
-        auto offLabelColour = textPrimary.interpolatedWith (textMuted.withAlpha (0.35f), clampedPos);
+        auto offLabelColour = glassText.interpolatedWith (glassTextMuted.withAlpha (0.35f), clampedPos);
         g.setColour (offLabelColour);
         g.setFont (heavyFont (7.0f));
         g.drawText ("OFF", offLabelBounds, juce::Justification::centredLeft, false);
 
         // ON label fades in from 0.35 alpha of textMuted to bright accentOrange when ON
-        auto onLabelColour = textMuted.withAlpha (0.35f).interpolatedWith (accentOrange.brighter (0.2f), clampedPos);
+        auto onLabelColour = glassTextMuted.withAlpha (0.35f).interpolatedWith (accentOrange.darker (0.05f), clampedPos);
         g.setColour (onLabelColour);
         g.setFont (heavyFont (7.0f));
         g.drawText ("ON", onLabelBounds, juce::Justification::centredLeft, false);
@@ -5185,27 +5221,24 @@ public:
     {
         auto bounds = getLocalBounds().toFloat();
 
-        fillRoundedGradient (g, bounds, panelDark.brighter (0.1f), panelDark.darker (0.2f), mediumCorner);
-        g.setColour (borderDark);
-        g.drawRoundedRectangle (bounds.reduced (0.5f), mediumCorner, 1.0f);
+        fillGlassRounded (g, *this, bounds.reduced (0.5f), mediumCorner);
 
         drawPanelHole (g, { 13.0f, 13.0f }, 6.0f);
         drawPanelHole (g, { bounds.getRight() - 13.0f, 13.0f }, 6.0f);
         drawPanelHole (g, { 13.0f, bounds.getBottom() - 13.0f }, 6.0f);
         drawPanelHole (g, { bounds.getRight() - 13.0f, bounds.getBottom() - 13.0f }, 6.0f);
 
+        // Recessed glass well that holds the two effect modules.
         auto innerBounds = bounds.reduced (16.0f);
-        fillRoundedGradient (g, innerBounds, juce::Colour (0xff242424), juce::Colour (0xff101010), smallCorner);
-        g.setColour (borderMid);
+        g.setColour (juce::Colours::black.withAlpha (0.16f));
+        g.fillRoundedRectangle (innerBounds, smallCorner);
+        g.setColour (juce::Colours::black.withAlpha (0.38f));
         g.drawRoundedRectangle (innerBounds.reduced (0.5f), smallCorner, 1.0f);
-        g.setColour (juce::Colours::black.withAlpha (0.6f));
-        g.drawRoundedRectangle (innerBounds.reduced (1.0f), smallCorner - 1.0f, 2.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.12f));
+        g.drawRoundedRectangle (innerBounds.expanded (0.5f), smallCorner + 0.5f, 1.0f);
 
-        fillRectGradient (g, juce::Rectangle<float> (33.0f, 314.0f, 212.0f, 3.0f),
-                          juce::Colour (0xff3a3a3a), juce::Colour (0xff171717));
-
-        g.setColour (juce::Colours::white.withAlpha (0.1f));
-        g.drawRoundedRectangle (bounds.reduced (1.0f), mediumCorner - 1.0f, 1.0f);
+        g.setColour (glassTextMuted.withAlpha (0.35f));
+        g.fillRect (juce::Rectangle<float> (33.0f, 315.0f, 212.0f, 1.0f));
 
         drawHelperText (g, "Switch must be ON before these knobs change audio",
                         juce::Rectangle<int> (42, 252, 194, 24));
@@ -5292,6 +5325,9 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
 {
     processorRef.sampleChangeBroadcaster.addChangeListener (this);
     processorRef.editChangeBroadcaster.addChangeListener (this);
+
+    backgroundImage = juce::ImageCache::getFromMemory (CueSamplerBinaryData::cue_background_png,
+                                                       CueSamplerBinaryData::cue_background_pngSize);
 
     lookAndFeel = std::make_unique<cue::CueSamplerLookAndFeel>();
     setLookAndFeel (lookAndFeel.get());
@@ -5492,6 +5528,9 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     for (auto* component : sections)
         contentComponent.addAndMakeVisible (*component);
 
+    midiKeyboardComponent = std::make_unique<cue::GlassKeyboard> (processorRef.keyboardState);
+    contentComponent.addAndMakeVisible (*midiKeyboardComponent);
+
     panelShadowEffect.setShadowProperties (defaultShadow);
     waveformDisplayComponent->setComponentEffect (&panelShadowEffect);
     transportSectionComponent->setComponentEffect (&panelShadowEffect);
@@ -5635,17 +5674,42 @@ void AudioPluginAudioProcessorEditor::changeListenerCallback (juce::ChangeBroadc
 //==============================================================================
 void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
 {
-    juce::ColourGradient background (juce::Colour (0xff242424), 0.0f, 0.0f,
-                                     juce::Colour (0xff111111), 0.0f, (float) getHeight(), false);
-    g.setGradientFill (background);
-    g.fillAll();
+    // Underlay for any letterboxing: hosts don't always honour the fixed
+    // aspect ratio, and getUiScale() fits the smaller axis, so the faceplate
+    // can fall short of the window edge. Painting the underlay with the same
+    // background keeps that strip orange instead of a dark bar.
+    if (const auto& underlay = cue::getModeTintedBackground (backgroundImage); underlay.isValid())
+    {
+        g.drawImage (underlay, getLocalBounds().toFloat(),
+                     juce::RectanglePlacement (juce::RectanglePlacement::fillDestination));
+    }
+    else
+    {
+        juce::ColourGradient background (juce::Colour (0xff242424), 0.0f, 0.0f,
+                                         juce::Colour (0xff111111), 0.0f, (float) getHeight(), false);
+        g.setGradientFill (background);
+        g.fillAll();
+    }
 
     juce::Graphics::ScopedSaveState scaleState (g);
     g.addTransform (juce::AffineTransform::scale (getUiScale()));
 
     auto faceplate = juce::Rectangle<float> (0.0f, 0.0f, (float) cue::editorWidth, (float) cue::editorHeight);
-    cue::fillRoundedGradient (g, faceplate, cue::shellDark.brighter (0.1f),
-                              cue::shellDark.darker (0.22f), cue::largeCorner);
+
+    if (const auto& background = cue::getModeTintedBackground (backgroundImage); background.isValid())
+    {
+        juce::Graphics::ScopedSaveState state (g);
+        juce::Path clip;
+        clip.addRoundedRectangle (faceplate, cue::largeCorner);
+        g.reduceClipRegion (clip);
+        g.drawImage (background, faceplate,
+                     juce::RectanglePlacement (juce::RectanglePlacement::fillDestination));
+    }
+    else
+    {
+        cue::fillRoundedGradient (g, faceplate, cue::shellDark.brighter (0.1f),
+                                  cue::shellDark.darker (0.22f), cue::largeCorner);
+    }
 
     g.setColour (cue::borderLight.withAlpha (0.75f));
     g.drawRoundedRectangle (faceplate.reduced (0.5f), cue::largeCorner, 1.0f);
@@ -5665,7 +5729,17 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
     paintSideRail (g, leftRail, true);
     paintSideRail (g, rightRail, false);
 
-    g.setColour (accentOrange);
+    // Glass chassis for the on-screen MIDI keyboard along the bottom strip.
+    {
+        auto keyboardPanel = juce::Rectangle<float> (96.0f, 798.0f, 1246.0f, 74.0f);
+        juce::Path panelPath;
+        panelPath.addRoundedRectangle (keyboardPanel, cue::mediumCorner);
+        cue::fillGlassPath (g, panelPath, keyboardPanel);
+    }
+
+    // White like the website headline: the accent orange is invisible on the
+    // orange gradient background.
+    g.setColour (juce::Colours::white);
     g.setFont (cue::heavyFont (12.0f));
     g.drawText ("CHOP STATION", juce::Rectangle<int> (96, 116, 150, 16), juce::Justification::centredLeft, false);
 }
@@ -5682,6 +5756,12 @@ void AudioPluginAudioProcessorEditor::resized()
     utilityStripComponent->setBounds (910, 133, 120, 655);
     effectsRackComponent->setBounds (1062, 133, 278, 655);
     helpOverlayComponent->setBounds (96, 133, 782, 655);
+
+    if (midiKeyboardComponent != nullptr)
+    {
+        midiKeyboardComponent->setKeyWidth (1230.0f / 49.0f); // 49 white keys, C1..B7
+        midiKeyboardComponent->setBounds (104, 806, 1230, 58);
+    }
 
     // Update banner: centred strip near the top, drawn over the content. Sized
     // in editor (unscaled) pixels since it is a direct child of the editor.
@@ -5701,10 +5781,9 @@ void AudioPluginAudioProcessorEditor::paintSideRail (juce::Graphics& g,
     auto railArea = bounds.toFloat();
     auto railPath = cue::createRailPath (railArea, isLeftRail, cue::largeCorner);
 
-    cue::fillPathGradient (g, railPath, railArea, cue::railDark.brighter (0.12f),
-                           cue::railDark.darker (0.25f));
+    cue::fillGlassPath (g, railPath, railArea);
 
-    g.setColour (cue::borderDark);
+    g.setColour (cue::glassTextMuted.withAlpha (0.4f));
     const float x = isLeftRail ? railArea.getRight() - 0.5f : railArea.getX() + 0.5f;
     g.drawLine (x, railArea.getY(), x, railArea.getBottom(), 1.0f);
 
@@ -5717,7 +5796,7 @@ void AudioPluginAudioProcessorEditor::paintSideRail (juce::Graphics& g,
     const auto railOriginX = railArea.getX();
     const auto railOriginY = railArea.getY();
     paintScrew (g, { railOriginX + 31.5f, railOriginY + 50.0f });
-    paintScrew (g, { railOriginX + 31.5f, railOriginY + 748.0f });
+    paintScrew (g, { railOriginX + 31.5f, railOriginY + (float) cue::editorHeight - 50.0f });
 }
 
 void AudioPluginAudioProcessorEditor::paintScrew (juce::Graphics& g, juce::Point<float> centre) const

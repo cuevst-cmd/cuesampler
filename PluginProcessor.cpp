@@ -2121,6 +2121,10 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     auto totalNumInputChannels  = getTotalNumInputChannels();
     auto totalNumOutputChannels = juce::jmin (getTotalNumOutputChannels(), buffer.getNumChannels());
     const auto analysis = std::atomic_load (&tempoAnalysis);
+
+    // Mirror host MIDI into the on-screen keyboard state and inject notes the
+    // user plays by clicking it, so clicked keys trigger chops like real MIDI.
+    keyboardState.processNextMidiBuffer (midiMessages, 0, buffer.getNumSamples(), true);
     
     // Host sync snapshot
     double blockStartHostPpq = 0.0;

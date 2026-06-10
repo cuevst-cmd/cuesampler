@@ -174,7 +174,9 @@ target_compile_definitions(CueSampler
 juce_add_binary_data(CueSamplerBinaryAssets
     NAMESPACE CueSamplerBinaryData
     SOURCES
-        assets/cue_logo.png)
+        assets/cue_logo.png
+        assets/cue_background.png
+        assets/cue_background_blur.png)
 
 # `target_link_libraries` links libraries and JUCE modules to other libraries or executables. Here,
 # we're linking our executable target to the `juce::juce_audio_utils` module. Inter-module

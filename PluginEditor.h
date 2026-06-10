@@ -2,6 +2,8 @@
 
 #include "PluginProcessor.h"
 
+#include <juce_audio_utils/juce_audio_utils.h>
+
 #include <memory>
 
 namespace cue
@@ -47,6 +49,8 @@ private:
 
     AudioPluginAudioProcessor& processorRef;
 
+    juce::Image backgroundImage;
+
     juce::Component contentComponent;
 
     std::unique_ptr<cue::CueSamplerLookAndFeel> lookAndFeel;
@@ -58,6 +62,7 @@ private:
 
     std::unique_ptr<cue::HelpOverlayComponent> helpOverlayComponent;
     std::unique_ptr<cue::UpdateBannerComponent> updateBannerComponent;
+    std::unique_ptr<juce::MidiKeyboardComponent> midiKeyboardComponent;
     std::unique_ptr<juce::FileChooser> fileChooser;
 
     juce::TooltipWindow tooltipWindow { this, 500 };
