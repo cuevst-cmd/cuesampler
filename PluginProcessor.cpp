@@ -4162,6 +4162,28 @@ int AudioPluginAudioProcessor::getMidiRootNote() const noexcept
     return midiRootNote + midiOctaveOffset.load (std::memory_order_acquire) * 12;
 }
 
+int AudioPluginAudioProcessor::getMidiNoteForChopId (int chopId) const noexcept
+{
+    if (chopId < 0)
+        return -1;
+
+    const auto state = std::atomic_load (&chopState);
+    if (state == nullptr)
+        return -1;
+
+    for (size_t i = 0; i < state->chops.size(); ++i)
+        if (state->chops[i].id == chopId)
+            return getMidiRootNote() + (int) i;
+
+    return -1;
+}
+
+int AudioPluginAudioProcessor::getSelectedChopMidiNote() const noexcept
+{
+    const auto state = std::atomic_load (&chopState);
+    return state != nullptr ? getMidiNoteForChopId (state->selectedChopId) : -1;
+}
+
 void AudioPluginAudioProcessor::setGridBpmTrim (float trimBpm)
 {
     if (! juce::approximatelyEqual (trimBpm, gridBpmTrim.load (std::memory_order_acquire)))

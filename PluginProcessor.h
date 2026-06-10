@@ -134,6 +134,12 @@ public:
     // Lowest MIDI note that triggers chop 1 with the current octave shift.
     int  getMidiRootNote() const noexcept;
 
+    // MIDI note that triggers the given chop id (root + its list index) under
+    // the current octave shift, or -1 if no such chop. Lets the editor light
+    // the matching key on the on-screen keyboard when a chop is previewed.
+    int  getMidiNoteForChopId (int chopId) const noexcept;
+    int  getSelectedChopMidiNote() const noexcept;
+
     // Mirrors the incoming MIDI stream for the editor's on-screen keyboard,
     // and injects notes played by clicking it back into processBlock.
     juce::MidiKeyboardState keyboardState;

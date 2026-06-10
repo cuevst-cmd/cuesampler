@@ -17,6 +17,7 @@ class UtilityStripComponent;
 class EffectsRackComponent;
 class StartKnobComponent;
 class UpdateBannerComponent;
+class GlassKeyboard;
 }
 
 //==============================================================================
@@ -62,7 +63,7 @@ private:
 
     std::unique_ptr<cue::HelpOverlayComponent> helpOverlayComponent;
     std::unique_ptr<cue::UpdateBannerComponent> updateBannerComponent;
-    std::unique_ptr<juce::MidiKeyboardComponent> midiKeyboardComponent;
+    std::unique_ptr<cue::GlassKeyboard> midiKeyboardComponent;
     std::unique_ptr<juce::FileChooser> fileChooser;
 
     juce::TooltipWindow tooltipWindow { this, 500 };

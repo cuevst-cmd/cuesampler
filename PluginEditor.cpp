@@ -1323,6 +1323,17 @@ public:
         setColour (juce::MidiKeyboardComponent::textLabelColourId, juce::Colour (0xff42454c));
     }
 
+    // Lights a key for a previewed chop without going through the shared
+    // MidiKeyboardState (which would inject a note and re-trigger the chop).
+    // Drawn with the same pressed-overlay as a real key-down.
+    void setHighlightedNote (int note)
+    {
+        if (note == highlightedNote)
+            return;
+        highlightedNote = note;
+        repaint();
+    }
+
     void paint (juce::Graphics& g) override
     {
         // Refreshed per paint so mode changes recolour the overlays. setColour
@@ -1331,6 +1342,25 @@ public:
         setColour (juce::MidiKeyboardComponent::mouseOverKeyOverlayColourId, accentOrange.withAlpha (0.28f));
         juce::MidiKeyboardComponent::paint (g);
     }
+
+    void drawWhiteNote (int midiNoteNumber, juce::Graphics& g, juce::Rectangle<float> area,
+                        bool isDown, bool isOver, juce::Colour lineColour, juce::Colour textColour) override
+    {
+        juce::MidiKeyboardComponent::drawWhiteNote (midiNoteNumber, g, area,
+                                                    isDown || midiNoteNumber == highlightedNote,
+                                                    isOver, lineColour, textColour);
+    }
+
+    void drawBlackNote (int midiNoteNumber, juce::Graphics& g, juce::Rectangle<float> area,
+                        bool isDown, bool isOver, juce::Colour noteFillColour) override
+    {
+        juce::MidiKeyboardComponent::drawBlackNote (midiNoteNumber, g, area,
+                                                    isDown || midiNoteNumber == highlightedNote,
+                                                    isOver, noteFillColour);
+    }
+
+private:
+    int highlightedNote = -1;
 };
 
 class StartKnobComponent final : public juce::Component
@@ -5668,6 +5698,11 @@ void AudioPluginAudioProcessorEditor::changeListenerCallback (juce::ChangeBroadc
                                                                juce::dontSendNotification);
 
         transportSectionComponent->refreshDisplays();
+
+        // Light the on-screen keyboard key that maps to the previewed
+        // (selected) chop; -1 clears it when nothing is selected.
+        if (midiKeyboardComponent != nullptr)
+            midiKeyboardComponent->setHighlightedNote (processorRef.getSelectedChopMidiNote());
     });
 }
 
