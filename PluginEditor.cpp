@@ -861,44 +861,109 @@ private:
 };
 } // namespace
 
+// --- Tactile keycaps ---------------------------------------------------------
+// Mechanical-keycap chassis shared by all push buttons: a dark skirted cap
+// floating on a soft contact shadow, with a lighter top face inset like a
+// keycap's top surface — the bottom wall reads thicker, like a key seen
+// slightly from the front. Pressing sinks the whole cap keycapTravel px and
+// collapses the shadow so the key visibly bottoms out; toggles warm the cap
+// toward the accent as they switch on (accentAmount 0..1).
+constexpr float keycapTravel = 3.0f;
+
+// Cap at rest is the component bounds minus a bottom sliver reserved for the
+// contact shadow (painting is clipped to the component); pressing translates
+// it down by keycapTravel.
+juce::Rectangle<float> getKeycapBounds (juce::Rectangle<float> bounds, bool isDown)
+{
+    return bounds.withTrimmedBottom (keycapTravel + 1.0f)
+                 .translated (0.0f, isDown ? keycapTravel : 0.0f);
+}
+
+// The top-face plateau: inset and shifted up inside the cap so the front
+// wall reads thicker, like a key seen slightly from the front. Labels and
+// icons are laid out against this rect so they sit on (and ride) the face.
+juce::Rectangle<float> getKeycapFaceBounds (juce::Rectangle<float> bounds, bool isDown)
+{
+    const auto cap = getKeycapBounds (bounds, isDown);
+    const float inset = juce::jlimit (2.0f, 5.0f, cap.getHeight() * 0.11f);
+    return cap.reduced (inset).translated (0.0f, -inset * 0.30f);
+}
+
+void drawKeycap (juce::Graphics& g, juce::Rectangle<float> bounds, float cornerSize,
+                 float hover, bool isDown, float accentAmount = 0.0f,
+                 juce::Colour base = juce::Colour (0xff34373d))
+{
+    const auto cap = getKeycapBounds (bounds, isDown);
+    const auto face = getKeycapFaceBounds (bounds, isDown);
+    const float faceCorner = juce::jmax (2.0f, cornerSize * 0.72f);
+    const auto accent = accentOrange;
+
+    if (accentAmount > 0.001f)
+        base = base.interpolatedWith (accent.withAlpha (0.85f), 0.16f * accentAmount);
+
+    // Contact shadow: lifts the cap at rest, collapses as it bottoms out.
+    if (isDown)
+        drawSoftDropShadow (g, cap, cornerSize, false, 0.9f, 1.0f, 2.0f);
+    else
+        drawSoftDropShadow (g, cap, cornerSize, false, 1.7f, 4.0f, 6.0f);
+
+    if (hover > 0.01f && ! isDown)
+        drawSoftDropShadow (g, cap, cornerSize, false, 1.5f * hover, 2.0f, 9.0f, accent.withAlpha (hover));
+
+    // Skirt: one continuous moulded surface, darkest along the bottom wall.
+    fillRoundedGradient (g, cap,
+                         base.brighter (0.02f + 0.05f * hover),
+                         base.darker (0.58f), cornerSize);
+
+    // Light catching the top rim of the cap.
+    juce::ColourGradient rim (juce::Colours::white.withAlpha (0.14f + 0.05f * hover),
+                              cap.getCentreX(), cap.getY(),
+                              juce::Colours::white.withAlpha (0.0f),
+                              cap.getCentreX(), cap.getY() + 5.0f, false);
+    g.setGradientFill (rim);
+    g.fillRoundedRectangle (cap, cornerSize);
+
+    g.setColour (juce::Colours::black.withAlpha (0.45f));
+    g.drawRoundedRectangle (cap, cornerSize, 1.0f);
+
+    // Soft recess where the face plateau meets the skirt — a blurred halo
+    // rather than a stroked ring, so the transition reads moulded.
+    drawSoftDropShadow (g, face, faceCorner, false, 1.0f, 1.0f, 2.5f);
+
+    auto faceTop = base.brighter (isDown ? 0.10f : 0.22f).brighter (0.06f * hover);
+    auto faceBottom = base.brighter (isDown ? 0.0f : 0.04f);
+    if (accentAmount > 0.001f)
+    {
+        faceTop = faceTop.interpolatedWith (accent, 0.10f * accentAmount);
+        faceBottom = faceBottom.interpolatedWith (accent, 0.07f * accentAmount);
+    }
+    fillRoundedGradient (g, face, faceTop, faceBottom, faceCorner);
+
+    // Soft sheen across the top half of the face, compressed while held down.
+    const float sheenAlpha = (isDown ? 0.05f : 0.11f) + 0.06f * hover;
+    juce::ColourGradient sheen (juce::Colours::white.withAlpha (sheenAlpha),
+                                face.getCentreX(), face.getY(),
+                                juce::Colours::white.withAlpha (0.0f),
+                                face.getCentreX(), face.getY() + face.getHeight() * 0.60f, false);
+    g.setGradientFill (sheen);
+    g.fillRoundedRectangle (face, faceCorner);
+}
+
 // Shared chassis for the glass toggle switches (HALF TIME, SYNC TO DAW): a
-// smoked-glass slab that warms toward the accent as the switch animates on,
-// with a status LED. One code path keeps hover/press/on states consistent
-// between the two switches.
+// tactile keycap that warms toward the accent as the switch animates on,
+// with a status LED riding the cap. One code path keeps hover/press/on
+// states consistent between the two switches.
 void drawGlassToggle (juce::Graphics& g, juce::Rectangle<float> bounds,
                       float position, float hover, bool isDown,
                       float ledRadius, float ledOffsetY)
 {
     const float pos = juce::jlimit (0.0f, 1.0f, position);
 
-    if (hover > 0.01f || pos > 0.01f)
-    {
-        const float glowAlpha = hover * 0.15f + 0.85f * pos;
-        drawSoftDropShadow (g, bounds, 8.0f, false, 1.2f + 1.8f * pos, 2.0f * (1.0f - pos),
-                            3.0f + 9.0f * pos, accentOrange.withAlpha (glowAlpha));
-    }
-    else
-    {
-        drawSoftDropShadow (g, bounds, 8.0f, false, 1.2f, 2.0f, 3.0f);
-    }
+    drawKeycap (g, bounds, 10.0f, hover, isDown, pos);
 
-    auto baseOff = juce::Colour (0xff26282c);
-    auto baseOn = accentOrange.withAlpha (0.32f).interpolatedWith (baseOff, 0.45f);
-    auto base = baseOff.interpolatedWith (baseOn, pos).brighter (0.05f * hover);
-
-    if (isDown)
-        base = base.darker (0.12f);
-
-    fillRoundedGradient (g, bounds, base.brighter (0.03f).withAlpha (0.86f),
-                         base.darker (0.08f).withAlpha (0.90f), 8.0f);
-
-    g.setColour (borderDark.interpolatedWith (accentOrange.withAlpha (0.35f), std::max (pos, hover)));
-    g.drawRoundedRectangle (bounds, 8.0f, 1.0f);
-    g.setColour (juce::Colours::white.withAlpha (0.10f).interpolatedWith (accentOrange.withAlpha (0.16f), std::max (pos, hover)));
-    g.drawRoundedRectangle (bounds.reduced (1.0f), 7.0f, 1.0f);
-
-    // Status LED
-    auto ledCentre = juce::Point<float> (bounds.getCentreX(), bounds.getY() + ledOffsetY);
+    // Status LED — positioned from the (possibly pressed) cap so it rides the key.
+    const auto cap = getKeycapBounds (bounds, isDown);
+    auto ledCentre = juce::Point<float> (cap.getCentreX(), cap.getY() + ledOffsetY);
     auto ledBounds = juce::Rectangle<float> (ledRadius * 2.0f, ledRadius * 2.0f).withCentre (ledCentre);
 
     if (pos > 0.01f)
@@ -953,6 +1018,39 @@ public:
         layout.draw (g, bounds.reduced (11.0f, 8.0f));
     }
 
+    void drawScrollbar (juce::Graphics& g, juce::ScrollBar& scrollbar,
+                        int x, int y, int width, int height,
+                        bool isScrollbarVertical, int thumbStartPosition, int thumbSize,
+                        bool isMouseOver, bool isMouseDown) override
+    {
+        juce::ignoreUnused (scrollbar);
+        const auto bounds = juce::Rectangle<int> (x, y, width, height).toFloat();
+
+        // Recessed glass groove
+        auto track = isScrollbarVertical ? bounds.reduced (bounds.getWidth() * 0.30f, 0.0f)
+                                         : bounds.reduced (0.0f, bounds.getHeight() * 0.30f);
+        const float trackRadius = juce::jmin (track.getWidth(), track.getHeight()) * 0.5f;
+        g.setColour (juce::Colours::black.withAlpha (0.38f));
+        g.fillRoundedRectangle (track, trackRadius);
+        g.setColour (juce::Colours::white.withAlpha (0.05f));
+        g.drawRoundedRectangle (track, trackRadius, 1.0f);
+
+        if (thumbSize <= 0)
+            return;
+
+        auto thumb = isScrollbarVertical
+            ? bounds.withY ((float) thumbStartPosition).withHeight ((float) thumbSize).reduced (1.0f, 0.0f)
+            : bounds.withX ((float) thumbStartPosition).withWidth ((float) thumbSize).reduced (0.0f, 1.0f);
+        const float thumbRadius = juce::jmin (thumb.getWidth(), thumb.getHeight()) * 0.5f;
+
+        const float hover = isMouseDown ? 1.0f : (isMouseOver ? 0.6f : 0.0f);
+        auto base = juce::Colour (0xff3c3f45).interpolatedWith (accentOrange, 0.30f + 0.35f * hover);
+        fillRoundedGradient (g, thumb, base.brighter (0.10f).withAlpha (0.92f),
+                             base.darker (0.12f).withAlpha (0.95f), thumbRadius);
+        g.setColour (juce::Colours::white.withAlpha (0.10f + 0.08f * hover));
+        g.drawRoundedRectangle (thumb, thumbRadius, 1.0f);
+    }
+
     float getHoverAlpha (juce::Button& button, bool isMouseOverButton)
     {
         if (auto* hb = dynamic_cast<SmoothHoverButton*> (&button))
@@ -971,32 +1069,13 @@ public:
         if (style == "transportSquare" || style == "halfTime"
             || style == "flatAction" || style == "utilitySync" || style == "effectSwitch")
         {
+            // Keycap travel is applied inside drawKeycap; effectSwitch is a
+            // left/right toggle, not a press button, and never dips.
             auto bounds = button.getLocalBounds().toFloat().reduced (0.5f);
-            // effectSwitch is a left/right toggle, not a press button — no vertical "press down" dip.
-            auto pressedOffset = (isButtonDown && style != "effectSwitch") ? 2.0f : 0.0f;
-            bounds = bounds.translated (0.0f, pressedOffset);
 
             if (style == "transportSquare")
             {
-                float hover = getHoverAlpha (button, isMouseOverButton);
-                if (hover > 0.01f)
-                    drawSoftDropShadow (g, bounds, 10.0f, false, 1.5f + 1.5f * hover, 3.0f * (1.0f - hover), 4.0f + 8.0f * hover, accentOrange.withAlpha (hover));
-                else
-                    drawSoftDropShadow (g, bounds, 10.0f, false, 1.5f, 3.0f, 4.0f);
-
-                juce::ColourGradient gradient (controlGlassTop, bounds.getCentreX(), bounds.getY(),
-                                               controlGlassBottom, bounds.getCentreX(), bounds.getBottom(), false);
-                g.setGradientFill (gradient);
-                g.fillRoundedRectangle (bounds, 10.0f);
-                if (isButtonDown)
-                {
-                    g.setColour (juce::Colours::black.withAlpha (0.18f));
-                    g.fillRoundedRectangle (bounds, 10.0f);
-                }
-                g.setColour (borderMid.interpolatedWith (accentOrange.withAlpha (0.35f), hover));
-                g.drawRoundedRectangle (bounds, 10.0f, 2.0f);
-                g.setColour (juce::Colours::white.withAlpha (0.06f).interpolatedWith (accentOrange.withAlpha (0.12f), hover));
-                g.drawRoundedRectangle (bounds.reduced (1.0f), 9.0f, 1.0f);
+                drawKeycap (g, bounds, 11.0f, getHoverAlpha (button, isMouseOverButton), isButtonDown);
                 return;
             }
 
@@ -1062,10 +1141,20 @@ public:
                 auto thumbColour = offThumbColour.interpolatedWith (onThumbColour, clampedPos);
                 thumbColour = thumbColour.brighter (0.1f * hover);
 
+                // Raised-cap treatment so the thumb matches the keycap language.
+                drawSoftDropShadow (g, thumbBounds, 3.0f, false, 1.1f, 1.5f, 3.0f);
+
                 juce::ColourGradient thumbGrad (thumbColour.brighter (0.1f), thumbBounds.getCentreX(), thumbBounds.getY(),
                                                 thumbColour.darker (0.2f), thumbBounds.getCentreX(), thumbBounds.getBottom(), false);
                 g.setGradientFill (thumbGrad);
                 g.fillRoundedRectangle (thumbBounds, 3.0f);
+
+                juce::ColourGradient thumbSheen (juce::Colours::white.withAlpha (0.12f),
+                                                 thumbBounds.getCentreX(), thumbBounds.getY(),
+                                                 juce::Colours::white.withAlpha (0.0f),
+                                                 thumbBounds.getCentreX(), thumbBounds.getY() + thumbBounds.getHeight() * 0.55f, false);
+                g.setGradientFill (thumbSheen);
+                g.fillRoundedRectangle (thumbBounds.reduced (1.0f), 2.5f);
 
                 auto offBorderColour = borderLight.brighter (0.2f);
                 auto onBorderColour = accentOrange.brighter (0.2f);
@@ -1083,63 +1172,40 @@ public:
                 return;
             }
 
-            float hover = getHoverAlpha (button, isMouseOverButton);
-            if (hover > 0.01f)
-                drawSoftDropShadow (g, bounds, 4.0f, false, 1.3f + 1.7f * hover, 2.0f * (1.0f - hover), 3.0f + 9.0f * hover, accentOrange.withAlpha (hover));
-            else
-                drawSoftDropShadow (g, bounds, 4.0f, false, 1.3f, 2.0f, 3.0f);
-
-            juce::ColourGradient gradient (juce::Colour (0xd62a2c30), bounds.getCentreX(), bounds.getY(),
-                                           juce::Colour (0xe01b1d20), bounds.getCentreX(), bounds.getBottom(), false);
-            g.setGradientFill (gradient);
-            g.fillRoundedRectangle (bounds, 4.0f);
-            if (isButtonDown)
-            {
-                g.setColour (juce::Colours::black.withAlpha (0.18f));
-                g.fillRoundedRectangle (bounds, 4.0f);
-            }
-            g.setColour (borderDark.interpolatedWith (accentOrange.withAlpha (0.35f), hover));
-            g.drawRoundedRectangle (bounds, 4.0f, 1.0f);
-            g.setColour (juce::Colours::white.withAlpha (0.05f).interpolatedWith (accentOrange.withAlpha (0.12f), hover));
-            g.drawRoundedRectangle (bounds.reduced (1.0f), 3.0f, 1.0f);
+            // flatAction
+            drawKeycap (g, bounds, juce::jlimit (6.0f, 10.0f, bounds.getHeight() * 0.26f),
+                        getHoverAlpha (button, isMouseOverButton), isButtonDown);
             return;
         }
 
+        // Generic fallback (helpButton, waveScaleStep, anything unstyled):
+        // same keycap chassis as the styled buttons so the family stays uniform.
+        juce::ignoreUnused (backgroundColour);
         auto bounds = button.getLocalBounds().toFloat().reduced (0.5f);
-        auto corner = juce::jlimit (4.0f, 10.0f, bounds.getHeight() * 0.18f);
-
-        auto base = backgroundColour;
-        float hover = getHoverAlpha (button, isMouseOverButton);
-        base = base.brighter (0.08f * hover);
-
-        if (isButtonDown)
-            base = base.darker (0.15f);
-
-        if (hover > 0.01f)
-            drawSoftDropShadow (g, bounds, corner, false, 1.2f + 1.8f * hover, 2.0f * (1.0f - hover), 3.0f + 9.0f * hover, accentOrange.withAlpha (hover));
-        else
-            drawSoftDropShadow (g, bounds, corner, false, 1.2f, 2.0f, 3.0f);
-
-        fillRoundedGradient (g, bounds, base.brighter (0.1f), base.darker (0.28f), corner);
-
-        g.setColour (borderDark.interpolatedWith (accentOrange.withAlpha (0.35f), hover));
-        g.drawRoundedRectangle (bounds, corner, 1.0f);
-
-        g.setColour (juce::Colours::white.withAlpha (0.08f).interpolatedWith (accentOrange.withAlpha (0.12f), hover));
-        g.drawRoundedRectangle (bounds.reduced (1.0f), juce::jmax (1.0f, corner - 1.0f), 1.0f);
+        auto corner = juce::jlimit (5.0f, 10.0f, bounds.getHeight() * 0.24f);
+        drawKeycap (g, bounds, corner, getHoverAlpha (button, isMouseOverButton), isButtonDown);
     }
 
     void drawButtonText (juce::Graphics& g, juce::TextButton& button,
-                         bool, bool) override
+                         bool, bool isButtonDown) override
     {
         const auto style = getCueStyle (button);
-        auto bounds = button.getLocalBounds().reduced (4, 4);
+
+        if (style == "effectSwitch")
+            return; // Handled entirely in drawButtonBackground
+
+        // Lay everything out against the keycap's top face so labels sit on
+        // the plateau and ride the key as it travels down.
+        const auto localBounds = button.getLocalBounds().toFloat().reduced (0.5f);
+        const auto face = getKeycapFaceBounds (localBounds, isButtonDown);
+        const auto cap = getKeycapBounds (localBounds, isButtonDown);
+        const auto bounds = face.toNearestInt();
 
         if (style == "transportSquare")
         {
             juce::Path icon;
             const auto iconName = getCueIcon (button);
-            auto iconBounds = bounds.toFloat().withSizeKeepingCentre (20.0f, 20.0f);
+            auto iconBounds = face.withSizeKeepingCentre (20.0f, 20.0f);
 
             if (iconName == "play")
             {
@@ -1175,7 +1241,10 @@ public:
             auto textOn = textPrimary;
             g.setColour (textOff.interpolatedWith (textOn, clampedPos));
             g.setFont (heavyFont (8.0f));
-            g.drawFittedText (button.getButtonText(), bounds.withTrimmedTop (18), juce::Justification::centred, 2);
+            // Below the status LED (radius 3.5 at capY + 11), inside the face.
+            g.drawFittedText (button.getButtonText(),
+                              bounds.withTop ((int) (cap.getY() + 16.0f)).withTrimmedBottom (1),
+                              juce::Justification::centred, 2);
             return;
         }
 
@@ -1185,8 +1254,8 @@ public:
             auto textOff = juce::Colour (0xff99a1af);
             auto textOn = textPrimary;
             g.setColour (textOff.interpolatedWith (textOn, hover));
-            g.setFont (heavyFont (14.0f));
-            g.drawFittedText (button.getButtonText(), bounds, juce::Justification::centred, 1);
+            g.setFont (heavyFont (juce::jlimit (9.0f, 13.0f, face.getHeight() * 0.60f)));
+            g.drawFittedText (button.getButtonText(), bounds.reduced (3, 0), juce::Justification::centred, 1);
             return;
         }
 
@@ -1196,8 +1265,8 @@ public:
             auto baseColour = button.findColour (button.getToggleState() ? juce::TextButton::textColourOnId
                                                                          : juce::TextButton::textColourOffId);
             g.setColour (baseColour.interpolatedWith (accentOrange, hover));
-            g.setFont (heavyFont (18.0f));
-            g.drawFittedText (button.getButtonText(), bounds.translated (0, -1), juce::Justification::centred, 1);
+            g.setFont (heavyFont (16.0f));
+            g.drawFittedText (button.getButtonText(), bounds, juce::Justification::centred, 1);
             return;
         }
 
@@ -1211,33 +1280,30 @@ public:
             auto textOff = juce::Colour (0xff777777);
             auto textOn = textPrimary;
             g.setColour (textOff.interpolatedWith (textOn, clampedPos));
-            g.setFont (heavyFont (10.0f));
-            g.drawFittedText (button.getButtonText(), bounds.withTrimmedTop (24), juce::Justification::centred, 2);
+            g.setFont (heavyFont (9.5f));
+            // Below the status LED (radius 4 at capY + 14), inside the face.
+            g.drawFittedText (button.getButtonText(),
+                              bounds.withTop ((int) (cap.getY() + 20.0f)).withTrimmedBottom (1),
+                              juce::Justification::centred, 1);
             return;
-        }
-
-        if (style == "effectSwitch")
-        {
-            return; // Handled entirely in drawButtonBackground
         }
 
         if (style == "waveScaleStep")
         {
             float hover = getHoverAlpha (button, false);
             g.setColour (textPrimary.withAlpha (0.9f).interpolatedWith (accentOrange, hover));
-            g.setFont (heavyFont (20.0f));
-            g.drawFittedText (button.getButtonText(), bounds.translated (0, -1),
-                              juce::Justification::centred, 1);
+            g.setFont (heavyFont (17.0f));
+            g.drawFittedText (button.getButtonText(), bounds, juce::Justification::centred, 1);
             return;
         }
 
-        auto fontSize = juce::jlimit (7.0f, 15.0f, (float) bounds.getHeight() * 0.32f);
+        auto fontSize = juce::jlimit (7.0f, 15.0f, face.getHeight() * 0.40f);
         float hover = getHoverAlpha (button, false);
         auto baseColor = button.findColour (button.getToggleState() ? juce::TextButton::textColourOnId
                                                                      : juce::TextButton::textColourOffId);
         g.setColour (baseColor.interpolatedWith (accentOrange, hover));
         g.setFont (heavyFont (fontSize));
-        g.drawFittedText (button.getButtonText(), bounds, juce::Justification::centred, 2);
+        g.drawFittedText (button.getButtonText(), bounds.reduced (2, 0), juce::Justification::centred, 2);
     }
 
     float getSliderHoverAlpha (juce::Slider& slider, bool isMouseOverOrDragging)
