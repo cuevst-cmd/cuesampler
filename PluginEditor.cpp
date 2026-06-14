@@ -1901,20 +1901,26 @@ private:
     }
 };
 
+// The white "CUE." brand wordmark (the bundled cue_logo_white.svg, including
+// its trailing square period). Rendered as vector so it stays crisp at any UI
+// scale and sits on the top line of the stacked title lockup.
+static const char* const cueWordmarkSvg =
+R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="20 -700 4123 760"><path fill="#FFFFFF" d="M1255.0 -267Q1250.0 -172 1186.0 -108.0Q1122.0 -44 997.5 -12.0Q873.0 20 683.0 20Q538.0 20 423.0 4.5Q308.0 -11 227.0 -48.5Q146.0 -86 103.0 -151.0Q60.0 -216 60.0 -315Q60.0 -414 103.0 -480.5Q146.0 -547 227.0 -586.5Q308.0 -626 423.0 -643.0Q538.0 -660 683.0 -660Q873.0 -660 998.0 -625.5Q1123.0 -591 1187.0 -524.0Q1251.0 -457 1256.0 -361H996.0Q984.0 -393 952.0 -417.5Q920.0 -442 856.0 -456.0Q792.0 -470 683.0 -470Q555.0 -470 475.0 -454.5Q395.0 -439 358.0 -405.0Q321.0 -371 321.0 -315Q321.0 -264 358.0 -232.0Q395.0 -200 475.0 -185.0Q555.0 -170 683.0 -170Q792.0 -170 855.5 -183.0Q919.0 -196 951.0 -218.5Q983.0 -241 995.0 -267Z M2303.0 -365V-640H2553.0V-320Q2553.0 -235 2521.5 -175.5Q2490.0 -116 2434.0 -77.5Q2378.0 -39 2305.0 -18.0Q2232.0 3 2148.5 11.5Q2065.0 20 1979.0 20Q1888.0 20 1803.0 11.5Q1718.0 3 1645.5 -18.0Q1573.0 -39 1519.0 -77.5Q1465.0 -116 1434.5 -175.5Q1404.0 -235 1404.0 -320V-640H1654.0V-365Q1654.0 -285 1693.0 -243.0Q1732.0 -201 1804.5 -185.5Q1877.0 -170 1979.0 -170Q2078.0 -170 2151.0 -185.5Q2224.0 -201 2263.5 -243.0Q2303.0 -285 2303.0 -365Z M2961.0 -270V-190H3721.0V0H2711.0V-640H3719.0V-450H2961.0V-370H3581.0V-270Z M4103.0 -151V0H3849.0V-151Z"/></svg>)SVG";
+
 class HeaderComponent final : public juce::Component,
                               public juce::SettableTooltipClient,
                               private juce::Timer
 {
 public:
     explicit HeaderComponent (AudioPluginAudioProcessor& p)
-        : processor (p),
-          logoImage (juce::ImageCache::getFromMemory (CueSamplerBinaryData::cue_logo_png,
-                                                      CueSamplerBinaryData::cue_logo_pngSize))
+        : processor (p)
     {
         setBufferedToImage (true);
         startTimerHz (headerRefreshHz);
 
-        setTooltip ("Output level meter - Green = safe, Yellow = loud, Red = clipping. Turn down the GAIN knob if it clips.");
+        const juce::String svg (cueWordmarkSvg);
+        cueWordmark = juce::Drawable::createFromImageData (svg.toRawUTF8(),
+                                                           (size_t) svg.getNumBytesAsUTF8());
 
         configureButton (helpButton, "?", textPrimary);
         helpButton.getProperties().set ("cueStyle", "helpButton");
@@ -1982,96 +1988,39 @@ public:
         g.drawLine ((float) bounds.getX(), (float) bounds.getBottom() - 1.0f,
                     (float) bounds.getRight(), (float) bounds.getBottom() - 1.0f, 1.0f);
 
-        auto logoCircle = juce::Rectangle<float> (50.0f, 50.0f).withCentre ({ 40.0f, 38.0f });
-        auto meterBounds = logoCircle.expanded (5.0f);
-        const auto meterLevel = juce::jlimit (0.0f, 1.0f, processor.getOutputMeterLevel());
-        const auto meterVisualLevel = std::sqrt (meterLevel);
-        constexpr float meterStartAngle = juce::degreesToRadians (135.0f);
-        constexpr float meterEndAngle = juce::degreesToRadians (405.0f);
-        constexpr float meterTrackThickness = 3.5f;
-        constexpr float meterGlowThickness = 6.5f;
-        const auto meterColour = getMeterColourForLevel (meterLevel);
+        // --- Stacked brand lockup: "CUE." over a wide-tracked "SAMPLER" ---
+        const float logoX = 10.0f;
+        const float logoY = 4.0f;
+        const float logoH = 38.0f;
+        float lockupW = 210.0f; // fallback if the wordmark fails to parse
 
-        juce::Path meterTrack;
-        meterTrack.addCentredArc (meterBounds.getCentreX(), meterBounds.getCentreY(),
-                                  meterBounds.getWidth() * 0.5f, meterBounds.getHeight() * 0.5f,
-                                  0.0f, meterStartAngle, meterEndAngle, true);
-        g.setColour (juce::Colour (0xff1f1f1f));
-        g.strokePath (meterTrack, juce::PathStrokeType (meterTrackThickness, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-
-        if (meterVisualLevel > 0.001f)
+        if (cueWordmark != nullptr)
         {
-            juce::Path meterArc;
-            meterArc.addCentredArc (meterBounds.getCentreX(), meterBounds.getCentreY(),
-                                    meterBounds.getWidth() * 0.5f, meterBounds.getHeight() * 0.5f,
-                                    0.0f, meterStartAngle,
-                                    juce::jmap (meterVisualLevel, 0.0f, 1.0f, meterStartAngle, meterEndAngle), true);
-
-            g.setColour (meterColour.withAlpha (0.16f + 0.12f * meterVisualLevel));
-            g.strokePath (meterArc, juce::PathStrokeType (meterGlowThickness, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-            g.setColour (meterColour);
-            g.strokePath (meterArc, juce::PathStrokeType (meterTrackThickness, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            const auto db = cueWordmark->getDrawableBounds();
+            if (db.getHeight() > 0.0f)
+                lockupW = logoH * db.getWidth() / db.getHeight();
+            cueWordmark->drawWithin (g, { logoX, logoY, lockupW, logoH },
+                                     juce::RectanglePlacement::stretchToFit, 1.0f);
         }
 
-        if (logoImage.isValid())
+        // "SAMPLER" sits beneath, letter-spaced to span the wordmark's width.
+        const float samplerSize = 17.0f;
+        auto samplerFont = juce::Font (juce::FontOptions ("Helvetica", samplerSize, juce::Font::plain));
         {
-            const auto minSourceDimension = juce::jmin (logoImage.getWidth(), logoImage.getHeight());
-            const auto sourceInset = juce::roundToInt ((float) minSourceDimension * 0.135f);
-            const auto sourceSize = juce::jmax (1, minSourceDimension - sourceInset * 2);
-            const auto sourceX = juce::jlimit (0, logoImage.getWidth() - sourceSize,
-                                               (logoImage.getWidth() - sourceSize) / 2);
-            const auto sourceY = juce::jlimit (0, logoImage.getHeight() - sourceSize,
-                                               (logoImage.getHeight() - sourceSize) / 2 - 20);
-
-            juce::Graphics::ScopedSaveState logoState (g);
-            juce::Path logoClip;
-            logoClip.addEllipse (logoCircle);
-            g.reduceClipRegion (logoClip);
-            g.setImageResamplingQuality (juce::Graphics::highResamplingQuality);
-            g.drawImage (logoImage,
-                         juce::roundToInt (logoCircle.getX()),
-                         juce::roundToInt (logoCircle.getY()),
-                         juce::roundToInt (logoCircle.getWidth()),
-                         juce::roundToInt (logoCircle.getHeight()),
-                         sourceX,
-                         sourceY,
-                         sourceSize,
-                         sourceSize);
-        }
-        else
-        {
-            fillEllipseGradient (g, logoCircle, accentOrange.brighter (0.35f), accentOrange.darker (0.28f));
-            g.setColour (textPrimary);
-            g.setFont (heavyFont (16.0f));
-            g.drawFittedText ("CUE", logoCircle.toNearestInt(), juce::Justification::centred, 1);
+            juce::GlyphArrangement ga;
+            ga.addLineOfText (samplerFont, "SAMPLER", 0.0f, 0.0f);
+            const float naturalW = ga.getBoundingBox (0, -1, true).getWidth();
+            const float kern = juce::jmax (0.0f, (lockupW - naturalW) / (samplerSize * 7.0f));
+            samplerFont = samplerFont.withExtraKerningFactor (kern);
         }
 
-        g.setColour (juce::Colours::black.withAlpha (0.35f));
-        g.drawEllipse (logoCircle.expanded (0.5f), 1.0f);
-
-        const auto titleFont = heavyFont (52.0f);
-        juce::GlyphArrangement titleGlyphs;
-        titleGlyphs.addLineOfText (titleFont, "SAMPLER", 0.0f, 0.0f);
-        const int samplerTextWidth = (int) std::ceil (titleGlyphs.getBoundingBox (0, -1, true).getWidth());
-
-        const int titleX = 96;
-        const int titleY = 4;
-        const int titleHeight = 58;
+        const int samplerTop = (int) std::round (logoY + logoH + 1.0f);
         g.setColour (textPrimary);
-        g.setFont (titleFont);
-        g.drawText ("SAMPLER", juce::Rectangle<int> (titleX, titleY, samplerTextWidth + 4, titleHeight),
+        g.setFont (samplerFont);
+        g.drawText ("SAMPLER",
+                    juce::Rectangle<int> ((int) std::round (logoX), samplerTop,
+                                          (int) std::ceil (lockupW) + 60, 28),
                     juce::Justification::centredLeft, false);
-
-        // Header text sits directly on the orange background; white like the
-        // website headline (orange/grey are illegible here).
-        const int dotX = titleX + samplerTextWidth;
-        g.setColour (textPrimary);
-        g.drawText (".", juce::Rectangle<int> (dotX, titleY, 20, titleHeight), juce::Justification::centredLeft, false);
-
-        const int betaX = dotX + 18;
-        g.setColour (textPrimary.withAlpha (0.78f));
-        g.setFont (heavyFont (16.0f));
-        g.drawText ("(beta)", juce::Rectangle<int> (betaX, 35, 90, 20), juce::Justification::centredLeft, false);
 
         g.setColour (textPrimary.withAlpha (0.85f));
         g.setFont (heavyFont (12.0f));
@@ -2082,22 +2031,17 @@ public:
 private:
     void timerCallback() override
     {
-        // Keep the undo button's enabled state in sync even when the realtime
-        // meter animation is throttled (e.g. plugin window hidden).
+        // The header is static now that the output meter is gone; the only live
+        // state is the undo button's enabled flag.
         if (const bool canUndo = processor.canUndoEdit(); canUndo != undoButton.isEnabled())
             undoButton.setEnabled (canUndo);
-
-        if (! shouldRunRealtimeUi (*this))
-            return;
-
-        repaint (4, 4, 72, 68);
     }
 
     AudioPluginAudioProcessor& processor;
     SmoothHoverButton helpButton;
     SmoothHoverButton dataButton;
     SmoothHoverButton undoButton;
-    juce::Image logoImage;
+    std::unique_ptr<juce::Drawable> cueWordmark;
 };
 
 class WaveformDisplayComponent final : public juce::Component,
@@ -2162,6 +2106,13 @@ public:
         repaint();
     }
 
+    juce::String getTooltip() override
+    {
+        if (exportButtonHovered)
+            return "Drag into your DAW to export this chop as audio, or click to save it to disk.";
+        return juce::SettableTooltipClient::getTooltip();
+    }
+
     // ---- FileDragAndDropTarget ----
     bool isInterestedInFileDrag (const juce::StringArray& files) override
     {
@@ -2215,6 +2166,11 @@ public:
         hoveredChopId = -1;
         if (edgeDragChopId < 0)
             edgeHoverKind = 0;
+        if (exportButtonHovered)
+        {
+            exportButtonHovered = false;
+            repaint();
+        }
         setMouseCursor (juce::MouseCursor::NormalCursor);
     }
 
@@ -2222,6 +2178,18 @@ public:
     {
         if (! isPositionInsideDisplay (event.position))
             return;
+
+        // Floating export button takes priority over selecting/auditioning the
+        // chop underneath it. We arm here; mouseDrag vs mouseUp decides whether
+        // this becomes a drag-into-DAW or a click-to-save.
+        if (hitTestExportButton (event.position))
+        {
+            exportButtonPressed   = true;
+            exportButtonDragArmed = false;
+            exportButtonPressPos  = event.position;
+            repaint();
+            return;
+        }
 
         if (processor.isWarpModeActive())
         {
@@ -2274,6 +2242,19 @@ public:
 
     void updateCursorForMode (juce::Point<float> pos)
     {
+        // The floating export button owns the cursor when hovered.
+        const bool overExport = hitTestExportButton (pos);
+        if (overExport != exportButtonHovered)
+        {
+            exportButtonHovered = overExport;
+            repaint();
+        }
+        if (overExport)
+        {
+            setMouseCursor (juce::MouseCursor::PointingHandCursor);
+            return;
+        }
+
         if (! isPositionInsideDisplay (pos))
         {
             edgeHoverKind = 0;
@@ -2721,6 +2702,27 @@ public:
 
     void mouseDrag (const juce::MouseEvent& event) override
     {
+        // Dragging the floating export button arms the OS file drag immediately
+        // (no 2 s wait). A tiny threshold distinguishes a drag from a click.
+        if (exportButtonPressed)
+        {
+            if (! exportButtonDragArmed
+                && event.position.getDistanceFrom (exportButtonPressPos) > 4.0f)
+            {
+                exportButtonDragArmed = true;
+                const int chopId = exportTargetChopId;
+                exportButtonPressed = false;
+                if (chopId >= 0)
+                {
+                    exportDragFired = true; // suppress our own FileDragAndDropTarget
+                    initiateChopExportDrag (chopId);
+                    exportDragFired = false;
+                }
+                repaint();
+            }
+            return;
+        }
+
         if (processor.isWarpModeActive() && warpDragChopId >= 0 && warpDragMarkerIndex >= 0)
         {
             handleWarpMouseDrag (event);
@@ -2745,6 +2747,20 @@ public:
 
     void mouseUp (const juce::MouseEvent& event) override
     {
+        // Released on the export button without dragging => click-to-save.
+        if (exportButtonPressed)
+        {
+            exportButtonPressed = false;
+            if (! exportButtonDragArmed && hitTestExportButton (event.position))
+            {
+                if (exportTargetChopId >= 0)
+                    saveChopToFile (exportTargetChopId);
+            }
+            exportButtonDragArmed = false;
+            repaint();
+            return;
+        }
+
         if (warpDragChopId >= 0 || warpDragMarkerIndex >= 0)
         {
             warpDragChopId      = -1;
@@ -3129,6 +3145,9 @@ public:
             g.setColour (accentOrange.withAlpha (0.5f));
             g.drawRoundedRectangle (displayBounds.reduced (2.0f), 3.0f, 2.0f);
         }
+
+        // ---- Floating export affordance (drawn on top) ----
+        paintExportButton (g);
     }
 
     void resized() override
@@ -3247,6 +3266,187 @@ private:
         repaint();
     }
 
+    // ---- Floating export button (drag handle + click-to-save) ----
+
+    // Repoints the button at a chop, replaying the pop-in when the target
+    // actually changes. The target is the selected chop or the chop most
+    // recently triggered from a MIDI key (see timerCallback).
+    void setExportTarget (int chopId)
+    {
+        if (chopId != exportTargetChopId)
+        {
+            exportTargetChopId = chopId;
+            exportButtonAppear = 0.0f; // replay pop-in for the new chop
+        }
+    }
+
+    // The button is shown whenever there's a target chop and we're not in the
+    // middle of another gesture that owns the display (edge resize, warp,
+    // or an in-progress hold-to-export).
+    bool isExportButtonActive() const
+    {
+        if (processor.isWarpModeActive())                            return false;
+        if (edgeDragChopId >= 0 || edgeHoverKind != 0)               return false;
+        if (holdTickCount > 0 || exportDragReady || exportDragFired)  return false;
+        if (exportTargetChopId < 0 || processor.getLoadedSample() == nullptr) return false;
+
+        const auto cs = processor.getChopState();
+        if (cs == nullptr)
+            return false;
+        for (const auto& c : cs->chops)
+            if (c.id == exportTargetChopId)
+                return true;
+        return false;
+    }
+
+    // On-screen rect of the floating export button, or an empty rect when it
+    // should not be shown. Anchored to the top-centre of the target chop's
+    // visible span, clamped inside the display and clear of the +/- buttons.
+    juce::Rectangle<float> getExportButtonBounds() const
+    {
+        if (! isExportButtonActive())
+            return {};
+
+        const auto sampleData = processor.getLoadedSample();
+        const auto cs         = processor.getChopState();
+        if (sampleData == nullptr || cs == nullptr)
+            return {};
+
+        const AudioPluginAudioProcessor::ChopDefinition* sel = nullptr;
+        for (const auto& c : cs->chops)
+            if (c.id == exportTargetChopId) { sel = &c; break; }
+        if (sel == nullptr)
+            return {};
+
+        const auto display  = getDisplayBounds();
+        const auto visRange = getVisibleRange (sampleData->buffer.getNumSamples());
+        const float startX = displayXForSamplePosition ((double) sel->startSample, visRange, display);
+        const float endX   = displayXForSamplePosition ((double) sel->endSample,   visRange, display);
+
+        const float visL = juce::jmax (startX, display.getX());
+        const float visR = juce::jmin (endX,   display.getRight());
+        if (visR - visL < 2.0f) // target chop scrolled out of view
+            return {};
+
+        constexpr float w = 94.0f;
+        constexpr float h = 22.0f;
+        const float leftLimit  = display.getX() + 6.0f;
+        const float rightLimit = display.getRight() - 70.0f; // keep clear of +/- buttons
+        float cx = juce::jlimit (leftLimit + w * 0.5f,
+                                 juce::jmax (leftLimit + w * 0.5f, rightLimit - w * 0.5f),
+                                 (visL + visR) * 0.5f);
+        const float y = display.getY() + 8.0f;
+        return juce::Rectangle<float> (cx - w * 0.5f, y, w, h);
+    }
+
+    bool hitTestExportButton (juce::Point<float> p) const
+    {
+        const auto b = getExportButtonBounds();
+        return ! b.isEmpty() && b.contains (p);
+    }
+
+    // Click (no drag) path: render the chop and offer a Save-As dialog.
+    void saveChopToFile (int chopId)
+    {
+        const bool applySync = processor.getSyncToHost();
+        const auto tempFile  = processor.renderChopToTempWav (chopId, applySync);
+        if (! tempFile.existsAsFile())
+            return;
+
+        auto suggested = juce::File::getSpecialLocation (juce::File::userDesktopDirectory)
+                             .getChildFile (tempFile.getFileName());
+
+        chopExportChooser = std::make_unique<juce::FileChooser> (
+            "Export Chop As", suggested, "*.wav");
+
+        const auto flags = juce::FileBrowserComponent::saveMode
+                         | juce::FileBrowserComponent::canSelectFiles
+                         | juce::FileBrowserComponent::warnAboutOverwriting;
+
+        chopExportChooser->launchAsync (flags, [tempFile] (const juce::FileChooser& fc)
+        {
+            auto dest = fc.getResult();
+            if (dest != juce::File())
+            {
+                dest.deleteFile();
+                tempFile.copyFileTo (dest);
+            }
+            tempFile.deleteFile();
+        });
+    }
+
+    void paintExportButton (juce::Graphics& g)
+    {
+        const auto b = getExportButtonBounds();
+        if (b.isEmpty())
+            return;
+
+        const float appear = juce::jlimit (0.0f, 1.0f, exportButtonAppear);
+        if (appear <= 0.01f)
+            return;
+
+        const float pulse = 0.5f + 0.5f * std::sin (exportButtonPulse); // 0..1
+        const juce::Colour amber (0xffffb300);
+
+        juce::Graphics::ScopedSaveState ss (g);
+        juce::Path clip;
+        clip.addRoundedRectangle (getDisplayBounds().expanded (0.0f, 8.0f), 4.0f);
+        g.reduceClipRegion (clip);
+
+        // Pop-in: tight scale 0.9->1.0 plus fade (snappy, minimal travel).
+        const float scale = 0.9f + 0.1f * appear;
+        auto rect = b.withSizeKeepingCentre (b.getWidth() * scale, b.getHeight() * scale);
+        const float corner = rect.getHeight() * 0.5f;
+
+        // Breathing glow behind the pill to draw the eye to it.
+        const float glowAlpha = (0.16f + 0.20f * pulse)
+                              * appear
+                              * (exportButtonHovered ? 1.4f : 1.0f);
+        for (int i = 3; i >= 1; --i)
+        {
+            g.setColour (amber.withAlpha (glowAlpha / (float) (i * 2)));
+            g.fillRoundedRectangle (rect.expanded ((float) i * 3.0f), corner + (float) i * 3.0f);
+        }
+
+        // Drop shadow.
+        g.setColour (juce::Colours::black.withAlpha (0.38f * appear));
+        g.fillRoundedRectangle (rect.translated (0.0f, 1.5f), corner);
+
+        // Pill body.
+        const juce::Colour base = exportButtonPressed ? amber.darker (0.18f)
+                                : exportButtonHovered ? amber.brighter (0.12f)
+                                                      : amber;
+        juce::ColourGradient grad (base.brighter (0.10f), rect.getX(), rect.getY(),
+                                   base.darker (0.18f),   rect.getX(), rect.getBottom(), false);
+        g.setGradientFill (grad);
+        g.fillRoundedRectangle (rect, corner);
+        g.setColour (juce::Colours::white.withAlpha (0.22f * appear));
+        g.drawRoundedRectangle (rect.reduced (0.5f), corner, 1.0f);
+
+        // Content: a download-to-tray glyph + "EXPORT".
+        const juce::Colour ink (0xff1a1205);
+        g.setColour (ink.withAlpha (appear));
+
+        auto content  = rect.reduced (10.0f, 0.0f);
+        auto iconArea = content.removeFromLeft (12.0f);
+        const float ax = iconArea.getCentreX();
+        const float ay = iconArea.getCentreY() - 1.0f;
+
+        juce::Path arrow;
+        arrow.startNewSubPath (ax, ay - 5.0f);        // shaft
+        arrow.lineTo          (ax, ay + 2.5f);
+        arrow.startNewSubPath (ax - 3.4f, ay - 1.0f); // head
+        arrow.lineTo          (ax, ay + 2.5f);
+        arrow.lineTo          (ax + 3.4f, ay - 1.0f);
+        arrow.startNewSubPath (ax - 4.2f, ay + 5.0f); // tray
+        arrow.lineTo          (ax + 4.2f, ay + 5.0f);
+        g.strokePath (arrow, juce::PathStrokeType (1.5f, juce::PathStrokeType::curved,
+                                                         juce::PathStrokeType::rounded));
+
+        g.setFont (heavyFont (10.5f).withExtraKerningFactor (0.06f));
+        g.drawText ("EXPORT", content, juce::Justification::centred);
+    }
+
     void timerCallback() override
     {
         if (const int hz = animationFrameRateHz(); hz != animHz)
@@ -3272,16 +3472,47 @@ private:
             }
         }
 
-        // Trigger pulse animation check
+        // Trigger pulse animation check. A MIDI key press lands here, so we
+        // also repoint the export button at the struck chop (it instantly
+        // scrolls into view) -- this is what makes the button appear when you
+        // play a key, not just when you click a chop.
         const auto triggerRevision = processor.getChopTriggerRevision();
         if (triggerRevision != lastObservedChopTriggerRevision)
         {
             lastObservedChopTriggerRevision = triggerRevision;
             const int triggeredId = processor.getLastTriggeredChopId();
             if (triggeredId >= 0)
+            {
                 chopAnimations[triggeredId].currentTriggerPulse = 1.0f; // Strike pulse!
-            
+                setExportTarget (triggeredId);
+            }
+
             scrollToChop (triggeredId, true); // Scroll exactly and instantly
+        }
+
+        // Drive the floating export button: snappy pop-in when the target chop
+        // changes plus a gentle continuous breathing pulse so it reads as
+        // interactive. Keyed off on-screen visibility so a chop scrolled out of
+        // view doesn't keep the UI repainting needlessly. Runs after the
+        // trigger block above so a MIDI-struck chop pops in on the same frame.
+        {
+            const auto cs    = processor.getChopState();
+            const int  selId = (cs != nullptr) ? cs->selectedChopId : -1;
+            if (selId != lastSeenSelectedId)
+            {
+                lastSeenSelectedId = selId;
+                setExportTarget (selId); // click-select moves the button too
+            }
+
+            const bool  visible      = ! getExportButtonBounds().isEmpty();
+            const float targetAppear = visible ? 1.0f : 0.0f;
+            exportButtonAppear += (targetAppear - exportButtonAppear)
+                                * frameRateLerp (0.55f, animHz, waveformRefreshHz);
+            if (std::abs (targetAppear - exportButtonAppear) < 0.01f)
+                exportButtonAppear = targetAppear;
+
+            if (visible || exportButtonAppear > 0.01f)
+                exportButtonPulse += frameRateStep (0.10f, animHz, waveformRefreshHz);
         }
 
         // Animate scroll, zoom, and vertical scale (warning-free)
@@ -3381,6 +3612,7 @@ private:
                                 || isScanning
                                 || exportDragReady
                                 || (holdChopId >= 0 && ! exportDragReady && holdTickCount > 0)
+                                || ! getExportButtonBounds().isEmpty() || exportButtonAppear > 0.01f
                                 || zoomChanged || scrollChanged || vertScaleChanged
                                 || anyChopAnimationActive;
 
@@ -4517,6 +4749,20 @@ private:
     bool exportDragReady = false;
     bool exportDragFired = false;
     int holdTicksRequired() const noexcept { return 2 * animHz; } // 2 s hold at the active frame rate
+
+    // Floating export button (drag handle + click-to-save). This is the
+    // discoverable affordance: it appears over the selected chop so users
+    // don't have to know about the 2 s hold gesture. Dragging it starts the
+    // OS file drag into the DAW; a plain click opens a Save-As dialog.
+    bool  exportButtonHovered   = false;
+    bool  exportButtonPressed   = false;
+    bool  exportButtonDragArmed = false;
+    juce::Point<float> exportButtonPressPos;
+    float exportButtonAppear    = 0.0f; // 0->1 pop-in when the target chop changes
+    float exportButtonPulse     = 0.0f; // continuous breathing phase
+    int   exportTargetChopId    = -1;   // chop the button acts on: selection OR last MIDI trigger
+    int   lastSeenSelectedId    = -1;   // detects selection changes
+    std::unique_ptr<juce::FileChooser> chopExportChooser;
 
     // Warp-mode drag state (step 9). markerIndex < 0 means nothing being dragged.
     int  warpDragChopId      = -1;
