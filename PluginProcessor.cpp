@@ -5241,10 +5241,17 @@ int AudioPluginAudioProcessor::chopAtTransients (TransientSensitivity sensitivit
     for (auto& v : flux)
         v /= fluxMax;
 
-    // Sensitivity profile: Light = fewer, only heavy hits; Medium = denser.
-    const float threshold   = sensitivity == TransientSensitivity::Light ? 0.35f : 0.18f;
-    const double minGapSec  = sensitivity == TransientSensitivity::Light ? 0.250 : 0.120;
-    const int minGapHops    = juce::jmax (1, (int) std::round (minGapSec * sampleRate / hopSize));
+    // Sensitivity profile: lower threshold + shorter min-gap => more onsets.
+    // Light  = only heavy hits; Medium = kicks + snares; Fine = busy / fills.
+    float threshold  = 0.18f;
+    double minGapSec = 0.120;
+    switch (sensitivity)
+    {
+        case TransientSensitivity::Light:  threshold = 0.35f; minGapSec = 0.250; break;
+        case TransientSensitivity::Medium: threshold = 0.18f; minGapSec = 0.120; break;
+        case TransientSensitivity::Fine:   threshold = 0.10f; minGapSec = 0.060; break;
+    }
+    const int minGapHops = juce::jmax (1, (int) std::round (minGapSec * sampleRate / hopSize));
 
     // Local-maximum peak picker over a small neighbourhood, then enforce
     // min-gap by suppressing weaker peaks within the window of stronger ones.

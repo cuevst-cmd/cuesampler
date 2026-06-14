@@ -1,5 +1,6 @@
 #include "KeyDetector.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -12,6 +13,12 @@ constexpr double minFrequencyHz = 65.0;
 constexpr double maxFrequencyHz = 2093.0;
 constexpr double analysisSeconds = 30.0; // analyze a longer span; 6s often catches only an ambiguous intro
 constexpr double minAudioSeconds = 0.5;
+
+// Log-magnitude compression strength. The spectrum is normalized to its global
+// peak (so this is loudness-independent), then each bin contributes
+// log1p(gamma * mag/peak). This whitens the chroma so loud partials and bass
+// notes no longer dominate the linear sum. Larger gamma => more compression.
+constexpr double logCompressionGamma = 1000.0;
 
 constexpr std::array<const char*, 12> noteNames
 {
@@ -40,18 +47,21 @@ int wrapPitchClass (int value)
 }
 }
 
-// Temperley (2001) key profiles. These outperform the original Krumhansl-Kessler
-// profiles on real recordings and are published research values (no GPL/AGPL
-// library code involved). The correlate() step is scale-invariant, so only the
-// shape of these profiles matters.
+// EDMA key profiles (Faraldo et al., "Key Estimation in Electronic Dance
+// Music", 2016). These are corpus-derived from a large Beatport set and
+// outperform the classical Krumhansl/Temperley profiles on electronic and
+// modern produced material — the right fit for a sampler aimed at beatmakers.
+// They are published research values (no GPL/AGPL library code involved), like
+// the Temperley profiles used previously. Index 0 is the tonic; the correlate()
+// step is mean/scale-invariant, so only the shape matters.
 const std::array<double, 12> KeyDetector::majorProfile
 {
-    0.748, 0.060, 0.488, 0.082, 0.670, 0.460, 0.096, 0.715, 0.104, 0.366, 0.057, 0.400
+    1.0000, 0.2875, 0.5020, 0.4048, 0.6050, 0.5614, 0.3205, 0.7966, 0.3159, 0.4506, 0.4202, 0.3889
 };
 
 const std::array<double, 12> KeyDetector::minorProfile
 {
-    0.712, 0.084, 0.474, 0.618, 0.049, 0.460, 0.105, 0.747, 0.404, 0.067, 0.133, 0.330
+    1.0000, 0.3096, 0.4415, 0.5827, 0.3262, 0.4948, 0.2889, 0.7804, 0.4328, 0.2903, 0.5331, 0.3217
 };
 
 // Detects the most likely musical key from the supplied audio buffer.
@@ -108,16 +118,19 @@ KeyDetector::Result KeyDetector::detect (const juce::AudioBuffer<float>& buffer,
         }
     }
 
+    // Confidence combines two factors, each clamped to [0, 1]:
+    //   tonality  — how well the winning key actually fits (a percussive or
+    //               atonal sample correlates poorly with every profile);
+    //   separation — how far the winner leads the runner-up (a ~0.10 Pearson
+    //               gap is treated as decisive). Note that genuine relative
+    //               major/minor and dominant ambiguities have small gaps, so
+    //               this honestly reports lower confidence for those cases.
     auto confidence = 0.0;
     if (std::isfinite (bestScore) && std::isfinite (secondBestScore))
     {
-        confidence = (bestScore - secondBestScore) * 0.5;
-
-        if (confidence < 0.0)
-            confidence = 0.0;
-
-        if (confidence > 1.0)
-            confidence = 1.0;
+        const auto tonality   = std::clamp (bestScore, 0.0, 1.0);
+        const auto separation = std::clamp ((bestScore - secondBestScore) / 0.10, 0.0, 1.0);
+        confidence = tonality * separation;
     }
 
     result.valid = true;
@@ -149,7 +162,16 @@ KeyDetector::Result KeyDetector::makeResult (int rootIndex, bool isMajor)
     return result;
 }
 
-// Builds a normalized chromagram from windowed FFT magnitudes.
+// Builds a normalized, tuning-corrected, spectrally-whitened chromagram.
+//
+// Two passes over the analysis span (FFT is cheap and this runs once per file
+// on a background thread):
+//   Pass 1 — find the global magnitude peak (for loudness-independent log
+//            compression) and estimate the global tuning offset, so material
+//            that isn't at A440 (pitched samples, off-tune recordings) doesn't
+//            smear energy across neighbouring pitch classes.
+//   Pass 2 — accumulate log-compressed, tuning-corrected magnitudes into the
+//            12 pitch classes.
 std::array<double, 12> KeyDetector::buildChromagram (const juce::AudioBuffer<float>& buffer, double sampleRate)
 {
     std::array<double, 12> chroma {};
@@ -158,7 +180,6 @@ std::array<double, 12> KeyDetector::buildChromagram (const juce::AudioBuffer<flo
         return chroma;
 
     juce::dsp::FFT fft (fftOrder);
-    std::array<float, fftSize * 2> fftData {};
     std::array<float, fftSize> window {};
 
     for (int i = 0; i < fftSize; ++i)
@@ -170,41 +191,77 @@ std::array<double, 12> KeyDetector::buildChromagram (const juce::AudioBuffer<flo
     const auto numChannels = buffer.getNumChannels();
     const auto numSamples = buffer.getNumSamples();
     const auto frameCap = static_cast<int> ((analysisSeconds * sampleRate) / static_cast<double> (hopSize));
-    auto frameCount = 0;
 
-    for (int start = 0; start + fftSize <= numSamples && frameCount < frameCap; start += hopSize)
+    // Runs the windowed-FFT frame loop, invoking binFn(frequency, magnitude)
+    // for every in-band bin of every frame.
+    const auto forEachBin = [&] (auto&& binFn)
     {
-        fftData.fill (0.0f);
+        std::array<float, fftSize * 2> fftData {};
+        auto frameCount = 0;
 
-        for (int i = 0; i < fftSize; ++i)
+        for (int start = 0; start + fftSize <= numSamples && frameCount < frameCap; start += hopSize, ++frameCount)
         {
-            double monoSample = 0.0;
+            fftData.fill (0.0f);
 
-            for (int channel = 0; channel < numChannels; ++channel)
-                monoSample += static_cast<double> (buffer.getSample (channel, start + i));
+            for (int i = 0; i < fftSize; ++i)
+            {
+                double monoSample = 0.0;
 
-            monoSample /= static_cast<double> (numChannels);
-            fftData[static_cast<size_t> (i)] = static_cast<float> (monoSample) * window[static_cast<size_t> (i)];
+                for (int channel = 0; channel < numChannels; ++channel)
+                    monoSample += static_cast<double> (buffer.getSample (channel, start + i));
+
+                monoSample /= static_cast<double> (numChannels);
+                fftData[static_cast<size_t> (i)] = static_cast<float> (monoSample) * window[static_cast<size_t> (i)];
+            }
+
+            fft.performFrequencyOnlyForwardTransform (fftData.data());
+
+            for (int bin = 1; bin < fftSize / 2; ++bin)
+            {
+                const auto frequency = static_cast<double> (bin) * sampleRate / static_cast<double> (fftSize);
+
+                if (frequency < minFrequencyHz || frequency > maxFrequencyHz)
+                    continue;
+
+                binFn (frequency, static_cast<double> (fftData[static_cast<size_t> (bin)]));
+            }
         }
+    };
 
-        fft.performFrequencyOnlyForwardTransform (fftData.data());
+    constexpr auto twoPi = juce::MathConstants<double>::twoPi;
 
-        for (int bin = 1; bin < fftSize / 2; ++bin)
-        {
-            const auto frequency = static_cast<double> (bin) * sampleRate / static_cast<double> (fftSize);
+    // Pass 1: peak magnitude + tuning offset (magnitude-weighted circular mean
+    // of each bin's deviation from the nearest equal-tempered semitone).
+    double globalMaxMag = 0.0;
+    double tuningCos = 0.0;
+    double tuningSin = 0.0;
 
-            if (frequency < minFrequencyHz || frequency > maxFrequencyHz)
-                continue;
+    forEachBin ([&] (double frequency, double magnitude)
+    {
+        globalMaxMag = std::max (globalMaxMag, magnitude);
 
-            const auto midi = (12.0 * std::log2 (frequency / 440.0)) + 69.0;
-            const auto pitchClass = wrapPitchClass (static_cast<int> (std::lround (midi)));
-            const auto magnitude = static_cast<double> (fftData[static_cast<size_t> (bin)]);
+        const auto midi = (12.0 * std::log2 (frequency / 440.0)) + 69.0;
+        const auto deviation = midi - std::round (midi); // semitones in [-0.5, 0.5]
+        tuningCos += magnitude * std::cos (twoPi * deviation);
+        tuningSin += magnitude * std::sin (twoPi * deviation);
+    });
 
-            chroma[static_cast<size_t> (pitchClass)] += magnitude;
-        }
+    if (globalMaxMag <= 0.0)
+        return chroma;
 
-        ++frameCount;
-    }
+    const auto tuningOffset = (tuningCos != 0.0 || tuningSin != 0.0)
+                                ? std::atan2 (tuningSin, tuningCos) / twoPi // semitones in [-0.5, 0.5]
+                                : 0.0;
+
+    // Pass 2: spectrally-whitened, tuning-corrected accumulation.
+    forEachBin ([&] (double frequency, double magnitude)
+    {
+        const auto weight = std::log1p (logCompressionGamma * magnitude / globalMaxMag);
+        const auto midi = (12.0 * std::log2 (frequency / 440.0)) + 69.0 - tuningOffset;
+        const auto pitchClass = wrapPitchClass (static_cast<int> (std::lround (midi)));
+
+        chroma[static_cast<size_t> (pitchClass)] += weight;
+    });
 
     double chromaSum = 0.0;
     for (auto value : chroma)

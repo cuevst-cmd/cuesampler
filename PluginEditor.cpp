@@ -1051,6 +1051,149 @@ public:
         g.drawRoundedRectangle (thumb, thumbRadius, 1.0f);
     }
 
+    // --- Popup / drop menus --------------------------------------------------
+    // Drop menus (CHOP @ TRANS. sensitivity, warp-marker snap, key override...)
+    // are drawn to match the smoked-glass aesthetic: a dark rounded panel with
+    // an accent rim, accent-tinted hover rows, and accent ticks / chevrons. The
+    // mode-aware accent (orange / blue / purple) follows the rest of the UI.
+
+    int getPopupMenuBorderSize() override { return 7; }
+
+    juce::Font getPopupMenuFont() override
+    {
+        return { juce::FontOptions ("Helvetica", 14.5f, juce::Font::plain) };
+    }
+
+    void drawPopupMenuBackground (juce::Graphics& g, int width, int height) override
+    {
+        auto bounds = juce::Rectangle<float> (0.0f, 0.0f, (float) width, (float) height).reduced (1.0f);
+        const float corner = 9.0f;
+
+        fillRoundedGradient (g, bounds, blackPanel.brighter (0.12f).withAlpha (0.985f),
+                             blackPanel.darker (0.25f).withAlpha (0.985f), corner);
+
+        // Soft top sheen so the panel reads as glass.
+        g.setColour (juce::Colours::white.withAlpha (0.05f));
+        g.fillRoundedRectangle (bounds.withHeight (bounds.getHeight() * 0.5f), corner);
+
+        g.setColour (accentOrange.withAlpha (0.5f));
+        g.drawRoundedRectangle (bounds, corner, 1.4f);
+    }
+
+    void getIdealPopupMenuItemSize (const juce::String& text, bool isSeparator,
+                                    int standardMenuItemHeight, int& idealWidth, int& idealHeight) override
+    {
+        if (isSeparator)
+        {
+            idealWidth = 60;
+            idealHeight = 11;
+            return;
+        }
+
+        idealHeight = standardMenuItemHeight > 0 ? juce::jmax (30, standardMenuItemHeight) : 30;
+        idealWidth = juce::GlyphArrangement::getStringWidthInt (getPopupMenuFont(), text) + 56; // tick gutter + chevron/padding
+    }
+
+    void drawPopupMenuSectionHeader (juce::Graphics& g, const juce::Rectangle<int>& area,
+                                     const juce::String& sectionName) override
+    {
+        auto r = area.toFloat().reduced (12.0f, 0.0f);
+
+        g.setColour (accentOrange.withAlpha (0.92f));
+        g.setFont (heavyFont (11.5f));
+        g.drawText (sectionName.toUpperCase(), r.withTrimmedBottom (3.0f).toNearestInt(),
+                    juce::Justification::bottomLeft, false);
+
+        // Hairline under the header.
+        g.setColour (juce::Colours::white.withAlpha (0.10f));
+        g.fillRect (juce::Rectangle<float> (r.getX(), r.getBottom() - 2.0f, r.getWidth(), 1.0f));
+    }
+
+    void drawPopupMenuItem (juce::Graphics& g, const juce::Rectangle<int>& area,
+                            bool isSeparator, bool isActive, bool isHighlighted,
+                            bool isTicked, bool hasSubMenu,
+                            const juce::String& text,
+                            const juce::String& shortcutKeyText,
+                            const juce::Drawable* icon,
+                            const juce::Colour* textColourToUse) override
+    {
+        if (isSeparator)
+        {
+            auto line = area.toFloat().reduced (14.0f, 0.0f);
+            g.setColour (juce::Colours::white.withAlpha (0.10f));
+            g.fillRect (juce::Rectangle<float> (line.getX(), line.getCentreY(), line.getWidth(), 1.0f));
+            return;
+        }
+
+        auto r = area.reduced (4, 1).toFloat();
+        const float corner = 5.0f;
+
+        // Hover / highlight row.
+        if (isHighlighted && isActive)
+        {
+            fillRoundedGradient (g, r, accentOrange.withAlpha (0.34f),
+                                 accentOrange.withAlpha (0.20f), corner);
+            g.setColour (accentOrange.withAlpha (0.55f));
+            g.drawRoundedRectangle (r, corner, 1.0f);
+        }
+
+        const float tickGutter = 26.0f;
+
+        // Tick: an accent check mark in the left gutter.
+        if (isTicked)
+        {
+            auto c = r.withWidth (tickGutter).getCentre();
+            const float s = 4.0f;
+            juce::Path check;
+            check.startNewSubPath (c.x - s,          c.y + s * 0.1f);
+            check.lineTo          (c.x - s * 0.25f,  c.y + s * 0.8f);
+            check.lineTo          (c.x + s,          c.y - s * 0.9f);
+            g.setColour (accentOrange.brighter (0.25f));
+            g.strokePath (check, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved,
+                                                       juce::PathStrokeType::rounded));
+        }
+        else if (icon != nullptr)
+        {
+            icon->drawWithin (g, r.withWidth (tickGutter).reduced (5.0f),
+                              juce::RectanglePlacement::centred, 1.0f);
+        }
+
+        // Submenu chevron / shortcut on the right.
+        auto textRight = 12.0f;
+        if (hasSubMenu)
+        {
+            auto c = r.removeFromRight (22.0f).getCentre();
+            const float h = 3.6f, w = 3.0f;
+            juce::Path arrow;
+            arrow.startNewSubPath (c.x - w * 0.5f, c.y - h);
+            arrow.lineTo          (c.x + w * 0.5f, c.y);
+            arrow.lineTo          (c.x - w * 0.5f, c.y + h);
+            g.setColour ((isHighlighted ? textPrimary : glassTextMuted).withAlpha (0.85f));
+            g.strokePath (arrow, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved,
+                                                       juce::PathStrokeType::rounded));
+            textRight = 0.0f;
+        }
+        else if (shortcutKeyText.isNotEmpty())
+        {
+            g.setColour (glassTextMuted.withAlpha (0.7f));
+            g.setFont (getPopupMenuFont().withHeight (12.5f));
+            g.drawText (shortcutKeyText, r.withTrimmedRight (12.0f).toNearestInt(),
+                        juce::Justification::centredRight, false);
+        }
+
+        // Label.
+        juce::Colour textColour = textColourToUse != nullptr ? *textColourToUse : glassText;
+        if (! isActive)
+            textColour = textMuted;
+        else if (isHighlighted)
+            textColour = textPrimary;
+
+        g.setColour (textColour);
+        g.setFont (getPopupMenuFont());
+        auto textArea = r.withTrimmedLeft (tickGutter).withTrimmedRight (textRight);
+        g.drawFittedText (text, textArea.toNearestInt(), juce::Justification::centredLeft, 1);
+    }
+
     float getHoverAlpha (juce::Button& button, bool isMouseOverButton)
     {
         if (auto* hb = dynamic_cast<SmoothHoverButton*> (&button))
@@ -1801,6 +1944,7 @@ public:
             juce::PopupMenu menu;
             menu.addItem (1, "Share anonymous data to improve BPM & key detection",
                           true, processor.isTelemetryEnabled());
+            menu.setLookAndFeel (&getLookAndFeel());
             menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (dataButton),
                                 [this] (int result)
                                 {
@@ -2477,6 +2621,8 @@ public:
 
         juce::PopupMenu::Options options;
         options = options.withTargetComponent (this);
+
+        menu.setLookAndFeel (&getLookAndFeel());
 
         // Capture by value — async callback must outlive this stack frame.
         menu.showMenuAsync (options,
@@ -4441,20 +4587,36 @@ public:
         chopTransientsButton.getProperties().set ("cueStyle", "flatAction");
         chopTransientsButton.onClick = [this]
         {
+            using Sensitivity = AudioPluginAudioProcessor::TransientSensitivity;
+
             juce::PopupMenu menu;
             menu.addSectionHeader ("Chop at transients");
-            menu.addItem (1, "Light  (heavy hits only)");
-            menu.addItem (2, "Medium (kicks + snares)");
 
-            auto& proc = processor;
+            // id == sensitivity + 1; tick the last-used level.
+            const auto addLevel = [&] (Sensitivity level, const juce::String& label)
+            {
+                const int id = (int) level + 1;
+                const bool ticked = lastTransientSensitivity == (int) level;
+                menu.addItem (id, label, true, ticked);
+            };
+
+            addLevel (Sensitivity::Light,  "Light  -  heavy hits only");
+            addLevel (Sensitivity::Medium, "Medium  -  kicks + snares");
+            addLevel (Sensitivity::Fine,   "Fine  -  busy / fills");
+
+            // PopupMenus don't inherit a component's L&F; point it at ours so
+            // the smoked-glass styling applies (default falls back to global).
+            menu.setLookAndFeel (&getLookAndFeel());
             menu.showMenuAsync (juce::PopupMenu::Options()
                                     .withTargetComponent (&chopTransientsButton),
-                                [&proc] (int chosen)
+                                [this] (int chosen)
                                 {
-                                    if (chosen == 1)
-                                        proc.chopAtTransients (AudioPluginAudioProcessor::TransientSensitivity::Light);
-                                    else if (chosen == 2)
-                                        proc.chopAtTransients (AudioPluginAudioProcessor::TransientSensitivity::Medium);
+                                    if (chosen <= 0)
+                                        return;
+
+                                    const auto level = (Sensitivity) (chosen - 1);
+                                    lastTransientSensitivity = chosen - 1;
+                                    processor.chopAtTransients (level);
                                 });
         };
         barsButton.getProperties().set ("cueStyle", "flatAction");
@@ -4464,7 +4626,7 @@ public:
         pauseButton.setTooltip ("Pause playback - press Play to resume from the same spot.");
         stopButton.setTooltip ("Stop playback and return to the beginning of the current chop.");
         halfSpeedButton.setTooltip ("Half-Time: plays at half speed while preserving pitch. Active when lit.");
-        chopTransientsButton.setTooltip ("Chop at transients: scans the sample for heavy hits (kicks/snares) and places chop markers at each onset. Click to choose sensitivity - Light (heavy hits only) or Medium (more onsets).");
+        chopTransientsButton.setTooltip ("Chop at transients: scans the sample for hits and places a chop marker at each onset. Click to choose sensitivity - Light (heavy hits only), Medium (kicks + snares), or Fine (busy / fills).");
         barsButton.setTooltip ("Sets how many bars each chop covers - cycles 1 / 2 / 4 / 8. Larger = fewer, longer chops.");
         loadButton.setTooltip ("Open a file browser to load a new audio sample (WAV, AIFF, MP3, FLAC, OGG). You can also drag a file onto the waveform.");
 
@@ -4833,6 +4995,8 @@ private:
         menu.addSubMenu ("Major", major);
         menu.addSubMenu ("Minor", minor);
 
+        menu.setLookAndFeel (&getLookAndFeel());
+
         juce::Component::SafePointer<TransportSectionComponent> safeThis (this);
         menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (keyDisplay),
                             [safeThis] (int result)
@@ -5000,6 +5164,11 @@ private:
     }
 
     AudioPluginAudioProcessor& processor;
+
+    // Last sensitivity chosen from the CHOP @ TRANS. menu, so the menu can tick
+    // the active choice. -1 = none picked yet (matches no TransientSensitivity).
+    int lastTransientSensitivity = -1;
+
     SmoothHoverButton playButton;
     SmoothHoverButton pauseButton;
     SmoothHoverButton stopButton;

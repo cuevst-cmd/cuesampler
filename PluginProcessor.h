@@ -273,7 +273,7 @@ public:
     // Light favors heavy hits only (sparser markers); Medium captures more
     // moderate hits as well. Runs on the calling thread; returns the number
     // of chops created (0 if no sample is loaded or nothing was detected).
-    enum class TransientSensitivity : int { Light = 0, Medium = 1 };
+    enum class TransientSensitivity : int { Light = 0, Medium = 1, Fine = 2 };
     int chopAtTransients (TransientSensitivity sensitivity);
 
     void selectChopAtSample (double samplePosition);
