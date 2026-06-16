@@ -96,9 +96,39 @@ const juce::Colour textMuted (0xff777777);
 const juce::Colour textFaint (0xff6a7282);
 const juce::Colour metalGrey (0xff555555);
 
+// The CUE brand typeface (Syne — same family as the logo wordmark). Loaded once
+// from binary data and kept alive for the app's lifetime so it stays registered
+// with JUCE's font system, allowing the name-based lookups below to find it (and,
+// on macOS, to instantiate the variable font's bold weight to match the logo).
+juce::Typeface::Ptr brandTypeface()
+{
+    static juce::Typeface::Ptr typeface = juce::Typeface::createSystemTypefaceFor (
+        CueSamplerBinaryData::Synewght_ttf, (size_t) CueSamplerBinaryData::Synewght_ttfSize);
+    return typeface;
+}
+
+const juce::String& brandFontName()
+{
+    static const juce::String name = []
+    {
+        auto tf = brandTypeface();
+        return tf != nullptr ? tf->getName() : juce::String ("Helvetica");
+    }();
+    return name;
+}
+
+// Brand text font (Syne). heavyFont() is the bold weight used for nearly all UI
+// text — labels, buttons, headers, the stacked title. brandFont() is the plain
+// weight for lighter/secondary text. Numeric readouts deliberately stay
+// monospaced (monoFont / cousineFont) so live-updating digits keep their width.
 juce::Font heavyFont (float height)
 {
-    return { juce::FontOptions ("Helvetica", height, juce::Font::bold) };
+    return { juce::FontOptions (brandFontName(), height, juce::Font::bold) };
+}
+
+juce::Font brandFont (float height)
+{
+    return { juce::FontOptions (brandFontName(), height, juce::Font::plain) };
 }
 
 juce::Font monoFont (float height)
@@ -988,6 +1018,16 @@ void drawGlassToggle (juce::Graphics& g, juce::Rectangle<float> bounds,
 class CueSamplerLookAndFeel final : public juce::LookAndFeel_V4
 {
 public:
+    CueSamplerLookAndFeel()
+    {
+        // Any component that doesn't set its own font now falls back to the CUE
+        // brand typeface (Syne) instead of the system sans-serif, so all UI text
+        // matches the logo. (Monospaced numeric readouts opt out by naming their
+        // own font explicitly.)
+        if (auto tf = brandTypeface())
+            setDefaultSansSerifTypeface (tf);
+    }
+
     juce::Rectangle<int> getTooltipBounds (const juce::String& tipText,
                                            juce::Point<int> screenPos,
                                            juce::Rectangle<int> parentArea) override
@@ -1061,7 +1101,7 @@ public:
 
     juce::Font getPopupMenuFont() override
     {
-        return { juce::FontOptions ("Helvetica", 14.5f, juce::Font::plain) };
+        return { juce::FontOptions (brandFontName(), 14.5f, juce::Font::plain) };
     }
 
     void drawPopupMenuBackground (juce::Graphics& g, int width, int height) override
@@ -2005,7 +2045,7 @@ public:
 
         // "SAMPLER" sits beneath, letter-spaced to span the wordmark's width.
         const float samplerSize = 17.0f;
-        auto samplerFont = juce::Font (juce::FontOptions ("Helvetica", samplerSize, juce::Font::plain));
+        auto samplerFont = juce::Font (juce::FontOptions (brandFontName(), samplerSize, juce::Font::plain));
         {
             juce::GlyphArrangement ga;
             ga.addLineOfText (samplerFont, "SAMPLER", 0.0f, 0.0f);
@@ -3127,7 +3167,7 @@ public:
                     if (chopRect.getWidth() > 50.0f)
                     {
                         g.setColour (juce::Colour (0xffffb300));
-                        g.setFont (juce::Font (juce::FontOptions().withHeight (16.0f)));
+                        g.setFont (heavyFont (16.0f));
                         g.drawFittedText ("DRAG TO EXPORT",
                                           chopRect.withSizeKeepingCentre (chopRect.getWidth() - 8.0f, 22.0f).toNearestInt(),
                                           juce::Justification::centred, 1);

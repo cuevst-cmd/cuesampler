@@ -751,20 +751,45 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
         return entry;
     }
 
-    auto warpedEntry = renderChopSync (source,
-                                       sourceSampleRate,
-                                       chopId,
-                                       chopStartSample,
-                                       chopEndSample,
-                                       markers,
-                                       generation);
-    if (warpedEntry == nullptr || warpedEntry->warpedBuffer == nullptr
-        || warpedEntry->warpedBuffer->getNumSamples() <= 0)
+    // Build the pitch-neutral "base" buffer that the pitch/time stretch runs on.
+    // Non-warp chops are simply the source slice, so skip the redundant identity
+    // Bungee pass that renderChopSync would perform — that roughly halves the bake
+    // time (the streamed chops are exactly the non-warp ones) and makes the result
+    // match the live fallback exactly, since that path also stretches straight from
+    // the source. Warped chops still bake their marker timing first.
+    std::shared_ptr<const juce::AudioBuffer<float>> baseHolder;
+    if (markers.empty())
     {
-        return entry;
+        const int sliceStart = juce::jlimit (0, juce::jmax (0, source.getNumSamples() - 1), chopStartSample);
+        const int sliceEnd   = juce::jlimit (sliceStart, source.getNumSamples(), chopEndSample);
+        const int sliceLen   = juce::jmax (0, sliceEnd - sliceStart);
+        if (sliceLen <= 0)
+            return entry;
+
+        auto slice = std::make_shared<juce::AudioBuffer<float>> (source.getNumChannels(), sliceLen);
+        for (int ch = 0; ch < source.getNumChannels(); ++ch)
+            slice->copyFrom (ch, 0, source, ch, sliceStart, sliceLen);
+        baseHolder = std::move (slice);
+    }
+    else
+    {
+        auto warpedEntry = renderChopSync (source,
+                                           sourceSampleRate,
+                                           chopId,
+                                           chopStartSample,
+                                           chopEndSample,
+                                           markers,
+                                           generation);
+        if (warpedEntry == nullptr || warpedEntry->warpedBuffer == nullptr
+            || warpedEntry->warpedBuffer->getNumSamples() <= 0)
+        {
+            return entry;
+        }
+
+        baseHolder = warpedEntry->warpedBuffer;
     }
 
-    const auto& base = *warpedEntry->warpedBuffer;
+    const auto& base = *baseHolder;
     const int baseFrames = base.getNumSamples();
     const int channels = base.getNumChannels();
     const auto clampedStretch = juce::jlimit (0.25f, 4.0f, stretchRatio);

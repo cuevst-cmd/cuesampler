@@ -1865,6 +1865,121 @@ private:
 };
 
 //==============================================================================
+// Bakes every non-warp chop's pitch+time-stretched audio (at the current global
+// pitch/stretch) into the prepared-entry cache so the audio thread can stream it
+// 1:1 — no real-time Bungee. Skips chops that are unity (the live path is already
+// cheap there) or warped (those need per-sample WarpMap mapping; left on the live
+// path). Self-cancels when superseded by a newer warm (prepareWarmGeneration).
+class AudioPluginAudioProcessor::PreparedWarmJob final : public juce::ThreadPoolJob
+{
+public:
+    PreparedWarmJob (AudioPluginAudioProcessor& processorIn,
+                     cuesampler::ChopAudioCache& cacheIn,
+                     std::shared_ptr<const LoadedSampleData> sampleIn,
+                     std::shared_ptr<const ChopState> chopStateIn,
+                     double sourceRateIn,
+                     double outputRateIn,
+                     float globalPitchSemitonesIn,
+                     float stretchRatioIn,
+                     int priorityChopIdIn,
+                     std::uint64_t generationIn)
+        : juce::ThreadPoolJob ("Prepared Warm"),
+          processor (processorIn),
+          cache (cacheIn),
+          sample (std::move (sampleIn)),
+          chopStateSnapshot (std::move (chopStateIn)),
+          sourceRate (sourceRateIn),
+          outputRate (outputRateIn),
+          globalPitchSemitones (globalPitchSemitonesIn),
+          stretchRatio (stretchRatioIn),
+          priorityChopId (priorityChopIdIn),
+          generation (generationIn)
+    {
+    }
+
+    JobStatus runJob() override
+    {
+        if (sample == nullptr || chopStateSnapshot == nullptr
+            || sample->buffer.getNumSamples() <= 0)
+            return jobHasFinished;
+
+        const bool stretchUnity = std::abs (stretchRatio - 1.0f) < 0.005f;
+        const bool ratesMatch   = std::abs (sourceRate - outputRate) < 0.5;
+
+        // Bake one chop (no-op if warped, unity, already cached, or superseded).
+        auto bakeOne = [&] (const ChopDefinition& chop) -> bool
+        {
+            if (shouldExit()
+                || processor.prepareWarmGeneration.load (std::memory_order_acquire) != generation)
+                return false;
+
+            // Warp chops stay on the live path (their WarpMap mapping is not a
+            // straight 1:1 read), so don't spend RAM/CPU baking them here.
+            if (! chop.warpMarkers.empty())
+                return true;
+
+            const float effPitch = juce::jlimit (-24.0f, 24.0f,
+                                                 globalPitchSemitones + chop.pitchSemitones);
+            const bool pitchUnity = std::abs (effPitch) < 0.01f;
+
+            // Unity playback already uses the cheap interpolation path — no Bungee
+            // to displace, so a prepared buffer would only waste memory.
+            if (pitchUnity && stretchUnity && ratesMatch)
+                return true;
+
+            const auto key = cuesampler::ChopAudioCache::makePreparedKey (
+                chop.startSample, chop.endSample, chop.cueOffsetSamples,
+                chop.warpMarkers, sourceRate, outputRate, effPitch, stretchRatio);
+
+            if (cache.getPrepared (chop.id, key) != nullptr)
+                return true; // already baked for the current settings
+
+            auto entry = cuesampler::ChopAudioCache::renderPreparedChopSync (
+                sample->buffer, sourceRate, outputRate, chop.id,
+                chop.startSample, chop.endSample, chop.cueOffsetSamples,
+                chop.warpMarkers, effPitch, stretchRatio, generation);
+
+            if (entry != nullptr && entry->buffer != nullptr
+                && entry->buffer->getNumSamples() > 0
+                && ! shouldExit()
+                && processor.prepareWarmGeneration.load (std::memory_order_acquire) == generation)
+                cache.storePrepared (entry);
+
+            return true;
+        };
+
+        // Bake the chop the user is most likely hearing first, so the current
+        // loop turns smooth in the first pass rather than the second.
+        if (priorityChopId >= 0)
+            for (const auto& chop : chopStateSnapshot->chops)
+                if (chop.id == priorityChopId)
+                {
+                    if (! bakeOne (chop))
+                        return jobHasFinished;
+                    break;
+                }
+
+        for (const auto& chop : chopStateSnapshot->chops)
+            if (! bakeOne (chop))
+                break;
+
+        return jobHasFinished;
+    }
+
+private:
+    AudioPluginAudioProcessor& processor;
+    cuesampler::ChopAudioCache& cache;
+    std::shared_ptr<const LoadedSampleData> sample;
+    std::shared_ptr<const ChopState> chopStateSnapshot;
+    double sourceRate = 44100.0;
+    double outputRate = 44100.0;
+    float  globalPitchSemitones = 0.0f;
+    float  stretchRatio = 1.0f;
+    int    priorityChopId = -1;
+    std::uint64_t generation = 0;
+};
+
+//==============================================================================
 AudioPluginAudioProcessor::AudioPluginAudioProcessor()
      : AudioProcessor (BusesProperties()
                      #if ! JucePlugin_IsMidiEffect
@@ -1922,17 +2037,79 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
     {
         juce::Logger::writeToLog ("BeatThisAnalyzer: beat_this.onnx not found, using autocorrelation fallback");
     }
+
+    // Keep the prepared-render cache warm independently of the editor (the UI may
+    // be closed). Polls often enough to start baking promptly after a sample loads
+    // or settings change; it only kicks a background bake when something relevant
+    // actually changed.
+    startTimerHz (20);
 }
 
 AudioPluginAudioProcessor::~AudioPluginAudioProcessor()
 {
+    stopTimer();
     cancelPendingUpdate();
     editTelemetry.flush();
     keyDetectionGeneration.fetch_add (1, std::memory_order_acq_rel);
+    prepareWarmGeneration.fetch_add (1, std::memory_order_acq_rel);
     restoreThreadPool.removeAllJobs (true, 2000);
     analysisThreadPool.removeAllJobs (true, 2000);
     warpRenderThreadPool.removeAllJobs (true, 2000);
     keyDetectionThreadPool.removeAllJobs (true, 2000);
+    prepareRenderThreadPool.removeAllJobs (true, 2000);
+}
+
+void AudioPluginAudioProcessor::timerCallback()
+{
+    warmPreparedCacheTick();
+}
+
+void AudioPluginAudioProcessor::warmPreparedCacheTick()
+{
+    const auto sample = std::atomic_load (&loadedSample);
+    const auto chops  = std::atomic_load (&chopState);
+    if (sample == nullptr || chops == nullptr || chops->chops.empty()
+        || sample->buffer.getNumSamples() <= 0)
+        return;
+
+    const double sourceRate = juce::jmax (1.0, sample->sampleRate);
+    const double hostRate   = juce::jmax (1.0, hostSampleRate.load (std::memory_order_acquire));
+
+    // Effective global pitch/stretch the audio thread will look up with. Mirror
+    // exactly the render path: half-time doubles the stretch ratio (clamped).
+    const float globalPitch = pitchSemitones.load (std::memory_order_acquire);
+    float stretch = juce::jlimit (0.25f, 4.0f, timeStretchRatio.load (std::memory_order_acquire));
+    if (halfTimeEnabled.load (std::memory_order_acquire))
+        stretch = juce::jlimit (0.25f, 4.0f, stretch * 2.0f);
+
+    const int pitchCents = (int) std::lround (globalPitch * 100.0f);
+    const int stretchPpm = (int) std::lround (stretch * 100000.0f);
+
+    // Nothing relevant changed since the last warm → the cache is already correct.
+    if (lastWarmValid
+        && pitchCents == lastWarmPitchCents
+        && stretchPpm == lastWarmStretchPpm
+        && std::abs (sourceRate - lastWarmSourceRate) < 0.5
+        && std::abs (hostRate - lastWarmHostRate) < 0.5
+        && chops == lastWarmChopState)
+        return;
+
+    lastWarmValid      = true;
+    lastWarmPitchCents = pitchCents;
+    lastWarmStretchPpm = stretchPpm;
+    lastWarmSourceRate = sourceRate;
+    lastWarmHostRate   = hostRate;
+    lastWarmChopState  = chops;
+
+    // Supersede any in-flight warm for stale settings, then bake the new set,
+    // starting with the chop the user is most likely hearing right now.
+    const int priorityChopId = lastTriggeredChopId.load (std::memory_order_acquire);
+    const auto gen = prepareWarmGeneration.fetch_add (1, std::memory_order_acq_rel) + 1;
+    prepareRenderThreadPool.removeAllJobs (false, 0);
+    prepareRenderThreadPool.addJob (new PreparedWarmJob (*this, chopAudioCache, sample, chops,
+                                                         sourceRate, hostRate, globalPitch, stretch,
+                                                         priorityChopId, gen),
+                                    true);
 }
 
 //==============================================================================
@@ -2418,7 +2595,60 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             // the Lanczos fallback below when it succeeds. -----
             bool handledByBungee = false;
 
-            if (useBungee)
+            // ----- Pre-rendered (prepared) fast path -------------------------------
+            // If a background warm has baked this non-warp chop's pitch+time-stretched
+            // audio for the current settings, stream it 1:1 instead of running Bungee
+            // on the audio thread. This is what keeps CPU flat during playback (esp.
+            // when the host downclocks the audio thread with the UI closed). Any miss
+            // (settings just changed, not baked yet) simply falls through to the live
+            // Bungee path below, so playback is never interrupted.
+            bool handledByPrepared = false;
+            if (! chopHasWarp && activeChop != nullptr && (! pitchIsUnity || ! stretchIsUnity))
+            {
+                const auto preparedKey = cuesampler::ChopAudioCache::makePreparedKey (
+                    activeChop->startSample, activeChop->endSample, activeChop->cueOffsetSamples,
+                    activeChop->warpMarkers, sourceRate, currentHostRate,
+                    effectivePitchSemitones, stretchRatio);
+
+                if (auto prepared = chopAudioCache.getPrepared (activeChop->id, preparedKey);
+                    prepared != nullptr && prepared->buffer != nullptr
+                    && prepared->buffer->getNumSamples() > 0)
+                {
+                    const auto*  pbuf     = prepared->buffer.get();
+                    const int    pLen     = pbuf->getNumSamples();
+                    const int    pChans   = pbuf->getNumChannels();
+                    const double invStep  = 1.0 / juce::jmax (1.0e-9, sourceFramesPerOutputFrame);
+                    const double chopStart = (double) activeChop->startSample;
+
+                    for (int i = 0; i < chunk; ++i)
+                    {
+                        const double preparedFrame = (v.playbackSamplePosition - chopStart) * invStep;
+                        const auto boundaryGain = computeSliceBoundaryGain (v.playbackSamplePosition, cueStart,
+                                                                             v.playbackStopSample, fadeSamples,
+                                                                             sliceEndFadeSamples);
+                        const float totalGain = chopGainLinear * v.midiVelocity * boundaryGain * v.fadeGain;
+
+                        for (int ch = 0; ch < outputChannels; ++ch)
+                        {
+                            const auto srcCh = juce::jmin (ch, pChans - 1);
+                            const auto* pdata = pbuf->getReadPointer (srcCh);
+                            auto* outData = buffer.getWritePointer (ch);
+                            outData[segmentOffset + segmentWriteOffset + i] +=
+                                interpolateSampleLanczos (pdata, pLen, preparedFrame, interpRadius) * totalGain;
+                        }
+                        v.playbackSamplePosition += interpolatedSourceStep;
+                        v.updateFade();
+                    }
+
+                    segmentWriteOffset += chunk;
+                    // If we later fall back to Bungee (settings change mid-note), it
+                    // must re-prime from the new position.
+                    v.bungeeResetPending = true;
+                    handledByPrepared = true;
+                }
+            }
+
+            if (! handledByPrepared && useBungee)
             {
                 auto& engine    = *pitchEngine;
                 auto& stream    = *engine.stream;
@@ -2445,11 +2675,28 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                     const int leadInWanted = stretcher.maxInputFrameCount();
                     const int leadInAvail  = juce::jmin (bungeeSrcStart, leadInWanted);
 
+                    // The synchronous note-on prime synthesises roughly
+                    // (leadInAvail / primeInPerOut) discarded grains to warm Bungee's
+                    // look-ahead. Slow-down host-sync stretch and half-time push
+                    // bungeeInPerOut below 1.0, which would multiply that grain count
+                    // (e.g. ~2x at half-time) — a per-note CPU burst large enough to
+                    // overrun the audio buffer when the host has downclocked the core
+                    // (commonly with the UI closed), causing audible spikes.
+                    //
+                    // Warming the look-ahead only depends on how much INPUT we feed:
+                    // Bungee centres its final grain on inputBuffer.endPosition(), not on
+                    // the discarded output count (see Stream.h). So priming at an
+                    // effective speed of >= 1.0 reaches the same warmed state and the same
+                    // playback start position, while capping note-on cost at that of a
+                    // normal unity-stretch note for every pitch/stretch/half-time setting.
+                    // The actual (stretched/half-time) render below is left untouched.
+                    const double primeInPerOut = juce::jmax (1.0, bungeeInPerOut);
+
                     if (leadInAvail > 0)
                     {
-                        // Cap per-call input so output (input / bungeeInPerOut)
+                        // Cap per-call input so output (input / primeInPerOut)
                         // can never exceed the discard buffer at extreme stretch.
-                        const double safeOutputPerInput = juce::jmax (0.25, 1.0 / juce::jmax (1.0e-3, bungeeInPerOut));
+                        const double safeOutputPerInput = juce::jmax (0.25, 1.0 / juce::jmax (1.0e-3, primeInPerOut));
                         const int    perCallInputCap   = juce::jmax (1,
                             juce::jmin (maxScratchInFrames,
                                          (int) std::floor ((double) (maxScratchOutFrames - 4) / safeOutputPerInput)));
@@ -2463,7 +2710,7 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                             const double primeOut  = juce::jlimit (1.0,
                                                                     (double) maxScratchOutFrames,
                                                                     juce::jmax (1.0,
-                                                                                std::ceil ((double) feedNow / juce::jmax (1.0e-3, bungeeInPerOut))));
+                                                                                std::ceil ((double) feedNow / juce::jmax (1.0e-3, primeInPerOut))));
 
                             for (int ch = 0; ch < channels; ++ch)
                             {
@@ -2549,7 +2796,7 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                 handledByBungee = true;
             }
 
-            if (! handledByBungee)
+            if (! handledByBungee && ! handledByPrepared)
             {
                 if (warpedBuf != nullptr)
                 {

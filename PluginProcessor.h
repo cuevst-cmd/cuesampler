@@ -20,7 +20,8 @@
 
 //==============================================================================
 class AudioPluginAudioProcessor final : public juce::AudioProcessor,
-                                        private juce::AsyncUpdater
+                                        private juce::AsyncUpdater,
+                                        private juce::Timer
 {
 public:
     struct LoadedSampleData
@@ -306,6 +307,15 @@ private:
     class DeferredSampleRestoreJob;
     class WarpRenderJob;
     class KeyDetectionJob;
+    class PreparedWarmJob;
+
+    // Background "pre-render" warm: bakes each non-warp chop's pitch+time-stretched
+    // audio into the ChopAudioCache prepared-entry cache so the audio thread can
+    // stream it 1:1 instead of running Bungee in real time. Polled from a message-
+    // thread timer (editor-independent) so it keeps the cache warm even with the
+    // UI closed. See timerCallback() / PreparedWarmJob.
+    void timerCallback() override;
+    void warmPreparedCacheTick();
 
     // Per-voice Bungee stretcher/stream wrapper. Defined in the .cpp so the
     // bungee headers (and Eigen) don't need to be visible to consumers of this
@@ -449,7 +459,24 @@ private:
     juce::ThreadPool analysisThreadPool { 1 };
     juce::ThreadPool warpRenderThreadPool { 1 };
     juce::ThreadPool keyDetectionThreadPool { 1 };
+    // Higher priority so the background bake finishes fast — and is biased onto a
+    // performance core on Apple Silicon instead of a slow efficiency core. Still
+    // below the host's real-time audio thread, so it cannot glitch playback.
+    juce::ThreadPool prepareRenderThreadPool { 1, juce::Thread::osDefaultStackSize,
+                                               juce::Thread::Priority::high };
     cuesampler::ChopAudioCache chopAudioCache;
+
+    // Bumped on every warm kick so an in-flight PreparedWarmJob can detect it has
+    // been superseded (params changed) and abort early. Read on the worker thread.
+    std::atomic<uint64_t> prepareWarmGeneration { 0 };
+    // Message-thread-only state used by warmPreparedCacheTick() to decide whether a
+    // fresh warm is needed (avoids re-kicking when nothing relevant has changed).
+    std::shared_ptr<const ChopState> lastWarmChopState;
+    bool   lastWarmValid       = false;
+    int    lastWarmPitchCents  = 0;
+    int    lastWarmStretchPpm  = 0;
+    double lastWarmSourceRate  = 0.0;
+    double lastWarmHostRate    = 0.0;
     std::shared_ptr<const VoicePitchEngineSet> pitchEngineSet;
 
     enum class TransportCommand : int
