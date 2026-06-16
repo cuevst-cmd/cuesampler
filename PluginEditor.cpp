@@ -4938,13 +4938,13 @@ public:
         octUpButton.setTooltip ("Shift the MIDI note mapping up one octave. Use this to reach the chops if your keyboard has no octave buttons.");
         octDownButton.onClick = [this]
         {
-            processor.setMidiOctaveOffset (processor.getMidiOctaveOffset() - 1);
+            processor.setMidiOctaveOffset (processor.getMidiOctaveOffset() + 1);
             updateOctaveControls();
             repaint();
         };
         octUpButton.onClick = [this]
         {
-            processor.setMidiOctaveOffset (processor.getMidiOctaveOffset() + 1);
+            processor.setMidiOctaveOffset (processor.getMidiOctaveOffset() - 1);
             updateOctaveControls();
             repaint();
         };
@@ -5394,8 +5394,10 @@ private:
 
     void updateOctaveControls()
     {
-        octDownButton.setEnabled (processor.getMidiOctaveOffset() > AudioPluginAudioProcessor::midiOctaveOffsetMin);
-        octUpButton.setEnabled   (processor.getMidiOctaveOffset() < AudioPluginAudioProcessor::midiOctaveOffsetMax);
+        // Functions are reversed: "OCT -" raises the offset, "OCT +" lowers it,
+        // so each button greys out at the opposite limit.
+        octDownButton.setEnabled (processor.getMidiOctaveOffset() < AudioPluginAudioProcessor::midiOctaveOffsetMax);
+        octUpButton.setEnabled   (processor.getMidiOctaveOffset() > AudioPluginAudioProcessor::midiOctaveOffsetMin);
     }
 
     juce::Rectangle<int> getTopPanelBounds() const
@@ -5646,16 +5648,40 @@ public:
             g.setColour (borderDark);
             g.drawRoundedRectangle (readoutBounds.reduced (0.5f), 4.0f, 1.0f);
 
+            auto area = readoutBounds.reduced (6.0f, 0.0f);
+
+            // "GR" label on the left.
             g.setColour (textMuted);
             g.setFont (heavyFont (7.0f));
-            g.drawText ("GR", readoutBounds.removeFromLeft (34.0f).toNearestInt(),
-                        juce::Justification::centred, false);
+            g.drawText ("GR", area.removeFromLeft (18.0f).toNearestInt(),
+                        juce::Justification::centredLeft, false);
 
-            g.setColour (gainReductionDb > 0.05f ? accentOrange.brighter (0.2f) : textPrimary.withAlpha (0.55f));
+            // dB readout on the right.
+            const bool reducing = gainReductionDb > 0.05f;
+            g.setColour (reducing ? accentOrange.brighter (0.2f) : textPrimary.withAlpha (0.4f));
             g.setFont (monoFont (10.5f));
             g.drawText (juce::String (gainReductionDb, 1) + " dB",
-                        readoutBounds.toNearestInt().reduced (4, 0),
+                        area.removeFromRight (50.0f).toNearestInt(),
                         juce::Justification::centredRight, false);
+
+            // Animated gain-reduction meter bar between the label and the value.
+            // Fills left-to-right with the amount of reduction (scaled to a
+            // typical 12 dB span). This is the part that visibly "moves".
+            auto track = area.reduced (4.0f, 5.5f);
+            g.setColour (juce::Colours::black.withAlpha (0.5f));
+            g.fillRoundedRectangle (track, 2.0f);
+            g.setColour (juce::Colour (0xff1f1f1f));
+            g.drawRoundedRectangle (track.reduced (0.5f), 2.0f, 1.0f);
+
+            constexpr float displayMaxDb = 12.0f;
+            const float frac = juce::jlimit (0.0f, 1.0f, gainReductionDb / displayMaxDb);
+            if (frac > 0.001f)
+            {
+                auto fill = track.reduced (1.0f);
+                fill.setWidth (fill.getWidth() * frac);
+                g.setColour (accentOrange.brighter (0.08f));
+                g.fillRoundedRectangle (fill, 1.5f);
+            }
         }
     }
 
@@ -5692,7 +5718,7 @@ public:
 private:
     juce::Rectangle<int> getGainReductionReadoutBounds() const noexcept
     {
-        return { 30, getHeight() - 24, getWidth() - 60, 18 };
+        return { 28, getHeight() - 26, getWidth() - 56, 20 };
     }
 
     juce::String title;

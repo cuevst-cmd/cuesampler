@@ -4148,8 +4148,13 @@ void AudioPluginAudioProcessor::setHalfTimeEnabled (bool shouldEnable) noexcept
 
 void AudioPluginAudioProcessor::setMidiOctaveOffset (int octaves) noexcept
 {
-    midiOctaveOffset.store (juce::jlimit (midiOctaveOffsetMin, midiOctaveOffsetMax, octaves),
-                            std::memory_order_release);
+    const int clamped = juce::jlimit (midiOctaveOffsetMin, midiOctaveOffsetMax, octaves);
+    if (clamped == midiOctaveOffset.exchange (clamped, std::memory_order_acq_rel))
+        return; // no change → don't churn the UI / host state
+
+    // The note→chop mapping just moved, so refresh the editor (re-lights the
+    // on-screen keyboard key for the selected chop) and persist the new offset.
+    notifyEditStateChanged();
 }
 
 int AudioPluginAudioProcessor::getMidiOctaveOffset() const noexcept
