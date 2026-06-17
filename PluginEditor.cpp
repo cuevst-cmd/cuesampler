@@ -5085,6 +5085,22 @@ public:
 
         drawHelperText (g, "Load audio - tempo/key are detected automatically",
                         juce::Rectangle<int> (394, (int) topPanel.getBottom() - 23, 374, 16), juce::Justification::centred, 10.0f);
+
+        // Draw an outline around the warp edit section:
+        const int warpRowY = (int) bottomPanel.getY() + 8;
+        auto warpGroupBounds = juce::Rectangle<float> (468.0f, (float) warpRowY, 256.0f, 22.0f).expanded (6.0f, 4.0f);
+
+        // Recessed slot/well backdrop
+        g.setColour (juce::Colours::black.withAlpha (0.18f));
+        g.fillRoundedRectangle (warpGroupBounds, 5.0f);
+
+        // Outer dark shadow/border
+        g.setColour (juce::Colours::black.withAlpha (0.32f));
+        g.drawRoundedRectangle (warpGroupBounds.reduced (0.5f), 5.0f, 1.0f);
+
+        // Highlight/accent rim (glows purple when warp mode is active)
+        g.setColour (accentOrange.withAlpha (0.25f));
+        g.drawRoundedRectangle (warpGroupBounds, 5.0f, 1.0f);
     }
 
     void resized() override
@@ -5573,7 +5589,7 @@ private:
     LabelledKnob pitchKnob;
 };
 
-class EffectModuleComponent final : public juce::Component
+class EffectModuleComponent final : public juce::Component, private juce::Timer
 {
 public:
     EffectModuleComponent (juce::String moduleName, juce::String leftLabel, juce::String rightLabel,
@@ -5600,6 +5616,11 @@ public:
         addAndMakeVisible (switchButton);
         addAndMakeVisible (firstKnob);
         addAndMakeVisible (secondKnob);
+    }
+
+    ~EffectModuleComponent() override
+    {
+        stopTimer();
     }
 
     void paint (juce::Graphics& g) override
@@ -5684,10 +5705,6 @@ public:
         if (gainReductionReadoutVisible)
         {
             auto readoutBounds = getGainReductionReadoutBounds().toFloat();
-            fillRoundedGradient (g, readoutBounds, blackPanel.brighter (0.06f), blackPanel, 4.0f);
-            g.setColour (borderDark);
-            g.drawRoundedRectangle (readoutBounds.reduced (0.5f), 4.0f, 1.0f);
-
             auto area = readoutBounds.reduced (6.0f, 0.0f);
 
             // "GR" label on the left.
@@ -5704,23 +5721,42 @@ public:
                         area.removeFromRight (50.0f).toNearestInt(),
                         juce::Justification::centredRight, false);
 
-            // Animated gain-reduction meter bar between the label and the value.
+            // Segmented gain-reduction meter bar between the label and the value.
             // Fills left-to-right with the amount of reduction (scaled to a
-            // typical 12 dB span). This is the part that visibly "moves".
-            auto track = area.reduced (4.0f, 5.5f);
-            g.setColour (juce::Colours::black.withAlpha (0.5f));
-            g.fillRoundedRectangle (track, 2.0f);
-            g.setColour (juce::Colour (0xff1f1f1f));
-            g.drawRoundedRectangle (track.reduced (0.5f), 2.0f, 1.0f);
+            // typical 12 dB span) using discrete square LED segments.
+            auto track = area.reduced (4.0f, 6.5f); // Height = 7.0f
+
+            const int numSegments = 12;
+            const float totalWidth = track.getWidth();
+            const float segSpan = totalWidth / (float) numSegments;
+            const float gapFrac = 0.30f;
+            const float segWidth = segSpan * (1.0f - gapFrac);
+            const float segHeight = track.getHeight();
 
             constexpr float displayMaxDb = 12.0f;
             const float frac = juce::jlimit (0.0f, 1.0f, gainReductionDb / displayMaxDb);
-            if (frac > 0.001f)
+
+            for (int i = 0; i < numSegments; ++i)
             {
-                auto fill = track.reduced (1.0f);
-                fill.setWidth (fill.getWidth() * frac);
-                g.setColour (accentOrange.brighter (0.08f));
-                g.fillRoundedRectangle (fill, 1.5f);
+                const float startFrac = (float) i / (float) numSegments;
+                const float endFrac = (float) (i + 1) / (float) numSegments;
+                const float lit = juce::jlimit (0.0f, 1.0f, (frac - startFrac) / (endFrac - startFrac));
+
+                const float x0 = track.getX() + segSpan * ((float) i + gapFrac * 0.5f);
+                auto segRect = juce::Rectangle<float> (x0, track.getY(), segWidth, segHeight);
+
+                if (lit > 0.0f)
+                {
+                    // Soft bloom behind the lit segment
+                    g.setColour (accentOrange.withAlpha (0.18f * lit));
+                    g.fillRoundedRectangle (segRect.expanded (1.5f, 1.0f), 1.0f);
+                }
+
+                // Segment fill: dark/translucent when unlit, bright orange when lit
+                auto baseColour = juce::Colours::black.withAlpha (0.45f);
+                auto litColour = accentOrange.brighter (0.18f);
+                g.setColour (baseColour.interpolatedWith (litColour, lit));
+                g.fillRoundedRectangle (segRect, 1.0f);
             }
         }
     }
@@ -5741,21 +5777,49 @@ public:
         if (gainReductionReadoutVisible != shouldShow)
         {
             gainReductionReadoutVisible = shouldShow;
+            if (gainReductionReadoutVisible && isShowing())
+                startTimerHz (animationFrameRateHz());
+            else
+                stopTimer();
             repaint();
         }
     }
 
     void setGainReductionDb (float dB) noexcept
     {
-        const auto clamped = juce::jlimit (0.0f, 99.9f, dB);
-        if (std::abs (clamped - gainReductionDb) > 0.05f)
+        targetGainReductionDb = juce::jlimit (0.0f, 99.9f, dB);
+        if (gainReductionReadoutVisible && ! isTimerRunning())
+            startTimerHz (animationFrameRateHz());
+    }
+
+private:
+    void timerCallback() override
+    {
+        if (! isShowing())
         {
-            gainReductionDb = clamped;
+            stopTimer();
+            return;
+        }
+
+        const int hz = animationFrameRateHz();
+        const float target = targetGainReductionDb;
+
+        // Fast attack, slightly slower decay, using rate-independent lerp
+        const float lerpFactor = (target > gainReductionDb) ? 0.45f : 0.25f;
+        const float nextVal = gainReductionDb + (target - gainReductionDb) * frameRateLerp (lerpFactor, hz);
+
+        if (std::abs (nextVal - gainReductionDb) > 0.01f)
+        {
+            gainReductionDb = nextVal;
+            repaint (getGainReductionReadoutBounds());
+        }
+        else if (gainReductionDb != target)
+        {
+            gainReductionDb = target;
             repaint (getGainReductionReadoutBounds());
         }
     }
 
-private:
     juce::Rectangle<int> getGainReductionReadoutBounds() const noexcept
     {
         return { 28, getHeight() - 26, getWidth() - 56, 20 };
@@ -5769,6 +5833,7 @@ private:
     juce::Rectangle<int> secondKnobBounds;
     bool gainReductionReadoutVisible = false;
     float gainReductionDb = 0.0f;
+    float targetGainReductionDb = 0.0f;
 };
 
 class EffectsRackComponent final : public juce::Component
