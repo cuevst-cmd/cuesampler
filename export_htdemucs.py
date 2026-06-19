@@ -58,13 +58,17 @@ import numpy as np
 # 0. Config — values baked into the exported graph by demucs-onnx. Printed at the
 #    end so Phase 2 (StemSeparator) can match the audio I/O exactly.
 # ─────────────────────────────────────────────────────────────────────────────
-MODEL        = "htdemucs_ft"
-STEMS        = ["drums", "bass", "vocals", "other"]  # standard Demucs source order
-                                                     # is [drums, bass, other,
-                                                     # vocals]; we export all four
-                                                     # FT specialists.
+# Single-pass base htdemucs (NOT the _ft bag): one model that outputs all four
+# stems in ONE forward pass. The _ft bag is 4 fine-tuned specialists run
+# separately — ~4x the compute for a small SDR gain — which made separation
+# ~0.8x realtime. The base model is ~3x faster at industry-standard quality and
+# gives a real "other" stem (no subtraction). Output order is the standard Demucs
+# source order [drums, bass, other, vocals] in the [1,4,2,S] "stems" tensor.
+MODEL        = "htdemucs"
+STEMS        = ["drums", "bass", "other", "vocals"]  # source order in the output tensor
 OPSET        = 17
-OUT_DIR      = Path("assets/htdemucs_ft")
+OUT_DIR      = Path("assets/htdemucs")
+OUT_FILE     = OUT_DIR / "htdemucs.onnx"
 PARITY_TOL   = 1e-3
 
 # Reference constants used by the published htdemucs_ft ONNX models. n_fft/hop are
@@ -94,56 +98,42 @@ print("demucs-onnx loaded OK")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Export each FT specialist (export_to_onnx runs an ORT-vs-PyTorch parity
+# 2. Export the single base model (export_to_onnx runs an ORT-vs-PyTorch parity
 #    check internally and raises if max-abs-error exceeds parity_tolerance).
+#    For a non-bag checkpoint this writes ONE .onnx that outputs all 4 stems.
 # ─────────────────────────────────────────────────────────────────────────────
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-exported: dict[str, Path] = {}
-failures: dict[str, str] = {}
+print(f"\n── Exporting base {MODEL} (single model, all 4 stems)  →  {OUT_FILE}")
+try:
+    result = export_to_onnx(
+        MODEL,
+        str(OUT_FILE),
+        opset=OPSET,
+        parity_check=True,
+        parity_tolerance=PARITY_TOL,
+    )
+    print(f"   export_to_onnx returned: {result}")
+    if not OUT_FILE.exists():
+        raise RuntimeError(f"expected output not found: {OUT_FILE}")
+    size_mb = OUT_FILE.stat().st_size / 1e6
+    print(f"   ✅ {OUT_FILE.name} written: {size_mb:.1f} MB  (parity < {PARITY_TOL})")
 
-for stem in STEMS:
-    out_path = OUT_DIR / f"{stem}.onnx"
-    print(f"\n── Exporting {MODEL} :: {stem}  →  {out_path}")
-    try:
-        result = export_to_onnx(
-            MODEL,
-            str(out_path),
-            stem=stem,
-            opset=OPSET,
-            parity_check=True,
-            parity_tolerance=PARITY_TOL,
-        )
-        # result is dict[str, Path]; print whatever it reports for transparency.
-        print(f"   export_to_onnx returned: {result}")
-        if not out_path.exists():
-            raise RuntimeError(f"expected output not found: {out_path}")
-
-        exported[stem] = out_path
-        size_mb = out_path.stat().st_size / 1e6
-        print(f"   ✅ {stem}.onnx written: {size_mb:.1f} MB  (parity < {PARITY_TOL})")
-
-        # External-weights sidecar only appears if a single file would exceed the
-        # 2 GB ONNX limit. htdemucs_ft (~316 MB) stays well under, so none is
-        # expected — but report it if the toolchain produced one.
-        sidecar = Path(str(out_path) + ".data")
-        if sidecar.exists():
-            print(f"   + sidecar: {sidecar.name} ({sidecar.stat().st_size/1e6:.1f} MB)")
-    except Exception as e:  # noqa: BLE001 — report per-stem, keep going
-        failures[stem] = str(e)
-        print(f"   ❌ {stem} export FAILED: {e}")
-
-if not exported:
-    print("\nNo models exported successfully — aborting.")
+    # External-weights sidecar only appears if a single file would exceed the
+    # 2 GB ONNX limit. htdemucs (~316 MB) stays well under, so none is expected.
+    sidecar = Path(str(OUT_FILE) + ".data")
+    if sidecar.exists():
+        print(f"   + sidecar: {sidecar.name} ({sidecar.stat().st_size/1e6:.1f} MB)")
+except Exception as e:  # noqa: BLE001
+    print(f"   ❌ export FAILED: {e}")
     sys.exit(1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Probe an exported graph for the AUTHORITATIVE I/O spec (resolves any
-#    doc ambiguity — Phase 2 should use exactly what this prints).
+# 3. Probe the exported graph for the AUTHORITATIVE I/O spec (resolves any
+#    doc ambiguity — StemSeparator should use exactly what this prints).
 # ─────────────────────────────────────────────────────────────────────────────
-probe_stem = "drums" if "drums" in exported else next(iter(exported))
-probe_path = exported[probe_stem]
+probe_path = OUT_FILE
 
 print("\n" + "=" * 70)
 print(f"ONNX I/O SPEC  (probed from {probe_path})")
@@ -180,23 +170,20 @@ if ort is not None:
 # 4. Summary for Phase 2
 # ─────────────────────────────────────────────────────────────────────────────
 print("\n" + "=" * 70)
-print("PHASE 2 REFERENCE")
+print("STEMSEPARATOR REFERENCE")
 print("=" * 70)
-print(f"  Model           : {MODEL}  (bag of 4 fine-tuned specialists)")
-print(f"  Exported OK     : {sorted(exported)}")
-if failures:
-    print(f"  Exported FAILED : {failures}")
+print(f"  Model           : {MODEL}  (single model, all 4 stems in one pass)")
+print(f"  Output          : {OUT_FILE}")
 print(f"  Opset           : {OPSET}")
 print(f"  Parity          : ORT-vs-PyTorch max-abs-err < {PARITY_TOL} (enforced by export)")
-print( "  Graph I/O       : input 'mix' float32 [1, 2, S]  →  output float32 [1, 2, S]")
+print( "  Graph I/O       : input 'mix' float32 [1, 2, S]  →  output 'stems' float32 [1, 4, 2, S]")
 print( "                    (raw stereo waveform in and out; STFT/iSTFT are IN-GRAPH —")
-print( "                     C++ does NOT compute STFT. Each specialist returns its own stem.)")
+print( "                     C++ does NOT compute STFT.)")
 print(f"  Audio config    : {SAMPLE_RATE} Hz, stereo; segment {SEGMENT_SECONDS:.2f} s "
-      f"= {SEGMENT_SAMPLES} samples; overlap-add for longer audio (Demucs uses 0.25).")
+      f"= {SEGMENT_SAMPLES} samples; overlap-add for longer audio.")
 print(f"  In-graph STFT   : n_fft={N_FFT}, hop={HOP}, hann, normalized=True (RealSTFT)")
-print( "  Stem ordering   : standard Demucs source order is [drums, bass, other, vocals];")
-print( "                    each FT specialist file returns ONLY its own stem.")
-print( "  Bundled in app  : drums.onnx, bass.onnx, vocals.onnx  (other = subtraction).")
+print( "  Stem ordering   : output dim 1 is [drums(0), bass(1), other(2), vocals(3)].")
+print( "  Bundled in app  : htdemucs.onnx (one file). StemSeparator slices all stems.")
 print("\n✅  Export step complete.")
-print("    Next: re-run CMake configure+build; the POST_BUILD step copies the three")
-print("    bundled models into the .vst3 / .component Contents/Resources/htdemucs_ft/.")
+print("    Next: re-run CMake configure+build; the POST_BUILD step copies the single")
+print("    model into the .vst3 / .component Contents/Resources/htdemucs/.")

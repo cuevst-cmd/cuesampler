@@ -6,12 +6,12 @@
 //
 //   cmake -S . -B build -DCUE_BUILD_STEM_TEST=ON
 //   cmake --build build --target test_stem_separator
-//   ./build/test_stem_separator_artefacts/test_stem_separator <song.wav> [models_dir]
+//   ./build/test_stem_separator_artefacts/test_stem_separator <song.wav> [model]
 //
 //   <song.wav>    short stereo WAV (a few seconds is plenty)
-//   [models_dir]  dir holding drums.onnx / bass.onnx / vocals.onnx
-//                 (default: assets/htdemucs_ft). Produce them with
-//                 export_htdemucs.py or download from StemSplitio/htdemucs-ft-onnx.
+//   [model]       path to htdemucs.onnx, or a dir containing it
+//                 (default: assets/htdemucs/htdemucs.onnx). Produce it with
+//                 export_htdemucs.py.
 //
 // If the onnxruntime dylib isn't found at run time, prefix with:
 //   DYLD_LIBRARY_PATH=build/_deps/onnxruntime-src/lib ./.../test_stem_separator ...
@@ -84,13 +84,16 @@ int main (int argc, char* argv[])
 {
     if (argc < 2)
     {
-        std::cerr << "usage: test_stem_separator <song.wav> [models_dir=assets/htdemucs_ft]\n";
+        std::cerr << "usage: test_stem_separator <song.wav> [model=assets/htdemucs/htdemucs.onnx]\n";
         return 2;
     }
 
-    const juce::File wavFile   { juce::String (argv[1]) };
-    const juce::File modelsDir { argc >= 3 ? juce::String (argv[2])
-                                           : juce::String ("assets/htdemucs_ft") };
+    const juce::File wavFile { juce::String (argv[1]) };
+    // argv[2] may be the model .onnx file, or a directory containing htdemucs.onnx.
+    juce::File modelFile { argc >= 3 ? juce::String (argv[2])
+                                     : juce::String ("assets/htdemucs/htdemucs.onnx") };
+    if (modelFile.isDirectory())
+        modelFile = modelFile.getChildFile ("htdemucs.onnx");
 
     if (! wavFile.existsAsFile())
     {
@@ -120,29 +123,27 @@ int main (int argc, char* argv[])
 
     // ── Construct the separator ───────────────────────────────────────────────
     StemSeparator::ModelPaths paths;
-    paths.drums  = modelsDir.getChildFile ("drums.onnx").getFullPathName();
-    paths.bass   = modelsDir.getChildFile ("bass.onnx").getFullPathName();
-    paths.vocals = modelsDir.getChildFile ("vocals.onnx").getFullPathName();
+    paths.model = modelFile.getFullPathName();
 
     using clock = std::chrono::steady_clock;
     auto secsSince = [] (clock::time_point t0)
     { return std::chrono::duration<double> (clock::now() - t0).count(); };
 
-    const bool coremlOff = std::getenv ("CUE_DISABLE_COREML") != nullptr;
-    std::cout << "Execution provider: " << (coremlOff ? "CPU only (CUE_DISABLE_COREML set)"
-                                                      : "CoreML + CPU fallback") << "\n";
+    const bool coremlOn = std::getenv ("CUE_ENABLE_COREML") != nullptr;
+    std::cout << "Execution provider: " << (coremlOn ? "CoreML + CPU fallback (CUE_ENABLE_COREML set)"
+                                                     : "CPU only (default)") << "\n";
 
     const auto tLoad0 = clock::now();
     StemSeparator sep (paths);
     const double loadSecs = secsSince (tLoad0);
     if (! sep.isReady())
     {
-        std::cout << "\nStemSeparator not ready (models missing in "
-                  << modelsDir.getFullPathName() << "). SKIPPING run.\n"
-                  << "Place drums/bass/vocals.onnx there to exercise inference.\n";
+        std::cout << "\nStemSeparator not ready (model missing: "
+                  << modelFile.getFullPathName() << "). SKIPPING run.\n"
+                  << "Run export_htdemucs.py to produce assets/htdemucs/htdemucs.onnx.\n";
         return 0; // clean skip — not a failure
     }
-    std::printf ("Session load + compile: %.2f s (3 models)\n", loadSecs);
+    std::printf ("Session load + compile: %.2f s\n", loadSecs);
 
     // ── Separate ──────────────────────────────────────────────────────────────
     std::cout << "Separating";

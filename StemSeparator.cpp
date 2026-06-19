@@ -15,8 +15,8 @@
 #include <vector>
 
 //==============================================================================
-// One loaded FT specialist: its Ort::Session plus the I/O names queried from the
-// graph. Kept in the .cpp so the ORT headers stay out of StemSeparator.h.
+// The loaded model: its Ort::Session plus the I/O names queried from the graph.
+// Kept in the .cpp so the ORT headers stay out of StemSeparator.h.
 struct StemSeparator::Model
 {
     std::unique_ptr<Ort::Session> session;
@@ -90,9 +90,10 @@ StemSeparator::StemSeparator (const ModelPaths& paths)
         ortEnv     = std::make_unique<Ort::Env> (ORT_LOGGING_LEVEL_WARNING, "StemSeparator");
         ortOptions = std::make_unique<Ort::SessionOptions>();
 
-        // Offline pass: let it use several cores, but cap so it doesn't starve the
-        // system. Phase 3 runs separate() on a single below-realtime thread.
-        const int nThreads = (int) juce::jlimit (1u, 8u, std::thread::hardware_concurrency());
+        // Offline pass on a single below-realtime thread, so let ORT use all
+        // logical cores for intra-op parallelism (the conv/matmul-heavy htdemucs
+        // graph scales with cores). Capped at 16 as a sanity bound.
+        const int nThreads = (int) juce::jlimit (1u, 16u, std::thread::hardware_concurrency());
         ortOptions->SetIntraOpNumThreads (nThreads);
         ortOptions->SetGraphOptimizationLevel (GraphOptimizationLevel::ORT_ENABLE_ALL);
 
@@ -128,21 +129,16 @@ StemSeparator::StemSeparator (const ModelPaths& paths)
 #endif
 
         Ort::SessionOptions* accel = ortOptionsCoreML.get();
-        drumsModel  = loadModel (*ortEnv, accel, *ortOptions, paths.drums,  "drums");
-        bassModel   = loadModel (*ortEnv, accel, *ortOptions, paths.bass,   "bass");
-        vocalsModel = loadModel (*ortEnv, accel, *ortOptions, paths.vocals, "vocals");
+        stemModel = loadModel (*ortEnv, accel, *ortOptions, paths.model, "htdemucs");
 
-        const bool allReady = drumsModel->ready && bassModel->ready && vocalsModel->ready;
-        sessionReady.store (allReady);
+        sessionReady.store (stemModel->ready);
 
-        juce::Logger::writeToLog ("StemSeparator: ready=" + juce::String (allReady ? "YES" : "NO")
-            + " (drums=" + juce::String (drumsModel->ready  ? "Y" : "N")
-            + " bass="   + juce::String (bassModel->ready   ? "Y" : "N")
-            + " vocals=" + juce::String (vocalsModel->ready ? "Y" : "N") + ")");
+        juce::Logger::writeToLog ("StemSeparator: ready="
+            + juce::String (stemModel->ready ? "YES" : "NO"));
 
-        if (allReady)
-            juce::Logger::writeToLog ("StemSeparator: input '" + juce::String (drumsModel->inputName)
-                + "', " + juce::String ((int) drumsModel->outputNames.size()) + " output(s)");
+        if (stemModel->ready)
+            juce::Logger::writeToLog ("StemSeparator: input '" + juce::String (stemModel->inputName)
+                + "', " + juce::String ((int) stemModel->outputNames.size()) + " output(s)");
     }
     catch (const std::exception& e)
     {
@@ -234,18 +230,18 @@ juce::AudioBuffer<float> StemSeparator::conform (const juce::AudioBuffer<float>&
 }
 
 //==============================================================================
-juce::AudioBuffer<float> StemSeparator::runModel (const Model& model,
-                                                  const juce::AudioBuffer<float>& mix44,
-                                                  int specialtyStemIndex,
-                                                  const std::function<void(float)>& progress,
-                                                  const std::function<bool()>& shouldAbort) const
+StemSeparator::Stems44 StemSeparator::runModel (const Model& model,
+                                                const juce::AudioBuffer<float>& mix44,
+                                                const std::function<void(float)>& progress,
+                                                const std::function<bool()>& shouldAbort) const
 {
+    Stems44 empty;
     if (! model.ready || model.session == nullptr)
-        return {};
+        return empty;
 
     const int L = mix44.getNumSamples();
     if (L <= 0)
-        return {};
+        return empty;
 
     const int seg    = kSegmentSamples;
     const int stride = juce::jmax (1, (int) std::llround ((double) seg * (1.0 - kOverlap)));
@@ -259,8 +255,11 @@ juce::AudioBuffer<float> StemSeparator::runModel (const Model& model,
     const float wmax = *std::max_element (weight.begin(), weight.end());
     for (auto& w : weight) w /= wmax;
 
-    juce::AudioBuffer<float> out (kModelChannels, L);
-    out.clear();
+    // One accumulator per kept stem (drums/bass/vocals), all sharing one weight sum.
+    constexpr int kNumKept = 3;
+    Stems44 stems;
+    juce::AudioBuffer<float>* outBufs[kNumKept] = { &stems.drums, &stems.bass, &stems.vocals };
+    for (auto* b : outBufs) { b->setSize (kModelChannels, L); b->clear(); }
     std::vector<double> sumW ((size_t) L, 0.0);
 
     std::vector<float> inFlat ((size_t) kModelChannels * (size_t) seg);
@@ -275,7 +274,7 @@ juce::AudioBuffer<float> StemSeparator::runModel (const Model& model,
     for (int offset = 0; offset < L; offset += stride)
     {
         if (shouldAbort && shouldAbort())
-            return {};
+            return empty;
 
         const int chunkLen = juce::jmin (seg, L - offset);
 
@@ -307,47 +306,41 @@ juce::AudioBuffer<float> StemSeparator::runModel (const Model& model,
         {
             juce::Logger::writeToLog ("StemSeparator: inference error: "
                                       + juce::String::fromUTF8 (e.what()));
-            return {};
+            return empty;
         }
         if (outs.empty())
-            return {};
+            return empty;
 
-        // Slice the specialty stem from the output tensor. Handles both the
-        // single-stem export ([1, C, T]) and an all-stems export ([1, S, C, T]).
+        // The base htdemucs graph returns all four stems as [1, S, C, T]; slice
+        // the three we keep in one go. (Also tolerate a [1, C, T] single-stem
+        // graph by treating S as 1 — every kept index then clamps to that stem.)
         const auto  info  = outs[0].GetTensorTypeAndShapeInfo();
         const auto  shape = info.GetShape();
         const float* raw  = outs[0].GetTensorData<float>();
 
-        int T = 0, outCh = kModelChannels;
-        size_t stemOffset = 0;
-        if (shape.size() == 3)
-        {
-            outCh = (int) shape[1];
-            T     = (int) shape[2];
-        }
-        else if (shape.size() == 4)
-        {
-            const int S = (int) shape[1];
-            outCh = (int) shape[2];
-            T     = (int) shape[3];
-            const int stemIdx = juce::jlimit (0, S - 1, specialtyStemIndex);
-            stemOffset = (size_t) stemIdx * (size_t) outCh * (size_t) T;
-        }
+        int S = 1, outCh = kModelChannels, T = 0;
+        if (shape.size() == 4)      { S = (int) shape[1]; outCh = (int) shape[2]; T = (int) shape[3]; }
+        else if (shape.size() == 3) { outCh = (int) shape[1]; T = (int) shape[2]; }
         else
         {
             juce::Logger::writeToLog ("StemSeparator: unexpected output rank "
                                       + juce::String ((int) shape.size()));
-            return {};
+            return empty;
         }
 
         const int useLen = juce::jmin (chunkLen, T);
-        for (int ch = 0; ch < kModelChannels; ++ch)
+        for (int k = 0; k < kNumKept; ++k)
         {
-            const int    sc    = juce::jmin (ch, outCh - 1);
-            const float* segCh = raw + stemOffset + (size_t) sc * (size_t) T;
-            float*       dst   = out.getWritePointer (ch) + offset;
-            for (int i = 0; i < useLen; ++i)
-                dst[i] += weight[(size_t) i] * segCh[i];
+            const int    stemIdx    = juce::jlimit (0, S - 1, kKeptStemIndices[k]);
+            const size_t stemOffset = (size_t) stemIdx * (size_t) outCh * (size_t) T;
+            for (int ch = 0; ch < kModelChannels; ++ch)
+            {
+                const int    sc    = juce::jmin (ch, outCh - 1);
+                const float* segCh = raw + stemOffset + (size_t) sc * (size_t) T;
+                float*       dst   = outBufs[k]->getWritePointer (ch) + offset;
+                for (int i = 0; i < useLen; ++i)
+                    dst[i] += weight[(size_t) i] * segCh[i];
+            }
         }
         for (int i = 0; i < useLen; ++i)
             sumW[(size_t) (offset + i)] += (double) weight[(size_t) i];
@@ -357,19 +350,20 @@ juce::AudioBuffer<float> StemSeparator::runModel (const Model& model,
             progress (juce::jlimit (0.0f, 1.0f, (float) segDone / (float) juce::jmax (1, numSeg)));
     }
 
-    // Normalize each sample by the accumulated overlap weight.
-    for (int ch = 0; ch < kModelChannels; ++ch)
-    {
-        float* d = out.getWritePointer (ch);
-        for (int i = 0; i < L; ++i)
+    // Normalize each stem by the accumulated overlap weight.
+    for (int k = 0; k < kNumKept; ++k)
+        for (int ch = 0; ch < kModelChannels; ++ch)
         {
-            const double w = sumW[(size_t) i];
-            if (w > 1e-8)
-                d[i] = (float) ((double) d[i] / w);
+            float* d = outBufs[k]->getWritePointer (ch);
+            for (int i = 0; i < L; ++i)
+            {
+                const double w = sumW[(size_t) i];
+                if (w > 1e-8)
+                    d[i] = (float) ((double) d[i] / w);
+            }
         }
-    }
 
-    return out;
+    return stems;
 }
 
 //==============================================================================
@@ -397,35 +391,15 @@ StemSeparator::StemResult StemSeparator::separate (const juce::AudioBuffer<float
     if (shouldAbort && shouldAbort())
         return result;
 
-    struct Pass { const Model* model; int stemIdx; juce::AudioBuffer<float>* dst; };
-    juce::AudioBuffer<float> drums44, bass44, vocals44;
-    const Pass passes[] = {
-        { drumsModel.get(),  Drums,  &drums44  },
-        { bassModel.get(),   Bass,   &bass44   },
-        { vocalsModel.get(), Vocals, &vocals44 },
-    };
-    constexpr int numModels = 3;
+    // 2. One segmented pass over the base model yields all three stems at once.
+    auto stems = runModel (*stemModel, mix44, progress, shouldAbort);
+    if (stems.drums.getNumSamples() <= 0)
+        return result; // aborted or failed → invalid result, caller keeps the original
 
-    for (int m = 0; m < numModels; ++m)
-    {
-        if (shouldAbort && shouldAbort())
-            return result;
-
-        auto mapped = [progress, m] (float f)
-        {
-            if (progress)
-                progress (juce::jlimit (0.0f, 1.0f, ((float) m + f) / (float) numModels));
-        };
-
-        *passes[m].dst = runModel (*passes[m].model, mix44, passes[m].stemIdx, mapped, shouldAbort);
-        if (passes[m].dst->getNumSamples() <= 0)
-            return result; // aborted or failed → invalid result, caller keeps the original
-    }
-
-    // 2. Resample each stem back to the source rate and conform to source shape.
-    result.drums  = conform (resample (drums44,  kModelSampleRate, sampleRate), srcCh, srcLen);
-    result.bass   = conform (resample (bass44,   kModelSampleRate, sampleRate), srcCh, srcLen);
-    result.vocals = conform (resample (vocals44, kModelSampleRate, sampleRate), srcCh, srcLen);
+    // 3. Resample each stem back to the source rate and conform to source shape.
+    result.drums  = conform (resample (stems.drums,  kModelSampleRate, sampleRate), srcCh, srcLen);
+    result.bass   = conform (resample (stems.bass,   kModelSampleRate, sampleRate), srcCh, srcLen);
+    result.vocals = conform (resample (stems.vocals, kModelSampleRate, sampleRate), srcCh, srcLen);
     result.valid  = true;
 
     if (progress) progress (1.0f);

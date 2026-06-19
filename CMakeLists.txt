@@ -214,8 +214,8 @@ target_include_directories(CueSampler
 # .app is self-contained and can be zipped for beta testers.
 #
 # ORDERING IS LOAD-BEARING — do not split copies out of this single POST_BUILD:
-#   * Every copied file (libonnxruntime, beat_this, AND the htdemucs_ft stem
-#     models) must land BEFORE the codesign step. The final codesign signs the
+#   * Every copied file (libonnxruntime, beat_this, AND the htdemucs stem
+#     model) must land BEFORE the codesign step. The final codesign signs the
 #     whole BUNDLE, which regenerates Contents/_CodeSignature/CodeResources to
 #     seal Resources/. A file added after signing makes `codesign --verify`
 #     report "a sealed resource is missing or invalid" → auval / notarization
@@ -226,15 +226,15 @@ target_include_directories(CueSampler
 #     tree, leaving the DAW-loaded plugin without the stem models.
 set(ONNX_DYLIB "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.1.20.1.dylib")
 
-# HTDemucs-FT stem specialists. export_htdemucs.py writes four ONNX files to
-# assets/htdemucs_ft/ (drums/bass/vocals/other, ~316 MB each, opset 17, weights
-# embedded — NO .onnx.data sidecar). The plugin's mute model is SUBTRACTION
-# (other = original − drums − bass − vocals), so only THREE ship (~948 MB).
-# They are far over GitHub's 100 MB limit, so they are gitignored and may be
-# ABSENT on a clean checkout / CI; copy_if_exists.cmake silently skips a missing
-# model so the build still succeeds (StemSeparator falls back to the original
-# buffer). NOT juce_add_binary_data — too large.
-set(CUE_BUNDLED_STEMS drums bass vocals)
+# Single base-htdemucs model. export_htdemucs.py writes ONE file,
+# assets/htdemucs/htdemucs.onnx (~316 MB, opset 17, weights embedded — NO
+# .onnx.data sidecar), that outputs all four stems in one pass. (This replaced
+# the htdemucs_ft 3-specialist bundle, ~948 MB, which was ~3x slower.) It is far
+# over GitHub's 100 MB limit, so it is gitignored and may be ABSENT on a clean
+# checkout / CI; copy_if_exists.cmake silently skips it so the build still
+# succeeds (StemSeparator falls back to the original buffer). NOT
+# juce_add_binary_data — too large.
+set(CUE_STEM_MODEL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/assets/htdemucs/htdemucs.onnx")
 set(CUE_COPY_IF_EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_if_exists.cmake")
 
 if(APPLE)
@@ -246,16 +246,13 @@ if(APPLE)
             continue()
         endif()
 
-        # Stem-model copies are built up here so they can be injected into the one
-        # POST_BUILD command BEFORE codesign (copy_if_exists skips absent models).
-        set(_stem_copies "")
-        foreach(_stem ${CUE_BUNDLED_STEMS})
-            list(APPEND _stem_copies
-                COMMAND ${CMAKE_COMMAND}
-                    "-DSRC=${CMAKE_CURRENT_SOURCE_DIR}/assets/htdemucs_ft/${_stem}.onnx"
-                    "-DDST=$<TARGET_FILE_DIR:${_tgt}>/../Resources/htdemucs_ft/${_stem}.onnx"
-                    -P "${CUE_COPY_IF_EXISTS}")
-        endforeach()
+        # Stem-model copy, built up here so it can be injected into the one
+        # POST_BUILD command BEFORE codesign (copy_if_exists skips it if absent).
+        set(_stem_copies
+            COMMAND ${CMAKE_COMMAND}
+                "-DSRC=${CUE_STEM_MODEL_SRC}"
+                "-DDST=$<TARGET_FILE_DIR:${_tgt}>/../Resources/htdemucs/htdemucs.onnx"
+                -P "${CUE_COPY_IF_EXISTS}")
 
         add_custom_command(TARGET ${_tgt} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory
@@ -274,8 +271,8 @@ if(APPLE)
                 "${CMAKE_CURRENT_SOURCE_DIR}/assets/beat_this.onnx.data"
                 "$<TARGET_FILE_DIR:${_tgt}>/../Resources/beat_this.onnx.data"
 
-            # htdemucs_ft stem models into Resources/htdemucs_ft/ — MUST precede
-            # codesign (see ORDERING note above).
+            # htdemucs model into Resources/htdemucs/ — MUST precede codesign
+            # (see ORDERING note above).
             ${_stem_copies}
 
             # Patch the binary so it finds libonnxruntime via @loader_path
@@ -303,17 +300,14 @@ elseif(WIN32)
     # the .vst3 / Standalone to run self-contained.
     foreach(_fmt VST3 Standalone)
         if(TARGET CueSampler_${_fmt})
-            # htdemucs stem models staged next to the binary (htdemucs_ft/<stem>.onnx),
-            # in the SAME POST_BUILD so they precede JUCE's install copy (so the
-            # installed plugin gets them too). copy_if_exists skips absent models.
-            set(_stem_copies "")
-            foreach(_stem ${CUE_BUNDLED_STEMS})
-                list(APPEND _stem_copies
-                    COMMAND ${CMAKE_COMMAND}
-                        "-DSRC=${CMAKE_CURRENT_SOURCE_DIR}/assets/htdemucs_ft/${_stem}.onnx"
-                        "-DDST=$<TARGET_FILE_DIR:CueSampler_${_fmt}>/htdemucs_ft/${_stem}.onnx"
-                        -P "${CUE_COPY_IF_EXISTS}")
-            endforeach()
+            # htdemucs model staged next to the binary (htdemucs/htdemucs.onnx),
+            # in the SAME POST_BUILD so it precedes JUCE's install copy (so the
+            # installed plugin gets it too). copy_if_exists skips it if absent.
+            set(_stem_copies
+                COMMAND ${CMAKE_COMMAND}
+                    "-DSRC=${CUE_STEM_MODEL_SRC}"
+                    "-DDST=$<TARGET_FILE_DIR:CueSampler_${_fmt}>/htdemucs/htdemucs.onnx"
+                    -P "${CUE_COPY_IF_EXISTS}")
             add_custom_command(TARGET CueSampler_${_fmt} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "${ONNXRUNTIME_ROOT}/lib/onnxruntime.dll"
@@ -333,11 +327,11 @@ endif() # APPLE / WIN32 — platform-specific bundling
 # ── Optional offline StemSeparator test ───────────────────────────────────────
 # OFF by default (mirrors tools/test_warp_map.cpp, which is unwired from the main
 # target). Builds a small console app that runs StemSeparator on a WAV. Needs the
-# htdemucs_ft models present to actually pass; without them StemSeparator reports
+# htdemucs model present to actually pass; without it StemSeparator reports
 # not-ready and the test exits cleanly with a skip notice.
 #   cmake -S . -B build -DCUE_BUILD_STEM_TEST=ON
 #   cmake --build build --target test_stem_separator
-#   ./build/test_stem_separator_artefacts/test_stem_separator <song.wav> [models_dir]
+#   ./build/test_stem_separator_artefacts/test_stem_separator <song.wav> [model]
 option(CUE_BUILD_STEM_TEST "Build the offline StemSeparator test" OFF)
 if(CUE_BUILD_STEM_TEST)
     juce_add_console_app(test_stem_separator PRODUCT_NAME "test_stem_separator")

@@ -2126,43 +2126,41 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
         juce::Logger::writeToLog ("BeatThisAnalyzer: beat_this.onnx not found, using autocorrelation fallback");
     }
 
-    // Initialise the HTDemucs-FT stem separator. The three FT specialists live in
-    // an htdemucs_ft/ folder resolved with the SAME precedence as beat_this above
-    // (Contents/Resources → next to the binary → dev-tree assets/). Missing models
-    // just leave the separator not-ready and the plugin behaves exactly as before.
-    auto findStemModelsDir = [] () -> juce::File
+    // Initialise the stem separator. The single base-htdemucs model lives in an
+    // htdemucs/ folder resolved with the SAME precedence as beat_this above
+    // (Contents/Resources → next to the binary → dev-tree assets/). A missing
+    // model just leaves the separator not-ready and the plugin behaves as before.
+    auto findStemModel = [] () -> juce::File
     {
         const auto binaryDir = juce::File::getSpecialLocation (juce::File::currentExecutableFile)
                                    .getParentDirectory();
 
-        const auto atResources = binaryDir.getParentDirectory().getChildFile ("Resources/htdemucs_ft");
-        if (atResources.getChildFile ("drums.onnx").existsAsFile())
+        const auto atResources = binaryDir.getParentDirectory().getChildFile ("Resources/htdemucs/htdemucs.onnx");
+        if (atResources.existsAsFile())
             return atResources;
 
-        const auto atBinary = binaryDir.getChildFile ("htdemucs_ft");
-        if (atBinary.getChildFile ("drums.onnx").existsAsFile())
+        const auto atBinary = binaryDir.getChildFile ("htdemucs/htdemucs.onnx");
+        if (atBinary.existsAsFile())
             return atBinary;
 
-        const auto atSource = juce::File (__FILE__).getParentDirectory().getChildFile ("assets/htdemucs_ft");
-        if (atSource.getChildFile ("drums.onnx").existsAsFile())
+        const auto atSource = juce::File (__FILE__).getParentDirectory().getChildFile ("assets/htdemucs/htdemucs.onnx");
+        if (atSource.existsAsFile())
             return atSource;
 
         return {};
     };
 
-    if (const auto stemDir = findStemModelsDir(); stemDir != juce::File())
+    if (const auto stemModelFile = findStemModel(); stemModelFile != juce::File())
     {
         StemSeparator::ModelPaths paths;
-        paths.drums  = stemDir.getChildFile ("drums.onnx").getFullPathName();
-        paths.bass   = stemDir.getChildFile ("bass.onnx").getFullPathName();
-        paths.vocals = stemDir.getChildFile ("vocals.onnx").getFullPathName();
+        paths.model = stemModelFile.getFullPathName();
         stemSeparator = std::make_unique<StemSeparator> (paths);
-        juce::Logger::writeToLog ("StemSeparator: models at " + stemDir.getFullPathName()
+        juce::Logger::writeToLog ("StemSeparator: model at " + stemModelFile.getFullPathName()
                                   + " ready=" + juce::String (stemSeparator->isReady() ? "YES" : "NO"));
     }
     else
     {
-        juce::Logger::writeToLog ("StemSeparator: htdemucs_ft models not found, stem separation disabled");
+        juce::Logger::writeToLog ("StemSeparator: htdemucs model not found, stem separation disabled");
     }
 
     // Keep the prepared-render cache warm independently of the editor (the UI may
