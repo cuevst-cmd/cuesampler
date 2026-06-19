@@ -2907,7 +2907,13 @@ public:
     void paint (juce::Graphics& g) override
     {
         auto bounds = getLocalBounds().toFloat();
-        auto panelBounds = juce::Rectangle<float> (780.0f, 409.0f).withCentre (bounds.getCentre());
+        // The panel art was designed at 780x409, but resized() later condensed
+        // this component (411 -> 330) to make room for the stem strip. The height
+        // must track the component or the panel/frame/display clip top & bottom.
+        // Width is unchanged (780 in a 782-wide component); only height-derived
+        // values are panelH-relative so the original insets are preserved.
+        auto panelBounds = bounds.reduced (1.0f);
+        const auto panelH = panelBounds.getHeight();
 
         fillGlassRounded (g, *this, panelBounds, mediumCorner);
 
@@ -2915,15 +2921,15 @@ public:
         const auto panelY = panelBounds.getY();
         drawPanelHole (g, { panelX + 13.0f, panelY + 13.0f }, 6.0f);
         drawPanelHole (g, { panelX + 767.0f, panelY + 13.0f }, 6.0f);
-        drawPanelHole (g, { panelX + 13.0f, panelY + 396.0f }, 6.0f);
-        drawPanelHole (g, { panelX + 767.0f, panelY + 396.0f }, 6.0f);
+        drawPanelHole (g, { panelX + 13.0f, panelBounds.getBottom() - 13.0f }, 6.0f);
+        drawPanelHole (g, { panelX + 767.0f, panelBounds.getBottom() - 13.0f }, 6.0f);
 
-        auto frameBounds = juce::Rectangle<float> (panelX + 16.0f, panelY + 16.0f, 748.0f, 377.0f);
+        auto frameBounds = juce::Rectangle<float> (panelX + 16.0f, panelY + 16.0f, 748.0f, panelH - 32.0f);
         fillRoundedGradient (g, frameBounds, panelInnerDark.brighter (0.14f), panelInnerDark.darker (0.2f), 10.0f);
         g.setColour (borderMid);
         g.drawRoundedRectangle (frameBounds.reduced (0.5f), 10.0f, 1.0f);
 
-        auto displayBounds = juce::Rectangle<float> (panelX + 22.0f, panelY + 22.0f, 734.0f, 363.0f);
+        auto displayBounds = juce::Rectangle<float> (panelX + 22.0f, panelY + 22.0f, 734.0f, panelH - 46.0f);
         fillRoundedGradient (g, displayBounds, blackPanel.brighter (0.08f), blackPanel.darker (0.3f), 4.0f);
         g.setColour (juce::Colours::black);
         g.drawRoundedRectangle (displayBounds.reduced (0.5f), 4.0f, 1.0f);
@@ -3682,8 +3688,10 @@ private:
     juce::Rectangle<float> getDisplayBounds() const
     {
         auto bounds = getLocalBounds().toFloat();
-        auto panelBounds = juce::Rectangle<float> (780.0f, 409.0f).withCentre (bounds.getCentre());
-        return { panelBounds.getX() + 26.0f, panelBounds.getY() + 26.0f, 726.0f, 355.0f };
+        // Match paint(): the panel tracks the (condensed) component height so the
+        // display area isn't clipped top & bottom. Same insets as the 780x409 art.
+        auto panelBounds = bounds.reduced (1.0f);
+        return { panelBounds.getX() + 26.0f, panelBounds.getY() + 26.0f, 726.0f, panelBounds.getHeight() - 54.0f };
     }
 
     bool isPositionInsideDisplay (juce::Point<float> position) const
@@ -4214,6 +4222,11 @@ private:
                     }
                 }
 
+                // Clamp to unity (matches the linear waveform path) so hot
+                // samples can't overflow the window vertically.
+                maxVal = juce::jlimit (-1.0f, 1.0f, maxVal);
+                minVal = juce::jlimit (-1.0f, 1.0f, minVal);
+
                 const auto xPos    = (float) px;
                 const auto topY    = centreY - maxVal * halfHeight;
                 const auto bottomY = centreY - minVal * halfHeight;
@@ -4469,7 +4482,9 @@ private:
         }
 
         const auto hoverX = juce::jlimit (displayBounds.getX(), displayBounds.getRight(), hoveredDisplayX);
-        const auto guideColour = juce::Colour (0xffff2233); // Vibrant glowing neon red
+        // Vibrant glowing neon red — but follows the WARP accent and turns purple in warp-edit mode.
+        const auto guideColour = cue::isWarpModeActive ? juce::Colour (0xffa855f7)  // WARP purple
+                                                       : juce::Colour (0xffff2233); // neon red
         lastPaintedHoverAlpha = hoverAnimationAlpha;
         lastPaintedHoverX = hoverX;
 
@@ -4676,6 +4691,11 @@ private:
                     }
                 }
             }
+
+            // Clamp to unity so over-0dBFS (hot) samples can't overflow the
+            // display window vertically at the default zoom.
+            maxVal = juce::jlimit (-1.0f, 1.0f, maxVal);
+            minVal = juce::jlimit (-1.0f, 1.0f, minVal);
 
             auto xPos = displayBounds.getX() + (float) pixel;
             const auto verticalSpan = displayHeight * 0.48f * waveformVerticalScale;
@@ -5704,46 +5724,46 @@ public:
 
         if (gainReductionReadoutVisible)
         {
-            auto readoutBounds = getGainReductionReadoutBounds().toFloat();
-            auto area = readoutBounds.reduced (6.0f, 0.0f);
+            auto area = getGainReductionReadoutBounds().toFloat();
 
-            // "GR" label on the left.
+            // "GR" label at the top of the channel.
             g.setColour (textMuted);
             g.setFont (heavyFont (7.0f));
-            g.drawText ("GR", area.removeFromLeft (18.0f).toNearestInt(),
-                        juce::Justification::centredLeft, false);
+            g.drawText ("GR", area.removeFromTop (11.0f).toNearestInt(),
+                        juce::Justification::centred, false);
 
-            // dB readout on the right.
+            // dB readout at the bottom.
             const bool reducing = gainReductionDb > 0.05f;
             g.setColour (reducing ? accentOrange.brighter (0.2f) : textPrimary.withAlpha (0.4f));
-            g.setFont (monoFont (10.5f));
-            g.drawText (juce::String (gainReductionDb, 1) + " dB",
-                        area.removeFromRight (50.0f).toNearestInt(),
-                        juce::Justification::centredRight, false);
+            g.setFont (monoFont (10.0f));
+            g.drawText (juce::String (gainReductionDb, 1),
+                        area.removeFromBottom (13.0f).toNearestInt(),
+                        juce::Justification::centred, false);
 
-            // Segmented gain-reduction meter bar between the label and the value.
-            // Fills left-to-right with the amount of reduction (scaled to a
-            // typical 12 dB span) using discrete square LED segments.
-            auto track = area.reduced (4.0f, 6.5f); // Height = 7.0f
+            // Segmented gain-reduction meter column between the label and the
+            // value. Fills bottom-to-top with the amount of reduction (scaled to
+            // a typical 12 dB span) using discrete square LED segments.
+            auto track = area.withSizeKeepingCentre (10.0f, area.getHeight() - 4.0f);
 
             const int numSegments = 12;
-            const float totalWidth = track.getWidth();
-            const float segSpan = totalWidth / (float) numSegments;
+            const float totalHeight = track.getHeight();
+            const float segSpan = totalHeight / (float) numSegments;
             const float gapFrac = 0.30f;
-            const float segWidth = segSpan * (1.0f - gapFrac);
-            const float segHeight = track.getHeight();
+            const float segHeight = segSpan * (1.0f - gapFrac);
+            const float segWidth = track.getWidth();
 
             constexpr float displayMaxDb = 12.0f;
             const float frac = juce::jlimit (0.0f, 1.0f, gainReductionDb / displayMaxDb);
 
             for (int i = 0; i < numSegments; ++i)
             {
+                // Segment 0 sits at the bottom and lights first.
                 const float startFrac = (float) i / (float) numSegments;
                 const float endFrac = (float) (i + 1) / (float) numSegments;
                 const float lit = juce::jlimit (0.0f, 1.0f, (frac - startFrac) / (endFrac - startFrac));
 
-                const float x0 = track.getX() + segSpan * ((float) i + gapFrac * 0.5f);
-                auto segRect = juce::Rectangle<float> (x0, track.getY(), segWidth, segHeight);
+                const float y0 = track.getBottom() - segSpan * ((float) (i + 1) - gapFrac * 0.5f);
+                auto segRect = juce::Rectangle<float> (track.getX(), y0, segWidth, segHeight);
 
                 if (lit > 0.0f)
                 {
@@ -5759,6 +5779,93 @@ public:
                 g.fillRoundedRectangle (segRect, 1.0f);
             }
         }
+
+        // Lo-fi quantized scope between the knobs. Draws the live crushed output
+        // when the module is ON and audio is present, otherwise an internal
+        // crushed sine that keeps flowing (incl. while the module is OFF) so the
+        // BITS / CRUSH knob shape is always previewed.
+        if (scopeActive)
+            paintScope (g);
+    }
+
+    void paintScope (juce::Graphics& g)
+    {
+        auto bounds = getScopeBounds().toFloat();
+        auto screen = bounds.reduced (2.0f);
+
+        // Assemble the sample window to plot. Live waveform only when the module
+        // is ON and signal is present; otherwise the crushed idle sine.
+        std::array<float, (size_t) kScopeN> pts;
+        const bool on   = switchButton.getToggleState();
+        const bool live = on && scopePeak > 0.0025f;
+        if (live)
+        {
+            pts = scopeSamples;
+        }
+        else
+        {
+            // Mirror the processor's amount->DSP mapping so the idle preview
+            // tracks the knobs exactly (see bitsAmountToDspBits / crushAmount...).
+            const float a        = juce::jlimit (0.0f, 1.0f, scopeBitsAmount  * 0.01f);
+            const float ac       = juce::jlimit (0.0f, 1.0f, scopeCrushAmount * 0.01f);
+            const float bits     = 16.0f - 15.0f * std::sqrt (a);
+            const float crushPct = 100.0f - 99.0f * std::sqrt (ac);
+            const bool  quantize = bits     < 15.99f;
+            const bool  resample = crushPct < 99.99f;
+            const float steps    = std::pow (2.0f, bits - 1.0f);
+            const float invSteps = 1.0f / steps;
+            const double phaseStep = juce::jlimit (1.0e-4, 1.0, (double) (crushPct * 0.01f));
+
+            double rphase = 1.0;
+            float  held   = 0.0f;
+            constexpr float cycles = 2.2f;
+            for (int i = 0; i < kScopeN; ++i)
+            {
+                const float t = (float) i / (float) kScopeN;
+                float x = std::sin (t * cycles * juce::MathConstants<float>::twoPi
+                                    + (float) scopeIdlePhase) * 0.72f;
+                if (resample)
+                {
+                    rphase += phaseStep;
+                    if (rphase >= 1.0) { rphase -= 1.0; held = x; }
+                    x = held;
+                }
+                if (quantize)
+                    x = std::round (x * steps) * invSteps;
+                pts[(size_t) i] = x;
+            }
+        }
+
+        // Clip (invisibly) to the channel so the glow never bleeds onto the knobs.
+        juce::Graphics::ScopedSaveState state (g);
+        g.reduceClipRegion (bounds.getSmallestIntegerContainer());
+
+        const float midY  = screen.getCentreY();
+        const float halfH = screen.getHeight() * 0.5f * 0.84f;
+        auto yFor = [&] (float v) { return midY - juce::jlimit (-1.0f, 1.0f, v) * halfH; };
+        auto xFor = [&] (int i)   { return screen.getX() + screen.getWidth() * ((float) i / (float) (kScopeN - 1)); };
+
+        // Sample-and-hold stepped trace (horizontal hold, then vertical step).
+        juce::Path trace;
+        float prevY = yFor (pts[0]);
+        trace.startNewSubPath (xFor (0), prevY);
+        for (int i = 1; i < kScopeN; ++i)
+        {
+            const float xi = xFor (i);
+            const float yi = yFor (pts[(size_t) i]);
+            trace.lineTo (xi, prevY);
+            trace.lineTo (xi, yi);
+            prevY = yi;
+        }
+
+        // Just the wave: a soft glow pass under a crisp core. Stays clearly
+        // visible (a touch dimmer) when idle / OFF, brightest on live signal.
+        const juce::PathStrokeType glow (3.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded);
+        const juce::PathStrokeType core (1.3f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded);
+        g.setColour (accentOrange.withAlpha (live ? 0.22f : 0.16f));
+        g.strokePath (trace, glow);
+        g.setColour (accentOrange.brighter (live ? 0.25f : 0.08f).withAlpha (live ? 0.95f : 0.72f));
+        g.strokePath (trace, core);
     }
 
     void resized() override
@@ -5777,10 +5884,7 @@ public:
         if (gainReductionReadoutVisible != shouldShow)
         {
             gainReductionReadoutVisible = shouldShow;
-            if (gainReductionReadoutVisible && isShowing())
-                startTimerHz (animationFrameRateHz());
-            else
-                stopTimer();
+            refreshAnimationTimer();
             repaint();
         }
     }
@@ -5788,11 +5892,53 @@ public:
     void setGainReductionDb (float dB) noexcept
     {
         targetGainReductionDb = juce::jlimit (0.0f, 99.9f, dB);
-        if (gainReductionReadoutVisible && ! isTimerRunning())
-            startTimerHz (animationFrameRateHz());
+        refreshAnimationTimer();
+    }
+
+    // Enables the lo-fi scope visualizer for this module (BIT CRUSHER).
+    void setScopeActive (bool shouldShow) noexcept
+    {
+        if (scopeActive != shouldShow)
+        {
+            scopeActive = shouldShow;
+            refreshAnimationTimer();
+            repaint();
+        }
+    }
+
+    bool isScopeActive() const noexcept { return scopeActive; }
+
+    // Latest crushed-output window plus the current knob amounts (0..100), fed
+    // from the editor timer. Peak decides live waveform vs. idle synth preview.
+    void pushScopeFrame (const float* samples, int numSamples, float bitsAmount, float crushAmount) noexcept
+    {
+        float peak = 0.0f;
+        const int n = juce::jmin (numSamples, kScopeN);
+        for (int i = 0; i < kScopeN; ++i)
+        {
+            const float v = i < n ? samples[i] : 0.0f;
+            scopeSamples[(size_t) i] = v;
+            peak = juce::jmax (peak, std::abs (v));
+        }
+        scopePeak        = peak;
+        scopeBitsAmount  = bitsAmount;
+        scopeCrushAmount = crushAmount;
+        refreshAnimationTimer();
     }
 
 private:
+    // Runs the shared per-frame timer whenever something on this module needs
+    // animating: the compressor GR meter, or the bit-crusher scope while ON.
+    void refreshAnimationTimer()
+    {
+        // The scope flows continuously whenever active (ON or OFF).
+        const bool want = isShowing() && (gainReductionReadoutVisible || scopeActive);
+        if (want && ! isTimerRunning())
+            startTimerHz (animationFrameRateHz());
+        else if (! want && isTimerRunning())
+            stopTimer();
+    }
+
     void timerCallback() override
     {
         if (! isShowing())
@@ -5802,28 +5948,56 @@ private:
         }
 
         const int hz = animationFrameRateHz();
-        const float target = targetGainReductionDb;
+        bool needMore = false;
 
-        // Fast attack, slightly slower decay, using rate-independent lerp
-        const float lerpFactor = (target > gainReductionDb) ? 0.45f : 0.25f;
-        const float nextVal = gainReductionDb + (target - gainReductionDb) * frameRateLerp (lerpFactor, hz);
+        if (gainReductionReadoutVisible)
+        {
+            const float target = targetGainReductionDb;
 
-        if (std::abs (nextVal - gainReductionDb) > 0.01f)
-        {
-            gainReductionDb = nextVal;
-            repaint (getGainReductionReadoutBounds());
+            // Fast attack, slightly slower decay, using rate-independent lerp
+            const float lerpFactor = (target > gainReductionDb) ? 0.45f : 0.25f;
+            const float nextVal = gainReductionDb + (target - gainReductionDb) * frameRateLerp (lerpFactor, hz);
+
+            if (std::abs (nextVal - gainReductionDb) > 0.01f)
+            {
+                gainReductionDb = nextVal;
+                repaint (getGainReductionReadoutBounds());
+            }
+            else if (gainReductionDb != target)
+            {
+                gainReductionDb = target;
+                repaint (getGainReductionReadoutBounds());
+            }
+            needMore = true;
         }
-        else if (gainReductionDb != target)
+
+        if (scopeActive)
         {
-            gainReductionDb = target;
-            repaint (getGainReductionReadoutBounds());
+            // Slow horizontal drift for the idle preview; live frames repaint anyway.
+            scopeIdlePhase += juce::MathConstants<double>::twoPi * 0.35 / (double) juce::jmax (1, hz);
+            repaint (getScopeBounds());
+            needMore = true;
         }
+
+        if (! needMore)
+            stopTimer();
     }
 
     juce::Rectangle<int> getGainReductionReadoutBounds() const noexcept
     {
-        return { 28, getHeight() - 26, getWidth() - 56, 20 };
+        // Vertical GR meter occupying the channel between the two knobs.
+        constexpr int channelWidth = 46;
+        return { getWidth() / 2 - channelWidth / 2, 66, channelWidth, 96 };
     }
+
+    juce::Rectangle<int> getScopeBounds() const noexcept
+    {
+        // Display sits in the channel between the two knobs.
+        constexpr int w = 48, h = 62;
+        return { getWidth() / 2 - w / 2, 60, w, h };
+    }
+
+    static constexpr int kScopeN = 64;
 
     juce::String title;
     SmoothAnimatedSwitchButton switchButton;
@@ -5834,6 +6008,161 @@ private:
     bool gainReductionReadoutVisible = false;
     float gainReductionDb = 0.0f;
     float targetGainReductionDb = 0.0f;
+
+    bool  scopeActive = false;
+    std::array<float, (size_t) kScopeN> scopeSamples {};
+    float scopePeak = 0.0f;
+    float scopeBitsAmount = 0.0f;
+    float scopeCrushAmount = 0.0f;
+    double scopeIdlePhase = 0.0;
+};
+
+// Slim glass strip beneath the waveform with three stem-mute toggles
+// (BASS / DRUMS / VOCALS) and a status line. Toggled == muted (the keycap LED
+// lights, via the shared "utilitySync" style). Buttons are disabled and dimmed
+// until the processor reports stems are ready; the status line shows separation
+// progress meanwhile. Reads/writes the processor's setMute*/getMute* +
+// isSeparatingStems/areStemsReady/getStemProgress; refresh() is pumped by the
+// editor's 30 Hz timer.
+class StemRackComponent final : public juce::Component
+{
+public:
+    explicit StemRackComponent (AudioPluginAudioProcessor& p)
+        : processorRef (p)
+    {
+        setBufferedToImage (true);
+
+        auto configureMute = [this] (SmoothAnimatedSwitchButton& b,
+                                     const juce::String& label,
+                                     const juce::String& tip,
+                                     std::function<void (bool)> apply)
+        {
+            configureButton (b, label, glassTextMuted);
+            b.getProperties().set ("cueStyle", "utilitySync");
+            b.setClickingTogglesState (true);
+            b.setTooltip (tip);
+            b.onClick = [&b, fn = std::move (apply)] { fn (b.getToggleState()); };
+            addAndMakeVisible (b);
+        };
+
+        configureMute (bassBtn, "BASS",
+                       "Mute the BASS stem (removes it from playback). Lit = muted.",
+                       [this] (bool m) { processorRef.setMuteBass (m); });
+        configureMute (drumsBtn, "DRUMS",
+                       "Mute the DRUMS stem (removes it from playback). Lit = muted.",
+                       [this] (bool m) { processorRef.setMuteDrums (m); });
+        configureMute (vocalsBtn, "VOCALS",
+                       "Mute the VOCALS stem (removes it from playback). Lit = muted.",
+                       [this] (bool m) { processorRef.setMuteVocals (m); });
+
+        // Initialise toggle states from the processor (state recall).
+        bassBtn.setToggleState (processorRef.getMuteBass(),   juce::dontSendNotification);
+        drumsBtn.setToggleState (processorRef.getMuteDrums(), juce::dontSendNotification);
+        vocalsBtn.setToggleState (processorRef.getMuteVocals(), juce::dontSendNotification);
+
+        lastReady = ! processorRef.areStemsReady(); // force the first refresh to apply
+        refresh();
+    }
+
+    // Pumped by the editor timer: syncs toggle states, button enablement/dim, and
+    // the status line to the processor's current separation state.
+    void refresh()
+    {
+        const bool  ready      = processorRef.areStemsReady();
+        const bool  separating = processorRef.isSeparatingStems();
+        const float progress   = processorRef.getStemProgress();
+
+        // Keep toggles in sync with the processor (state restore, fresh-load reset)
+        // without firing onClick. setToggleState no-ops when unchanged.
+        bassBtn.setToggleState (processorRef.getMuteBass(),   juce::dontSendNotification);
+        drumsBtn.setToggleState (processorRef.getMuteDrums(), juce::dontSendNotification);
+        vocalsBtn.setToggleState (processorRef.getMuteVocals(), juce::dontSendNotification);
+
+        if (ready != lastReady)
+        {
+            for (auto* b : { &bassBtn, &drumsBtn, &vocalsBtn })
+            {
+                b->setEnabled (ready);
+                b->setAlpha (ready ? 1.0f : 0.4f);
+            }
+            lastReady = ready;
+        }
+
+        juce::String text;
+        juce::Colour colour;
+        if (! processorRef.areStemModelsAvailable())
+        {
+            text = "NO MODEL";
+            colour = glassTextMuted.withAlpha (0.55f);
+        }
+        else if (separating)
+        {
+            text = "SEPARATING " + juce::String (juce::roundToInt (juce::jlimit (0.0f, 1.0f, progress) * 100.0f)) + "%";
+            colour = accentOrange;
+        }
+        else if (ready)
+        {
+            text = "READY";
+            colour = juce::Colour (0xff6ad48a);
+        }
+        else if (processorRef.wasStemSeparationSkipped())
+        {
+            text = "SAMPLE TOO LONG";
+            colour = glassTextMuted.withAlpha (0.7f);
+        }
+        else
+        {
+            text = {}; // idle / no sample — neutral (just the STEMS title)
+            colour = glassTextMuted.withAlpha (0.55f);
+        }
+
+        if (text != statusText)
+        {
+            statusText   = text;
+            statusColour = colour;
+            repaint();
+        }
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        auto bounds = getLocalBounds().toFloat();
+
+        fillGlassRounded (g, *this, bounds.reduced (0.5f), mediumCorner);
+
+        drawPanelHole (g, { 13.0f, 13.0f }, 6.0f);
+        drawPanelHole (g, { bounds.getRight() - 13.0f, 13.0f }, 6.0f);
+        drawPanelHole (g, { 13.0f, bounds.getBottom() - 13.0f }, 6.0f);
+        drawPanelHole (g, { bounds.getRight() - 13.0f, bounds.getBottom() - 13.0f }, 6.0f);
+
+        g.setColour (glassText);
+        g.setFont (heavyFont (14.0f).withExtraKerningFactor (0.10f));
+        g.drawText ("STEMS", juce::Rectangle<int> (26, 13, 200, 24), juce::Justification::centredLeft);
+
+        g.setColour (statusColour);
+        g.setFont (heavyFont (9.5f).withExtraKerningFactor (0.06f));
+        g.drawText (statusText, juce::Rectangle<int> (27, 39, 210, 18), juce::Justification::centredLeft);
+    }
+
+    void resized() override
+    {
+        constexpr int y = 11, h = 51, gap = 14;
+        constexpr int leftEdge = 255, rightEdge = 758;
+        constexpr int w = (rightEdge - leftEdge - 2 * gap) / 3; // 158
+
+        bassBtn.setBounds   (leftEdge,                   y, w, h);
+        drumsBtn.setBounds  (leftEdge + (w + gap),       y, w, h);
+        vocalsBtn.setBounds (leftEdge + 2 * (w + gap),   y, w, h);
+    }
+
+private:
+    AudioPluginAudioProcessor& processorRef;
+    SmoothAnimatedSwitchButton bassBtn, drumsBtn, vocalsBtn;
+    juce::String statusText;
+    juce::Colour statusColour { glassTextMuted };
+    bool lastReady = false;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StemRackComponent)
 };
 
 class EffectsRackComponent final : public juce::Component
@@ -5849,6 +6178,7 @@ public:
         addAndMakeVisible (bitCrusher);
         addAndMakeVisible (compressor);
 
+        bitCrusher.setScopeActive (true);
         bitCrusher.getSwitchButton().setTooltip ("Enable / disable the Bit Crusher effect.");
         bitCrusher.getFirstKnob().getSlider().setTooltip ("BITS: amount of bit-depth reduction (0 % = clean, 100 % = crunchiest). Alt-click to reset.");
         bitCrusher.getSecondKnob().getSlider().setTooltip ("CRUSH: amount of sample-rate reduction (0 % = clean, 100 % = most lo-fi / aliased). Alt-click to reset.");
@@ -5980,6 +6310,7 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     transportSectionComponent = std::make_unique<cue::TransportSectionComponent> (processorRef);
     utilityStripComponent = std::make_unique<cue::UtilityStripComponent>();
     effectsRackComponent = std::make_unique<cue::EffectsRackComponent>();
+    stemRackComponent = std::make_unique<cue::StemRackComponent> (processorRef);
 
     // Measure the real display refresh rate from the vblank so animations run
     // at the display's native frame rate (120 Hz on ProMotion, 60 Hz otherwise).
@@ -6164,6 +6495,7 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     juce::Component* sections[] = { headerComponent.get(),
                                     waveformDisplayComponent.get(),
                                     transportSectionComponent.get(),
+                                    stemRackComponent.get(),
                                     utilityStripComponent.get(),
                                     effectsRackComponent.get() };
 
@@ -6176,6 +6508,7 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     panelShadowEffect.setShadowProperties (defaultShadow);
     waveformDisplayComponent->setComponentEffect (&panelShadowEffect);
     transportSectionComponent->setComponentEffect (&panelShadowEffect);
+    stemRackComponent->setComponentEffect (&panelShadowEffect);
     utilityStripComponent->setComponentEffect (&panelShadowEffect);
     effectsRackComponent->setComponentEffect (&panelShadowEffect);
 
@@ -6242,10 +6575,23 @@ void AudioPluginAudioProcessorEditor::timerCallback()
     if (! cue::shouldRunRealtimeUi (*this))
         return;
 
+    // Poll separation progress/ready → button enablement + status line.
+    if (stemRackComponent != nullptr)
+        stemRackComponent->refresh();
+
     if (effectsRackComponent == nullptr) return;
 
     const auto grDb = processorRef.getCompressorGainReductionDb();
     effectsRackComponent->getCompressorModule().setGainReductionDb (grDb);
+
+    auto& crusherModule = effectsRackComponent->getBitCrusherModule();
+    if (crusherModule.isScopeActive())
+    {
+        float scope[AudioPluginAudioProcessor::kBitCrusherScopeSize];
+        processorRef.readBitCrusherScope (scope, AudioPluginAudioProcessor::kBitCrusherScopeSize);
+        crusherModule.pushScopeFrame (scope, AudioPluginAudioProcessor::kBitCrusherScopeSize,
+                                      processorRef.getBitCrusherBits(), processorRef.getBitCrusherCrush());
+    }
 }
 
 void AudioPluginAudioProcessorEditor::showUpdateBannerIfNeeded()
@@ -6398,7 +6744,10 @@ void AudioPluginAudioProcessorEditor::resized()
     contentComponent.setBounds (0, 0, cue::editorWidth, cue::editorHeight);
 
     headerComponent->setBounds (96, 32, 1246, 77);
-    waveformDisplayComponent->setBounds (96, 133, 782, 411);
+    // Waveform condensed (411 → 330) to make room for the stem strip directly
+    // beneath it (8 px gaps match the existing rhythm). Transport unchanged.
+    waveformDisplayComponent->setBounds (96, 133, 782, 330);
+    stemRackComponent->setBounds (96, 471, 782, 73);
     transportSectionComponent->setBounds (96, 552, 782, 236);
     utilityStripComponent->setBounds (910, 133, 120, 655);
     effectsRackComponent->setBounds (1062, 133, 278, 655);

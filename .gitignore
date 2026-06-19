@@ -40,5 +40,10 @@ JuceLibraryCode/
 # *.aif
 # *.mp3
 
+# HTDemucs-FT stem-separation models (~316 MB each, over GitHub's 100 MB limit).
+# Produced by export_htdemucs.py or downloaded from StemSplitio/htdemucs-ft-onnx.
+# NOTE: assets/beat_this.onnx(.data) ARE committed (small) and stay tracked.
+assets/htdemucs_ft/
+
 # API Keys and Secrets
 APIKeys.h

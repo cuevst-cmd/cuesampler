@@ -5,6 +5,7 @@
 
 #include "AudioFingerprinter.h"
 #include "BeatThisAnalyzer.h"
+#include "StemSeparator.h"
 #include "EditTelemetry.h"
 #include "UpdateChecker.h"
 #include "KeyDetector.h"
@@ -33,6 +34,18 @@ public:
         juce::String fileName;
         int leadingContentStartSample = 0;
         juce::MemoryBlock serializedStateData;
+    };
+
+    // Result of HTDemucs-FT separation for the current sample. Holds the three
+    // stems we mute against plus a pointer to the PRISTINE source sample they
+    // were derived from. Muting is subtraction: played buffer = source.buffer −
+    // Σ(muted stems); "other" is implicit and always plays. Keeping the source
+    // sample (not a copy of its buffer) lets "nothing muted" restore the exact
+    // original object bit-for-bit with zero copy. Swapped via atomic_load/store.
+    struct StemSet
+    {
+        std::shared_ptr<LoadedSampleData> source;   // pristine original to subtract from
+        juce::AudioBuffer<float> drums, bass, vocals; // source rate/length/channels
     };
 
     struct TempoAnalysisData
@@ -176,6 +189,12 @@ public:
     float getBitCrusherBits()   const noexcept;
     float getBitCrusherCrush()  const noexcept;
 
+    // Live post-bit-crusher output snapshot for the on-module scope visualizer:
+    // a small rolling window of mono output samples in chronological order,
+    // published lock-free from the audio thread and read on the editor timer.
+    static constexpr int kBitCrusherScopeSize = 64;
+    void  readBitCrusherScope (float* dest, int maxSamples) const noexcept;
+
     bool isPlaying() const noexcept;
     double getPlaybackSamplePosition() const noexcept;
     int getLastTriggeredChopId() const noexcept;
@@ -195,6 +214,28 @@ public:
     bool isTempoAnalysisInProgress() const noexcept;
     bool isKeyDetectionInProgress() const noexcept;
     KeyDetector::Result getDetectedKey() const;
+
+    // ---- Stem separation (HTDemucs-FT) ------------------------------------
+    // Each setter flips the flag and schedules a background remix of the played
+    // buffer (original − Σ muted stems), atomic-swapped into loadedSample. No-op
+    // (original keeps playing) until stems are ready. Message-thread facing.
+    void setMuteDrums  (bool shouldMute) noexcept;
+    void setMuteBass   (bool shouldMute) noexcept;
+    void setMuteVocals (bool shouldMute) noexcept;
+    bool getMuteDrums()  const noexcept { return muteDrums.load (std::memory_order_acquire); }
+    bool getMuteBass()   const noexcept { return muteBass.load (std::memory_order_acquire); }
+    bool getMuteVocals() const noexcept { return muteVocals.load (std::memory_order_acquire); }
+
+    // True while a background separation pass is running; true once the three
+    // stems exist for the current sample; [0,1] progress of the running pass.
+    bool  isSeparatingStems() const noexcept { return stemSeparationInProgress.load (std::memory_order_acquire); }
+    bool  areStemsReady()     const noexcept { return stemsReady.load (std::memory_order_acquire); }
+    float getStemProgress()   const noexcept { return stemProgress.load (std::memory_order_acquire); }
+    // True if the htdemucs_ft models loaded — lets the UI distinguish "no model
+    // installed" from an idle/too-long state. Skipped == separation bypassed
+    // because the sample exceeds kMaxStemSeparationSeconds.
+    bool  areStemModelsAvailable() const noexcept;
+    bool  wasStemSeparationSkipped() const noexcept { return stemSeparationSkipped.load (std::memory_order_acquire); }
 
     // Apply a user key override (rootIndex 0..11 = C..B). Replaces the displayed
     // key and records a key_correction in the flywheel (user pick = ground truth).
@@ -308,6 +349,8 @@ private:
     class WarpRenderJob;
     class KeyDetectionJob;
     class PreparedWarmJob;
+    class StemSeparationJob;
+    class RemixJob;
 
     // Background "pre-render" warm: bakes each non-warp chop's pitch+time-stretched
     // audio into the ChopAudioCache prepared-entry cache so the audio thread can
@@ -342,12 +385,16 @@ private:
         float restoredGlobalPitch = 0.0f;
         bool restoredSyncToHost = false;
         bool restoredHalfTime = false;
+        bool restoredMuteDrums = false;
+        bool restoredMuteBass = false;
+        bool restoredMuteVocals = false;
         int restoredBarsPerChop = 1;
         int restoredMidiOctaveOffset = 0;
         double restoredPlaybackPosition = 0.0;
     };
 
     std::unique_ptr<BeatThisAnalyzer> beatThisAnalyzer;
+    std::unique_ptr<StemSeparator>    stemSeparator;
     KeyDetector keyDetector;
     AudioFingerprinter audioFingerprinter;
     cuesampler::EditTelemetry editTelemetry;
@@ -423,6 +470,7 @@ private:
     };
 
     std::shared_ptr<LoadedSampleData> loadedSample;
+    std::shared_ptr<const StemSet> stemSet;
     std::shared_ptr<TempoAnalysisData> tempoAnalysis;
     std::shared_ptr<TempoEditState> tempoEditState;
     std::shared_ptr<ChopState> chopState;
@@ -459,6 +507,10 @@ private:
     juce::ThreadPool analysisThreadPool { 1 };
     juce::ThreadPool warpRenderThreadPool { 1 };
     juce::ThreadPool keyDetectionThreadPool { 1 };
+    // Offline HTDemucs-FT separation + mute remixes. Single thread (one pass at a
+    // time), default priority — below the host's realtime audio thread so it can
+    // never glitch playback. Runs both StemSeparationJob and RemixJob.
+    juce::ThreadPool stemThreadPool { 1 };
     // Higher priority so the background bake finishes fast — and is biased onto a
     // performance core on Apple Silicon instead of a slow efficiency core. Still
     // below the host's real-time audio thread, so it cannot glitch playback.
@@ -472,6 +524,9 @@ private:
     // Message-thread-only state used by warmPreparedCacheTick() to decide whether a
     // fresh warm is needed (avoids re-kicking when nothing relevant has changed).
     std::shared_ptr<const ChopState> lastWarmChopState;
+    // Also tracked so a stem mute (which swaps loadedSample to a new buffer with
+    // the SAME chopState) forces a prepared-cache re-warm against the new audio.
+    std::shared_ptr<const LoadedSampleData> lastWarmSample;
     bool   lastWarmValid       = false;
     int    lastWarmPitchCents  = 0;
     int    lastWarmStretchPpm  = 0;
@@ -506,6 +561,23 @@ private:
     std::atomic<uint64_t> keyDetectionGeneration { 0 };
     std::atomic<bool> tempoAnalysisInProgress { false };
     std::atomic<bool> keyDetectionInProgress { false };
+
+    // Stem-separation state. stemGeneration guards background separation jobs;
+    // stemRemixGeneration coalesces rapid mute toggles. appliedStemMask is the
+    // mute bitmask (drums=1|bass=2|vocals=4) currently baked into loadedSample,
+    // or -1 when loadedSample is the raw original (equivalent to mask 0).
+    std::atomic<uint64_t> stemGeneration { 0 };
+    std::atomic<uint64_t> stemRemixGeneration { 0 };
+    std::atomic<bool>  muteDrums { false };
+    std::atomic<bool>  muteBass { false };
+    std::atomic<bool>  muteVocals { false };
+    std::atomic<bool>  stemsReady { false };
+    std::atomic<bool>  stemSeparationInProgress { false };
+    std::atomic<bool>  stemSeparationSkipped { false }; // sample exceeded the length guard
+    std::atomic<float> stemProgress { 0.0f };
+    std::atomic<int>   appliedStemMask { -1 };
+    // Samples longer than this skip separation (avoids huge RAM/time on full songs).
+    static constexpr double kMaxStemSeparationSeconds = 600.0; // 10 minutes
     std::atomic<uint64_t> tempoUiRevision { 0 };
     std::atomic<double> hostSampleRate { 44100.0 };
     std::atomic<double> playbackSamplePosition { 0.0 };
@@ -539,6 +611,13 @@ private:
     std::atomic<float> bitCrusherCrushUi   { 0.0f };
     std::atomic<bool>  bitCrusherEnabledUi { false };
 
+    // Rolling mono window of the crushed output: the audio thread appends into
+    // the ring, then publishes a chronological copy into the atomic array the
+    // editor reads. Sized by kBitCrusherScopeSize.
+    std::array<float, kBitCrusherScopeSize>              bitCrusherScopeRing {};
+    int                                                  bitCrusherScopeWritePos = 0;
+    std::array<std::atomic<float>, kBitCrusherScopeSize> bitCrusherScope {};
+
     // (Re)build the per-voice Bungee stretcher/stream pair so it matches the
     // currently known source sample rate, host sample rate, and channel
     // count. No-op when nothing has changed. Always called from the message
@@ -548,6 +627,16 @@ private:
 
     void launchTempoAnalysis (std::shared_ptr<const LoadedSampleData> sampleData);
     void publishTempoAnalysis (std::shared_ptr<TempoAnalysisData> analysisResult, uint64_t analysisGeneration);
+
+    // Stem separation, mirroring the launchTempoAnalysis / publishTempoAnalysis
+    // pattern. launchStemSeparation resets stem state and kicks a background
+    // pass; publishStems installs the result (generation-guarded) and applies any
+    // active mutes; rebuildActiveMix swaps loadedSample to original − Σ(muted);
+    // scheduleRebuildActiveMix posts a coalesced rebuild off the message thread.
+    void launchStemSeparation (std::shared_ptr<LoadedSampleData> sampleData);
+    void publishStems (std::shared_ptr<const StemSet> newStemSet, uint64_t generation);
+    void rebuildActiveMix();
+    void scheduleRebuildActiveMix();
     void buildChopsFromAnalysis (const TempoAnalysisData& analysis);
     DeferredRestoreStateData parseDeferredRestoreState (const juce::ValueTree& state) const;
     void applyParsedRestoreState (const DeferredRestoreStateData& restoreState);

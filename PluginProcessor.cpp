@@ -1649,6 +1649,94 @@ private:
     uint64_t generation = 0;
 };
 
+// Offline HTDemucs-FT pass for one sample. Mirrors TempoAnalysisJob: holds the
+// generation captured at launch, bails via shouldExit()/stale-generation, and
+// publishes through a generation-guarded publishStems(). On any failure it
+// publishes a null result, leaving the original buffer in place.
+class AudioPluginAudioProcessor::StemSeparationJob final : public juce::ThreadPoolJob
+{
+public:
+    StemSeparationJob (AudioPluginAudioProcessor& ownerIn,
+                       std::shared_ptr<LoadedSampleData> sampleDataIn,
+                       uint64_t generationIn)
+        : juce::ThreadPoolJob ("Stem Separation"),
+          owner (ownerIn),
+          sampleData (std::move (sampleDataIn)),
+          generation (generationIn)
+    {
+    }
+
+    JobStatus runJob() override
+    {
+        if (shouldExit() || sampleData == nullptr)
+            return jobHasFinished;
+
+        if (owner.stemSeparator == nullptr || ! owner.stemSeparator->isReady())
+        {
+            owner.publishStems (nullptr, generation); // no models → stay on original
+            return jobHasFinished;
+        }
+
+        auto stale = [this]
+        {
+            return shouldExit() || generation != owner.stemGeneration.load (std::memory_order_acquire);
+        };
+
+        auto onProgress = [this] (float f)
+        {
+            if (generation == owner.stemGeneration.load (std::memory_order_acquire))
+                owner.stemProgress.store (juce::jlimit (0.0f, 1.0f, f), std::memory_order_release);
+        };
+
+        const auto result = owner.stemSeparator->separate (sampleData->buffer,
+                                                            sampleData->sampleRate,
+                                                            onProgress, stale);
+
+        if (stale())
+            return jobHasFinished;
+
+        if (! result.valid)
+        {
+            owner.publishStems (nullptr, generation);
+            return jobHasFinished;
+        }
+
+        auto set = std::make_shared<StemSet>();
+        set->source = sampleData;             // pristine original (shared, not copied)
+        set->drums  = result.drums;
+        set->bass   = result.bass;
+        set->vocals = result.vocals;
+        owner.publishStems (std::move (set), generation);
+        return jobHasFinished;
+    }
+
+private:
+    AudioPluginAudioProcessor& owner;
+    std::shared_ptr<LoadedSampleData> sampleData;
+    uint64_t generation = 0;
+};
+
+// Coalesced background remix after a mute toggle. Only the latest generation
+// actually rebuilds; superseded ones return immediately. Runs on stemThreadPool.
+class AudioPluginAudioProcessor::RemixJob final : public juce::ThreadPoolJob
+{
+public:
+    RemixJob (AudioPluginAudioProcessor& ownerIn, uint64_t generationIn)
+        : juce::ThreadPoolJob ("Stem Remix"), owner (ownerIn), generation (generationIn) {}
+
+    JobStatus runJob() override
+    {
+        if (shouldExit() || generation != owner.stemRemixGeneration.load (std::memory_order_acquire))
+            return jobHasFinished;
+        owner.rebuildActiveMix();
+        return jobHasFinished;
+    }
+
+private:
+    AudioPluginAudioProcessor& owner;
+    uint64_t generation = 0;
+};
+
 class AudioPluginAudioProcessor::DeferredSampleRestoreJob final : public juce::ThreadPoolJob
 {
 public:
@@ -2038,6 +2126,45 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
         juce::Logger::writeToLog ("BeatThisAnalyzer: beat_this.onnx not found, using autocorrelation fallback");
     }
 
+    // Initialise the HTDemucs-FT stem separator. The three FT specialists live in
+    // an htdemucs_ft/ folder resolved with the SAME precedence as beat_this above
+    // (Contents/Resources → next to the binary → dev-tree assets/). Missing models
+    // just leave the separator not-ready and the plugin behaves exactly as before.
+    auto findStemModelsDir = [] () -> juce::File
+    {
+        const auto binaryDir = juce::File::getSpecialLocation (juce::File::currentExecutableFile)
+                                   .getParentDirectory();
+
+        const auto atResources = binaryDir.getParentDirectory().getChildFile ("Resources/htdemucs_ft");
+        if (atResources.getChildFile ("drums.onnx").existsAsFile())
+            return atResources;
+
+        const auto atBinary = binaryDir.getChildFile ("htdemucs_ft");
+        if (atBinary.getChildFile ("drums.onnx").existsAsFile())
+            return atBinary;
+
+        const auto atSource = juce::File (__FILE__).getParentDirectory().getChildFile ("assets/htdemucs_ft");
+        if (atSource.getChildFile ("drums.onnx").existsAsFile())
+            return atSource;
+
+        return {};
+    };
+
+    if (const auto stemDir = findStemModelsDir(); stemDir != juce::File())
+    {
+        StemSeparator::ModelPaths paths;
+        paths.drums  = stemDir.getChildFile ("drums.onnx").getFullPathName();
+        paths.bass   = stemDir.getChildFile ("bass.onnx").getFullPathName();
+        paths.vocals = stemDir.getChildFile ("vocals.onnx").getFullPathName();
+        stemSeparator = std::make_unique<StemSeparator> (paths);
+        juce::Logger::writeToLog ("StemSeparator: models at " + stemDir.getFullPathName()
+                                  + " ready=" + juce::String (stemSeparator->isReady() ? "YES" : "NO"));
+    }
+    else
+    {
+        juce::Logger::writeToLog ("StemSeparator: htdemucs_ft models not found, stem separation disabled");
+    }
+
     // Keep the prepared-render cache warm independently of the editor (the UI may
     // be closed). Polls often enough to start baking promptly after a sample loads
     // or settings change; it only kicks a background bake when something relevant
@@ -2052,11 +2179,15 @@ AudioPluginAudioProcessor::~AudioPluginAudioProcessor()
     editTelemetry.flush();
     keyDetectionGeneration.fetch_add (1, std::memory_order_acq_rel);
     prepareWarmGeneration.fetch_add (1, std::memory_order_acq_rel);
+    stemGeneration.fetch_add (1, std::memory_order_acq_rel);
+    stemRemixGeneration.fetch_add (1, std::memory_order_acq_rel);
     restoreThreadPool.removeAllJobs (true, 2000);
     analysisThreadPool.removeAllJobs (true, 2000);
     warpRenderThreadPool.removeAllJobs (true, 2000);
     keyDetectionThreadPool.removeAllJobs (true, 2000);
     prepareRenderThreadPool.removeAllJobs (true, 2000);
+    // Separation can be mid-flight (tens of seconds); give it a generous window.
+    stemThreadPool.removeAllJobs (true, 10000);
 }
 
 void AudioPluginAudioProcessor::timerCallback()
@@ -2086,12 +2217,16 @@ void AudioPluginAudioProcessor::warmPreparedCacheTick()
     const int stretchPpm = (int) std::lround (stretch * 100000.0f);
 
     // Nothing relevant changed since the last warm → the cache is already correct.
+    // 'sample' identity is part of the key: a stem mute swaps loadedSample to a new
+    // buffer with the SAME chopState, so without this the prepared cache would keep
+    // serving pre-mute audio.
     if (lastWarmValid
         && pitchCents == lastWarmPitchCents
         && stretchPpm == lastWarmStretchPpm
         && std::abs (sourceRate - lastWarmSourceRate) < 0.5
         && std::abs (hostRate - lastWarmHostRate) < 0.5
-        && chops == lastWarmChopState)
+        && chops == lastWarmChopState
+        && sample == lastWarmSample)
         return;
 
     lastWarmValid      = true;
@@ -2100,6 +2235,7 @@ void AudioPluginAudioProcessor::warmPreparedCacheTick()
     lastWarmSourceRate = sourceRate;
     lastWarmHostRate   = hostRate;
     lastWarmChopState  = chops;
+    lastWarmSample     = sample;
 
     // Supersede any in-flight warm for stale settings, then bake the new set,
     // starting with the chop the user is most likely hearing right now.
@@ -2929,6 +3065,27 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     playbackSamplePosition.store (activeVoice.playbackSamplePosition, std::memory_order_release);
 
     bitCrusher.process (buffer);
+
+    // Capture a rolling mono window of the crushed output for the UI scope
+    // visualizer (before the compressor colours it). Cheap: a handful of ring
+    // writes plus a 64-slot relaxed publish, only while the crusher is on.
+    if (bitCrusher.isEnabled())
+    {
+        const int   n  = buffer.getNumSamples();
+        const auto* L  = buffer.getReadPointer (0);
+        const auto* R  = buffer.getNumChannels() > 1 ? buffer.getReadPointer (1) : nullptr;
+        for (int i = 0; i < n; ++i)
+        {
+            bitCrusherScopeRing[(size_t) bitCrusherScopeWritePos] = R != nullptr ? 0.5f * (L[i] + R[i]) : L[i];
+            bitCrusherScopeWritePos = (bitCrusherScopeWritePos + 1) % kBitCrusherScopeSize;
+        }
+        for (int i = 0; i < kBitCrusherScopeSize; ++i)
+        {
+            const int idx = (bitCrusherScopeWritePos + i) % kBitCrusherScopeSize; // oldest first
+            bitCrusherScope[(size_t) i].store (bitCrusherScopeRing[(size_t) idx], std::memory_order_relaxed);
+        }
+    }
+
     compressor.process (buffer);
 
     float blockPeak = 0.0f;
@@ -3033,6 +3190,9 @@ void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData
     state.setProperty ("globalPitchSemitones", (double) pitchSemitones.load (std::memory_order_acquire), nullptr);
     state.setProperty ("syncToHost", syncToHost.load (std::memory_order_acquire), nullptr);
     state.setProperty ("halfTimeEnabled", halfTimeEnabled.load (std::memory_order_acquire), nullptr);
+    state.setProperty ("muteDrums", muteDrums.load (std::memory_order_acquire), nullptr);
+    state.setProperty ("muteBass", muteBass.load (std::memory_order_acquire), nullptr);
+    state.setProperty ("muteVocals", muteVocals.load (std::memory_order_acquire), nullptr);
     state.setProperty ("chopBarsCount", chopBarsCount.load (std::memory_order_acquire), nullptr);
     state.setProperty ("midiOctaveOffset", midiOctaveOffset.load (std::memory_order_acquire), nullptr);
     state.setProperty ("playbackSamplePosition", playbackSamplePosition.load (std::memory_order_acquire), nullptr);
@@ -3293,6 +3453,9 @@ AudioPluginAudioProcessor::parseDeferredRestoreState (const juce::ValueTree& sta
                                                      (float) (double) state.getProperty ("globalPitchSemitones", 0.0));
     restoreState.restoredSyncToHost = (bool) state.getProperty ("syncToHost", false);
     restoreState.restoredHalfTime = (bool) state.getProperty ("halfTimeEnabled", false);
+    restoreState.restoredMuteDrums = (bool) state.getProperty ("muteDrums", false);
+    restoreState.restoredMuteBass = (bool) state.getProperty ("muteBass", false);
+    restoreState.restoredMuteVocals = (bool) state.getProperty ("muteVocals", false);
     restoreState.restoredBarsPerChop = juce::jlimit (1, 8, (int) state.getProperty ("chopBarsCount", 1));
     restoreState.restoredMidiOctaveOffset = juce::jlimit (midiOctaveOffsetMin, midiOctaveOffsetMax,
                                                           (int) state.getProperty ("midiOctaveOffset", 0));
@@ -3325,6 +3488,18 @@ void AudioPluginAudioProcessor::applyParsedRestoreState (const DeferredRestoreSt
     pitchSemitones.store (restoreState.restoredGlobalPitch, std::memory_order_release);
     syncToHost.store (restoreState.restoredSyncToHost, std::memory_order_release);
     halfTimeEnabled.store (restoreState.restoredHalfTime, std::memory_order_release);
+
+    // Restore the mute flags and clear stem state — the new sample re-separates
+    // (stem audio is never serialized), then these mutes apply on publish.
+    muteDrums.store (restoreState.restoredMuteDrums, std::memory_order_release);
+    muteBass.store (restoreState.restoredMuteBass, std::memory_order_release);
+    muteVocals.store (restoreState.restoredMuteVocals, std::memory_order_release);
+    std::atomic_store (&stemSet, std::shared_ptr<const StemSet> {});
+    stemsReady.store (false, std::memory_order_release);
+    stemSeparationInProgress.store (false, std::memory_order_release);
+    stemProgress.store (0.0f, std::memory_order_release);
+    appliedStemMask.store (-1, std::memory_order_release);
+
     chopBarsCount.store ((restoreState.restoredBarsPerChop <= 1) ? 1
                                                                  : (restoreState.restoredBarsPerChop <= 2) ? 2
                                                                  : (restoreState.restoredBarsPerChop <= 4) ? 4
@@ -3491,6 +3666,10 @@ void AudioPluginAudioProcessor::completeDeferredSampleRestore (const DeferredRes
         launchTempoAnalysis (restoredSample);
     else
         touchTempoUiRevision();
+
+    // Re-separate on restore (stem audio is never serialized). The mute flags were
+    // already restored in applyParsedRestoreState; they apply once stems publish.
+    launchStemSeparation (restoredSample);
 
     // Restored chops may carry warp markers — re-bake those entries.
     if (const auto restoredState = std::atomic_load (&chopState); restoredState != nullptr)
@@ -3672,6 +3851,13 @@ void AudioPluginAudioProcessor::loadAudioFile (const juce::File& file)
         playbackSamplePosition.store ((double) sampleData->leadingContentStartSample, std::memory_order_release);
 
         launchTempoAnalysis (sampleData);
+
+        // A fresh sample starts unmuted; launchStemSeparation clears stem state and
+        // kicks the background pass (mutes apply automatically once stems publish).
+        muteDrums.store (false, std::memory_order_release);
+        muteBass.store (false, std::memory_order_release);
+        muteVocals.store (false, std::memory_order_release);
+        launchStemSeparation (sampleData);
 
         const auto keyGeneration = keyDetectionGeneration.fetch_add (1, std::memory_order_acq_rel) + 1;
         keyDetectionThreadPool.removeAllJobs (false, 0);
@@ -4341,6 +4527,13 @@ float AudioPluginAudioProcessor::getBitCrusherCrush() const noexcept
     return bitCrusherCrushUi.load (std::memory_order_acquire);
 }
 
+void AudioPluginAudioProcessor::readBitCrusherScope (float* dest, int maxSamples) const noexcept
+{
+    const int n = juce::jmin (maxSamples, kBitCrusherScopeSize);
+    for (int i = 0; i < n; ++i)
+        dest[i] = bitCrusherScope[(size_t) i].load (std::memory_order_relaxed);
+}
+
 float AudioPluginAudioProcessor::getTimeStretchRatio() const noexcept
 {
     return timeStretchRatio.load (std::memory_order_acquire);
@@ -4778,6 +4971,178 @@ void AudioPluginAudioProcessor::publishTempoAnalysis (std::shared_ptr<TempoAnaly
 
     touchTempoUiRevision();
     notifyEditStateChanged();
+}
+
+//==============================================================================
+// Stem separation — mirrors the launchTempoAnalysis / publishTempoAnalysis pair.
+void AudioPluginAudioProcessor::launchStemSeparation (std::shared_ptr<LoadedSampleData> sampleData)
+{
+    // Abandon any in-flight separation / queued remix for the previous sample and
+    // reset stem state. appliedStemMask = -1 marks loadedSample as the raw original.
+    stemThreadPool.removeAllJobs (false, 0);
+    std::atomic_store (&stemSet, std::shared_ptr<const StemSet> {});
+    stemsReady.store (false, std::memory_order_release);
+    stemProgress.store (0.0f, std::memory_order_release);
+    stemSeparationSkipped.store (false, std::memory_order_release);
+    appliedStemMask.store (-1, std::memory_order_release);
+
+    // No separator (models missing / failed) → behave exactly as before: original
+    // plays, mutes stay disabled.
+    if (stemSeparator == nullptr || ! stemSeparator->isReady()
+        || sampleData == nullptr || sampleData->buffer.getNumSamples() <= 0)
+    {
+        stemSeparationInProgress.store (false, std::memory_order_release);
+        if (stemSeparator == nullptr || ! stemSeparator->isReady())
+            juce::Logger::writeToLog ("StemSeparator: separation unavailable (models not ready)");
+        return;
+    }
+
+    // Length guard: skip separation for very long samples (RAM/time). The panel
+    // shows a brief reason; the original plays and mutes stay disabled.
+    const double durationSeconds = sampleData->sampleRate > 0.0
+        ? (double) sampleData->buffer.getNumSamples() / sampleData->sampleRate
+        : 0.0;
+    if (durationSeconds > kMaxStemSeparationSeconds)
+    {
+        stemSeparationInProgress.store (false, std::memory_order_release);
+        stemSeparationSkipped.store (true, std::memory_order_release);
+        juce::Logger::writeToLog ("StemSeparator: sample too long ("
+            + juce::String (durationSeconds, 1) + "s > "
+            + juce::String (kMaxStemSeparationSeconds, 0) + "s) — skipping separation");
+        return;
+    }
+
+    stemSeparationInProgress.store (true, std::memory_order_release);
+    const auto generation = stemGeneration.fetch_add (1, std::memory_order_acq_rel) + 1;
+    stemThreadPool.addJob (new StemSeparationJob (*this, std::move (sampleData), generation), true);
+}
+
+void AudioPluginAudioProcessor::publishStems (std::shared_ptr<const StemSet> newStemSet, uint64_t generation)
+{
+    if (generation != stemGeneration.load (std::memory_order_acquire))
+        return; // superseded by a newer sample / separation
+
+    stemSeparationInProgress.store (false, std::memory_order_release);
+
+    if (newStemSet == nullptr)
+    {
+        // Separation unavailable or failed → keep the original buffer in place.
+        stemsReady.store (false, std::memory_order_release);
+        return;
+    }
+
+    std::atomic_store (&stemSet, newStemSet);
+    stemProgress.store (1.0f, std::memory_order_release);
+    stemsReady.store (true, std::memory_order_release);
+    rebuildActiveMix(); // apply any active mutes now that stems exist
+}
+
+void AudioPluginAudioProcessor::rebuildActiveMix()
+{
+    const auto stems = std::atomic_load (&stemSet);
+    if (stems == nullptr || stems->source == nullptr)
+        return; // no stems → original already playing
+
+    const int desiredMask = (muteDrums.load (std::memory_order_acquire)  ? 1 : 0)
+                          | (muteBass.load (std::memory_order_acquire)   ? 2 : 0)
+                          | (muteVocals.load (std::memory_order_acquire) ? 4 : 0);
+
+    int currentMask = appliedStemMask.load (std::memory_order_acquire);
+    if (currentMask < 0)
+        currentMask = 0; // raw original is equivalent to "nothing muted"
+
+    if (desiredMask == currentMask)
+    {
+        appliedStemMask.store (desiredMask, std::memory_order_release);
+        return; // already correct — avoid a needless swap + cache rebuild
+    }
+
+    std::shared_ptr<LoadedSampleData> newSample;
+
+    if (desiredMask == 0)
+    {
+        // Nothing muted → restore the exact pristine original (zero-copy alias).
+        newSample = stems->source;
+    }
+    else
+    {
+        const auto& orig = stems->source->buffer;
+        const int numCh = orig.getNumChannels();
+        const int numS  = orig.getNumSamples();
+
+        juce::AudioBuffer<float> mix (numCh, numS);
+        for (int ch = 0; ch < numCh; ++ch)
+            mix.copyFrom (ch, 0, orig, ch, 0, numS);
+
+        auto subtract = [&] (const juce::AudioBuffer<float>& stem)
+        {
+            const int sc = juce::jmin (numCh, stem.getNumChannels());
+            const int sn = juce::jmin (numS, stem.getNumSamples());
+            for (int ch = 0; ch < sc; ++ch)
+                mix.addFrom (ch, 0, stem, ch, 0, sn, -1.0f);
+        };
+        if (desiredMask & 1) subtract (stems->drums);
+        if (desiredMask & 2) subtract (stems->bass);
+        if (desiredMask & 4) subtract (stems->vocals);
+
+        newSample = std::make_shared<LoadedSampleData>();
+        newSample->sampleRate                = stems->source->sampleRate;
+        newSample->sourceFile                = stems->source->sourceFile;
+        newSample->filePath                  = stems->source->filePath;
+        newSample->fileName                  = stems->source->fileName;
+        newSample->leadingContentStartSample = stems->source->leadingContentStartSample;
+        newSample->serializedStateData       = stems->source->serializedStateData;
+        newSample->buffer                    = std::move (mix);
+    }
+
+    std::atomic_store (&loadedSample, newSample);
+    appliedStemMask.store (desiredMask, std::memory_order_release);
+
+    // Chop list/positions are unchanged but the audio content changed, so the warp
+    // + prepared caches are stale. Refresh exactly like a content change does: drop
+    // the warp cache, bump generations, re-bake chops with markers. The prepared
+    // cache re-warms via warmPreparedCacheTick (now keyed on loadedSample identity).
+    warpRenderThreadPool.removeAllJobs (false, 0);
+    chopAudioCache.clear();
+    warpRenderGeneration.fetch_add (1, std::memory_order_acq_rel);
+    prepareWarmGeneration.fetch_add (1, std::memory_order_acq_rel);
+
+    if (const auto currentChopState = std::atomic_load (&chopState); currentChopState != nullptr)
+        for (const auto& c : currentChopState->chops)
+            if (! c.warpMarkers.empty())
+                requestChopWarpRender (c.id);
+}
+
+void AudioPluginAudioProcessor::scheduleRebuildActiveMix()
+{
+    if (std::atomic_load (&stemSet) == nullptr)
+        return; // no stems yet → original keeps playing; mutes apply on publish
+
+    const auto generation = stemRemixGeneration.fetch_add (1, std::memory_order_acq_rel) + 1;
+    stemThreadPool.addJob (new RemixJob (*this, generation), true);
+}
+
+void AudioPluginAudioProcessor::setMuteDrums (bool shouldMute) noexcept
+{
+    muteDrums.store (shouldMute, std::memory_order_release);
+    scheduleRebuildActiveMix();
+}
+
+void AudioPluginAudioProcessor::setMuteBass (bool shouldMute) noexcept
+{
+    muteBass.store (shouldMute, std::memory_order_release);
+    scheduleRebuildActiveMix();
+}
+
+void AudioPluginAudioProcessor::setMuteVocals (bool shouldMute) noexcept
+{
+    muteVocals.store (shouldMute, std::memory_order_release);
+    scheduleRebuildActiveMix();
+}
+
+bool AudioPluginAudioProcessor::areStemModelsAvailable() const noexcept
+{
+    return stemSeparator != nullptr && stemSeparator->isReady();
 }
 
 void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData& analysis)

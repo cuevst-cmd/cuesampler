@@ -15,6 +15,7 @@ class WaveformDisplayComponent;
 class TransportSectionComponent;
 class UtilityStripComponent;
 class EffectsRackComponent;
+class StemRackComponent;
 class StartKnobComponent;
 class UpdateBannerComponent;
 class GlassKeyboard;
@@ -60,6 +61,7 @@ private:
     std::unique_ptr<cue::TransportSectionComponent> transportSectionComponent;
     std::unique_ptr<cue::UtilityStripComponent> utilityStripComponent;
     std::unique_ptr<cue::EffectsRackComponent> effectsRackComponent;
+    std::unique_ptr<cue::StemRackComponent> stemRackComponent;
 
     std::unique_ptr<cue::HelpOverlayComponent> helpOverlayComponent;
     std::unique_ptr<cue::UpdateBannerComponent> updateBannerComponent;
