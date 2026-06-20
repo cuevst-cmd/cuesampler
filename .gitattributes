@@ -1,0 +1,29 @@
+# Line-ending policy — keep Windows checkouts from breaking the build.
+#
+# The load-bearing rule is *.patch: patches/bungee-stream-reset.patch is applied
+# with `git apply` during the Bungee FetchContent step. If Git for Windows
+# converts it to CRLF on checkout (the default core.autocrlf=true does this),
+# the patch can fail to apply. Forcing LF here makes it machine-independent.
+# (This file is already LF, so adding these rules causes no renormalization.)
+#
+# NOTE: .gitattributes only governs THIS repo. The Bungee/JUCE sources pulled by
+# FetchContent are separate clones governed by the machine's global git config,
+# so also run `git config --global core.autocrlf input` on the VM
+# (see WINDOWS_VM_SETUP.md).
+
+# Patches and build scripts must stay LF.
+*.patch  text eol=lf
+*.cmake  text eol=lf
+*.sh     text eol=lf
+
+# Binary assets — never apply end-of-line conversion (would corrupt them).
+*.png    binary
+*.ttf    binary
+*.onnx   binary
+*.data   binary
+*.dll    binary
+*.dylib  binary
+*.component binary
+*.vst3   binary
+*.zip    binary
+*.tgz    binary

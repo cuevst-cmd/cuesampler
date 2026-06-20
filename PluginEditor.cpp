@@ -6050,13 +6050,13 @@ public:
         // the stem plays, LED off = muted. So the light stays on while unmuted and
         // turns off to mute. apply() inverts the toggle into the processor's mute flag.
         configureMute (bassBtn, "BASS",
-                       "BASS stem. Lit = playing — click to mute (removes it from playback).",
+                       "BASS stem. Lit = playing - click to mute (removes it from playback).",
                        [this] (bool active) { processorRef.setMuteBass (! active); });
         configureMute (drumsBtn, "DRUMS",
-                       "DRUMS stem. Lit = playing — click to mute (removes it from playback).",
+                       "DRUMS stem. Lit = playing - click to mute (removes it from playback).",
                        [this] (bool active) { processorRef.setMuteDrums (! active); });
         configureMute (vocalsBtn, "VOCALS",
-                       "VOCALS stem. Lit = playing — click to mute (removes it from playback).",
+                       "VOCALS stem. Lit = playing - click to mute (removes it from playback).",
                        [this] (bool active) { processorRef.setMuteVocals (! active); });
 
         // Initialise toggle states from the processor (state recall). Inverted:
