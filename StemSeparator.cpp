@@ -5,6 +5,7 @@
 
 #if defined(__APPLE__)
  #include <coreml_provider_factory.h>
+ #include <sys/sysctl.h>
 #endif
 
 #include <algorithm>
@@ -13,6 +14,54 @@
 #include <cstdlib>
 #include <thread>
 #include <vector>
+
+//==============================================================================
+namespace
+{
+    // Intra-op thread count for the offline htdemucs pass.
+    //
+    // On heterogeneous Apple Silicon (M4: 4 performance + 6 efficiency cores)
+    // oversubscribing all 10 logical cores is counter-productive for this
+    // conv/matmul/attention graph: ORT synchronises at every parallel-region
+    // barrier, so the 4 fast P-core threads finish their slice and then stall
+    // waiting on 6 E-core threads running at ~1/3 the speed — plus QoS migration
+    // and cache thrash. Pinning to the performance-core count is the documented
+    // best practice for compute-bound ML. Override with CUE_STEM_THREADS to A/B
+    // sweep without a rebuild.
+    int chooseIntraOpThreads()
+    {
+        if (const char* env = std::getenv ("CUE_STEM_THREADS"))
+        {
+            const int n = std::atoi (env);
+            if (n >= 1)
+                return juce::jlimit (1, 32, n);
+        }
+
+       #if defined(__APPLE__)
+        int    perfCores = 0;
+        size_t sz        = sizeof (perfCores);
+        if (sysctlbyname ("hw.perflevel0.logicalcpu", &perfCores, &sz, nullptr, 0) == 0
+            && perfCores >= 1)
+            return juce::jlimit (1, 32, perfCores);
+       #endif
+
+        return (int) juce::jlimit (1u, 16u, std::thread::hardware_concurrency());
+    }
+
+    // Segment overlap for the triangular overlap-add. Lower = fewer inferences
+    // (faster) but more boundary artifacts at each ~7.8 s segment seam. Override
+    // with CUE_STEM_OVERLAP (clamped [0, 0.5]) to dial in by ear without a rebuild.
+    double resolveOverlap (double fallback)
+    {
+        if (const char* env = std::getenv ("CUE_STEM_OVERLAP"))
+        {
+            const double v = std::atof (env);
+            if (v >= 0.0)
+                return juce::jlimit (0.0, 0.5, v);
+        }
+        return fallback;
+    }
+}
 
 //==============================================================================
 // The loaded model: its Ort::Session plus the I/O names queried from the graph.
@@ -90,12 +139,13 @@ StemSeparator::StemSeparator (const ModelPaths& paths)
         ortEnv     = std::make_unique<Ort::Env> (ORT_LOGGING_LEVEL_WARNING, "StemSeparator");
         ortOptions = std::make_unique<Ort::SessionOptions>();
 
-        // Offline pass on a single below-realtime thread, so let ORT use all
-        // logical cores for intra-op parallelism (the conv/matmul-heavy htdemucs
-        // graph scales with cores). Capped at 16 as a sanity bound.
-        const int nThreads = (int) juce::jlimit (1u, 16u, std::thread::hardware_concurrency());
+        // Offline pass on a single below-realtime thread. On Apple Silicon this
+        // defaults to the performance-core count (see chooseIntraOpThreads); other
+        // platforms use all logical cores capped at 16. Tune via CUE_STEM_THREADS.
+        const int nThreads = chooseIntraOpThreads();
         ortOptions->SetIntraOpNumThreads (nThreads);
         ortOptions->SetGraphOptimizationLevel (GraphOptimizationLevel::ORT_ENABLE_ALL);
+        juce::Logger::writeToLog ("StemSeparator: intra-op threads = " + juce::String (nThreads));
 
 #if defined(__APPLE__)
         // CoreML is OFF by default for the stem models — pure CPU. Benchmarked
@@ -243,8 +293,11 @@ StemSeparator::Stems44 StemSeparator::runModel (const Model& model,
     if (L <= 0)
         return empty;
 
+    const double t0      = juce::Time::getMillisecondCounterHiRes();
+    const double overlap = resolveOverlap (kOverlap);
+
     const int seg    = kSegmentSamples;
-    const int stride = juce::jmax (1, (int) std::llround ((double) seg * (1.0 - kOverlap)));
+    const int stride = juce::jmax (1, (int) std::llround ((double) seg * (1.0 - overlap)));
 
     // Triangular overlap-add weight (Demucs, transition_power = 1): ramp 1..max
     // then max..1, normalized to a peak of 1.
@@ -362,6 +415,16 @@ StemSeparator::Stems44 StemSeparator::runModel (const Model& model,
                     d[i] = (float) ((double) d[i] / w);
             }
         }
+
+    // Field metric: wall-clock vs audio length, so EP/thread/overlap changes are
+    // always measurable from the log without external profiling.
+    const double elapsedSec = (juce::Time::getMillisecondCounterHiRes() - t0) / 1000.0;
+    const double audioSec   = (double) L / kModelSampleRate;
+    const double xRealtime  = elapsedSec > 1e-6 ? audioSec / elapsedSec : 0.0;
+    juce::Logger::writeToLog ("StemSeparator: " + juce::String (numSeg) + " seg, overlap "
+        + juce::String (overlap, 2) + " — " + juce::String (elapsedSec, 2) + " s wall for "
+        + juce::String (audioSec, 1) + " s audio (" + juce::String (xRealtime, 2) + "x realtime, "
+        + juce::String (xRealtime > 1e-6 ? 60.0 / xRealtime : 0.0, 1) + " s/min-of-audio)");
 
     return stems;
 }

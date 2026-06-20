@@ -86,9 +86,12 @@ public:
     static constexpr double kModelSampleRate = 44100.0;
     static constexpr int    kModelChannels   = 2;
     static constexpr int    kSegmentSamples  = 343980;  // 7.8 s @ 44.1 kHz
-    // Demucs default is 0.25; lowered to 0.10 to cut the segment count (~17%
-    // fewer inferences) for a small, generally inaudible boundary-quality cost.
-    static constexpr double kOverlap         = 0.10;
+    // Demucs default is 0.25; we ran 0.10, now default 0.0 (no overlap) for the
+    // fewest inferences. This is the compile-time fallback only — the live value
+    // is resolved from CUE_STEM_OVERLAP at runtime (clamped [0, 0.5]) so the
+    // speed/boundary-artifact trade can be dialled in by ear. Bump to ~0.05 if
+    // segment seams become audible.
+    static constexpr double kOverlap         = 0.0;
 
     // Standard Demucs source order in the model's [1,4,2,T] output. We keep
     // drums/bass/vocals; "other" (index 2) is recomputed by subtraction downstream.

@@ -5141,7 +5141,7 @@ public:
         // CUE/GAIN/PITCH live in the left bay, bounded on the right by the
         // centred CHOP @ TRANS button. Centre the cluster (3 knobs + 2 gaps)
         // both horizontally within that bay and vertically within the panel.
-        constexpr int knobGap = 52;
+        constexpr int knobGap = 20;
         const int clusterWidth = 3 * smallKnobDiameter + 2 * knobGap;
         const int chopTransientsX = (getWidth() - 148) / 2;
         const int knobRowX = (chopTransientsX - clusterWidth) / 2;
@@ -6024,7 +6024,8 @@ private:
 // progress meanwhile. Reads/writes the processor's setMute*/getMute* +
 // isSeparatingStems/areStemsReady/getStemProgress; refresh() is pumped by the
 // editor's 30 Hz timer.
-class StemRackComponent final : public juce::Component
+class StemRackComponent final : public juce::Component,
+                                private juce::Timer
 {
 public:
     explicit StemRackComponent (AudioPluginAudioProcessor& p)
@@ -6045,20 +6046,24 @@ public:
             addAndMakeVisible (b);
         };
 
+        // The toggle state represents the stem being ACTIVE (playing): LED lit =
+        // the stem plays, LED off = muted. So the light stays on while unmuted and
+        // turns off to mute. apply() inverts the toggle into the processor's mute flag.
         configureMute (bassBtn, "BASS",
-                       "Mute the BASS stem (removes it from playback). Lit = muted.",
-                       [this] (bool m) { processorRef.setMuteBass (m); });
+                       "BASS stem. Lit = playing — click to mute (removes it from playback).",
+                       [this] (bool active) { processorRef.setMuteBass (! active); });
         configureMute (drumsBtn, "DRUMS",
-                       "Mute the DRUMS stem (removes it from playback). Lit = muted.",
-                       [this] (bool m) { processorRef.setMuteDrums (m); });
+                       "DRUMS stem. Lit = playing — click to mute (removes it from playback).",
+                       [this] (bool active) { processorRef.setMuteDrums (! active); });
         configureMute (vocalsBtn, "VOCALS",
-                       "Mute the VOCALS stem (removes it from playback). Lit = muted.",
-                       [this] (bool m) { processorRef.setMuteVocals (m); });
+                       "VOCALS stem. Lit = playing — click to mute (removes it from playback).",
+                       [this] (bool active) { processorRef.setMuteVocals (! active); });
 
-        // Initialise toggle states from the processor (state recall).
-        bassBtn.setToggleState (processorRef.getMuteBass(),   juce::dontSendNotification);
-        drumsBtn.setToggleState (processorRef.getMuteDrums(), juce::dontSendNotification);
-        vocalsBtn.setToggleState (processorRef.getMuteVocals(), juce::dontSendNotification);
+        // Initialise toggle states from the processor (state recall). Inverted:
+        // a stem that is NOT muted shows its LED lit.
+        bassBtn.setToggleState (! processorRef.getMuteBass(),   juce::dontSendNotification);
+        drumsBtn.setToggleState (! processorRef.getMuteDrums(), juce::dontSendNotification);
+        vocalsBtn.setToggleState (! processorRef.getMuteVocals(), juce::dontSendNotification);
 
         lastReady = ! processorRef.areStemsReady(); // force the first refresh to apply
         refresh();
@@ -6073,10 +6078,11 @@ public:
         const float progress   = processorRef.getStemProgress();
 
         // Keep toggles in sync with the processor (state restore, fresh-load reset)
-        // without firing onClick. setToggleState no-ops when unchanged.
-        bassBtn.setToggleState (processorRef.getMuteBass(),   juce::dontSendNotification);
-        drumsBtn.setToggleState (processorRef.getMuteDrums(), juce::dontSendNotification);
-        vocalsBtn.setToggleState (processorRef.getMuteVocals(), juce::dontSendNotification);
+        // without firing onClick. setToggleState no-ops when unchanged. Inverted:
+        // lit = NOT muted (the stem is playing).
+        bassBtn.setToggleState (! processorRef.getMuteBass(),   juce::dontSendNotification);
+        drumsBtn.setToggleState (! processorRef.getMuteDrums(), juce::dontSendNotification);
+        vocalsBtn.setToggleState (! processorRef.getMuteVocals(), juce::dontSendNotification);
 
         if (ready != lastReady)
         {
@@ -6088,6 +6094,27 @@ public:
             lastReady = ready;
         }
 
+        // Drive the running progress animation: store the real target and start/stop
+        // the internal smoothing timer as separation begins/ends. Easing of the
+        // visible fill and the shimmer sweep happen in timerCallback().
+        targetProgress = juce::jlimit (0.0f, 1.0f, progress);
+        if (separating != separatingNow)
+        {
+            separatingNow = separating;
+            if (separating)
+            {
+                displayProgress = targetProgress; // begin from the current value
+                sweepPhase      = 0.0f;
+                animHz          = animationFrameRateHz();
+                startTimerHz (animHz);
+            }
+            else
+            {
+                stopTimer();
+                repaint();
+            }
+        }
+
         juce::String text;
         juce::Colour colour;
         if (! processorRef.areStemModelsAvailable())
@@ -6097,7 +6124,7 @@ public:
         }
         else if (separating)
         {
-            text = "SEPARATING " + juce::String (juce::roundToInt (juce::jlimit (0.0f, 1.0f, progress) * 100.0f)) + "%";
+            text   = "SEPARATING"; // live % and bar are drawn in paint() from displayProgress
             colour = accentOrange;
         }
         else if (ready)
@@ -6124,6 +6151,22 @@ public:
         }
     }
 
+    // Internal pump, live only while separating: eases the visible fill toward the
+    // real progress (so chunky per-segment jumps read as one smooth climb) and
+    // advances the shimmer sweep so the bar always looks alive.
+    void timerCallback() override
+    {
+        displayProgress += (targetProgress - displayProgress) * frameRateLerp (0.16f, animHz);
+        if (std::abs (targetProgress - displayProgress) < 0.0005f)
+            displayProgress = targetProgress;
+
+        sweepPhase += frameRateStep (0.015f, animHz); // ~0.9 sweeps/sec at 60 Hz
+        if (sweepPhase >= 1.0f)
+            sweepPhase -= 1.0f;
+
+        repaint (0, 0, 250, getHeight()); // only the title/status/progress column
+    }
+
     void paint (juce::Graphics& g) override
     {
         auto bounds = getLocalBounds().toFloat();
@@ -6139,9 +6182,69 @@ public:
         g.setFont (heavyFont (14.0f).withExtraKerningFactor (0.10f));
         g.drawText ("STEMS", juce::Rectangle<int> (26, 13, 200, 24), juce::Justification::centredLeft);
 
+        if (separatingNow)
+        {
+            paintProgress (g);
+            return;
+        }
+
         g.setColour (statusColour);
         g.setFont (heavyFont (9.5f).withExtraKerningFactor (0.06f));
         g.drawText (statusText, juce::Rectangle<int> (27, 39, 210, 18), juce::Justification::centredLeft);
+    }
+
+    // The "running" loading state: a smoothly-easing orange fill with a moving
+    // shimmer sweep, plus a live percentage that counts up alongside the fill.
+    void paintProgress (juce::Graphics& g)
+    {
+        const float p   = juce::jlimit (0.0f, 1.0f, displayProgress);
+        const int   pct = juce::roundToInt (p * 100.0f);
+
+        // Label row: "SEPARATING" on the left, live % right-aligned over the bar.
+        g.setFont (heavyFont (9.5f).withExtraKerningFactor (0.06f));
+        g.setColour (accentOrange);
+        g.drawText ("SEPARATING", juce::Rectangle<int> (27, 37, 160, 15), juce::Justification::centredLeft);
+        g.setColour (textPrimary);
+        g.drawText (juce::String (pct) + "%", juce::Rectangle<int> (27, 37, 210, 15), juce::Justification::centredRight);
+
+        // Recessed track.
+        const juce::Rectangle<float> track (27.0f, 56.0f, 210.0f, 5.0f);
+        const float r = track.getHeight() * 0.5f;
+        g.setColour (juce::Colours::black.withAlpha (0.45f));
+        g.fillRoundedRectangle (track, r);
+        g.setColour (juce::Colours::white.withAlpha (0.05f));
+        g.drawRoundedRectangle (track, r, 1.0f);
+
+        // Determinate fill + shimmer, clipped to the rounded track so corners stay
+        // clean and the sweep never spills past the ends.
+        const float fillW = track.getWidth() * p;
+        if (fillW > 0.5f)
+        {
+            juce::Graphics::ScopedSaveState ss (g);
+            juce::Path clip;
+            clip.addRoundedRectangle (track, r);
+            g.reduceClipRegion (clip);
+
+            auto fill = track.withWidth (fillW);
+            juce::ColourGradient fillGrad (accentOrange.brighter (0.20f), fill.getX(), fill.getY(),
+                                           accentOrange.darker (0.12f),  fill.getX(), fill.getBottom(), false);
+            g.setGradientFill (fillGrad);
+            g.fillRect (fill);
+
+            // Brighter leading edge.
+            g.setColour (accentOrange.brighter (0.5f).withAlpha (0.9f));
+            g.fillRect (juce::Rectangle<float> (fill.getRight() - 2.0f, fill.getY(), 2.0f, fill.getHeight()));
+
+            // Moving highlight sweep along the filled portion.
+            const float sweepW = 48.0f;
+            const float sx     = -sweepW + (fillW + sweepW) * sweepPhase;
+            juce::Rectangle<float> sweepR (track.getX() + sx, track.getY(), sweepW, track.getHeight());
+            juce::ColourGradient sweepGrad (juce::Colours::white.withAlpha (0.0f), sweepR.getX(),     sweepR.getCentreY(),
+                                            juce::Colours::white.withAlpha (0.0f), sweepR.getRight(), sweepR.getCentreY(), false);
+            sweepGrad.addColour (0.5, juce::Colours::white.withAlpha (0.30f));
+            g.setGradientFill (sweepGrad);
+            g.fillRect (sweepR);
+        }
     }
 
     void resized() override
@@ -6161,6 +6264,13 @@ private:
     juce::String statusText;
     juce::Colour statusColour { glassTextMuted };
     bool lastReady = false;
+
+    // Running-progress animation state (driven by the internal Timer while separating).
+    bool  separatingNow   = false;
+    float targetProgress  = 0.0f; // real progress reported by the processor [0,1]
+    float displayProgress = 0.0f; // eased value actually drawn
+    float sweepPhase      = 0.0f; // 0..1 position of the moving shimmer highlight
+    int   animHz          = 60;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StemRackComponent)
 };
