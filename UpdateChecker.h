@@ -13,8 +13,9 @@ namespace cuesampler
 
 // Checks GitHub Releases for a newer build and surfaces a download link in the
 // editor. A loaded plugin binary cannot replace itself while a DAW holds it
-// open, so "update" here means: tell the user, then hand off to the notarized
-// .pkg in the browser. The actual swap happens after they quit the host.
+// open, so "update" here means: tell the user, then hand off to the platform
+// installer in the browser (Windows .exe / macOS notarized .pkg). The actual
+// swap happens after they quit the host and run the installer.
 //
 // Source of truth for "what's newest" is the GitHub API endpoint:
 //   https://api.github.com/repos/<owner>/<repo>/releases/latest
@@ -36,7 +37,7 @@ public:
     {
         bool         available = false;   // a newer, non-skipped version exists
         juce::String latestVersion;        // e.g. "0.1.0" (leading 'v' stripped)
-        juce::String downloadUrl;          // direct .pkg asset, when present
+        juce::String downloadUrl;          // direct installer for this OS (.exe / .pkg), when present
         juce::String pageUrl;              // release html page (notes / fallback)
         juce::String notes;                // release body text
     };

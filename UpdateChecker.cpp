@@ -116,20 +116,34 @@ void UpdateChecker::performCheck()
     r.pageUrl       = obj->getProperty ("html_url").toString();
     r.notes         = obj->getProperty ("body").toString();
 
-    // Prefer a direct .pkg asset so the button starts the download immediately;
-    // fall back to the release page when no .pkg is attached.
+    // Prefer a direct installer asset FOR THIS PLATFORM so the button starts the
+    // download immediately; fall back to the release page when none is attached.
+    // Windows ships a .exe (Inno Setup), macOS a notarized .pkg. Note ".exe" does
+    // not match the ".exe.sha256" checksum sidecar, so the picker grabs the
+    // installer, not its hash file.
+   #if JUCE_WINDOWS
+    const char* const installerExt = ".exe";
+   #elif JUCE_MAC
+    const char* const installerExt = ".pkg";
+   #else
+    const char* const installerExt = nullptr;
+   #endif
+
     const auto assets = obj->getProperty ("assets");
-    if (auto* arr = assets.getArray())
+    if (installerExt != nullptr)
     {
-        for (const auto& a : *arr)
+        if (auto* arr = assets.getArray())
         {
-            if (auto* ao = a.getDynamicObject())
+            for (const auto& a : *arr)
             {
-                const auto name = ao->getProperty ("name").toString();
-                if (name.endsWithIgnoreCase (".pkg"))
+                if (auto* ao = a.getDynamicObject())
                 {
-                    r.downloadUrl = ao->getProperty ("browser_download_url").toString();
-                    break;
+                    const auto name = ao->getProperty ("name").toString();
+                    if (name.endsWithIgnoreCase (installerExt))
+                    {
+                        r.downloadUrl = ao->getProperty ("browser_download_url").toString();
+                        break;
+                    }
                 }
             }
         }

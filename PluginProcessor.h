@@ -226,14 +226,26 @@ public:
     bool getMuteBass()   const noexcept { return muteBass.load (std::memory_order_acquire); }
     bool getMuteVocals() const noexcept { return muteVocals.load (std::memory_order_acquire); }
 
+    // Manually start a stem-separation pass on the currently-loaded sample. The
+    // STEMS button in the editor calls this. Stem separation is NOT automatic:
+    // the heavy ONNX model is loaded lazily on the first request (off the message
+    // thread) so simply instantiating the plugin in a host stays fast. No-op if
+    // no sample is loaded or no model is installed.
+    void requestStemSeparation();
+
     // True while a background separation pass is running; true once the three
     // stems exist for the current sample; [0,1] progress of the running pass.
     bool  isSeparatingStems() const noexcept { return stemSeparationInProgress.load (std::memory_order_acquire); }
     bool  areStemsReady()     const noexcept { return stemsReady.load (std::memory_order_acquire); }
     float getStemProgress()   const noexcept { return stemProgress.load (std::memory_order_acquire); }
-    // True if the htdemucs_ft models loaded — lets the UI distinguish "no model
-    // installed" from an idle/too-long state. Skipped == separation bypassed
-    // because the sample exceeds kMaxStemSeparationSeconds.
+    // True while the ONNX session is being built on the stem thread (the one-time
+    // cost paid on the first separation request). Lets the UI show a "preparing"
+    // hint before per-segment progress starts moving.
+    bool  isLoadingStemModel() const noexcept { return stemModelLoading.load (std::memory_order_acquire); }
+    // True if an htdemucs model file is installed AND its session hasn't failed to
+    // build — lets the UI distinguish "no model installed" from an idle/too-long
+    // state, and enables the STEMS button. Skipped == separation bypassed because
+    // the sample exceeds kMaxStemSeparationSeconds.
     bool  areStemModelsAvailable() const noexcept;
     bool  wasStemSeparationSkipped() const noexcept { return stemSeparationSkipped.load (std::memory_order_acquire); }
 
@@ -576,6 +588,14 @@ private:
     std::atomic<bool>  stemSeparationSkipped { false }; // sample exceeded the length guard
     std::atomic<float> stemProgress { 0.0f };
     std::atomic<int>   appliedStemMask { -1 };
+    // Resolved once in the constructor (cheap path probe); empty when no htdemucs
+    // model file is installed. Never mutated afterwards, so it is safe to read
+    // from both the message thread (areStemModelsAvailable) and the stem thread
+    // (ensureStemSeparatorLoaded) without a lock. The StemSeparator/ONNX session
+    // itself is built lazily from this path on the first separation request.
+    juce::String       stemModelPath;
+    std::atomic<bool>  stemModelLoading { false };    // session being built on the stem thread
+    std::atomic<bool>  stemModelLoadFailed { false }; // model file present but session build failed
     // Samples longer than this skip separation (avoids huge RAM/time on full songs).
     static constexpr double kMaxStemSeparationSeconds = 600.0; // 10 minutes
     std::atomic<uint64_t> tempoUiRevision { 0 };
@@ -633,7 +653,15 @@ private:
     // pass; publishStems installs the result (generation-guarded) and applies any
     // active mutes; rebuildActiveMix swaps loadedSample to original − Σ(muted);
     // scheduleRebuildActiveMix posts a coalesced rebuild off the message thread.
+    // resetStemState clears stems/flags WITHOUT launching a pass — used when a new
+    // sample loads (separation is now user-initiated via requestStemSeparation).
+    void resetStemState();
     void launchStemSeparation (std::shared_ptr<LoadedSampleData> sampleData);
+    // Builds the StemSeparator/ONNX session on first use. MUST be called from the
+    // stem thread (single-threaded pool): the model build + probe is the heavy,
+    // deferred cost. Returns the ready separator, or nullptr if no model is
+    // installed or the session failed to build.
+    StemSeparator* ensureStemSeparatorLoaded();
     void publishStems (std::shared_ptr<const StemSet> newStemSet, uint64_t generation);
     void rebuildActiveMix();
     void scheduleRebuildActiveMix();

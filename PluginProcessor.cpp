@@ -1698,9 +1698,12 @@ public:
         if (shouldExit() || sampleData == nullptr)
             return jobHasFinished;
 
-        if (owner.stemSeparator == nullptr || ! owner.stemSeparator->isReady())
+        // Lazily build the ONNX session on first use (this thread). The one-time
+        // model build + probe is the heavy cost we deferred out of the constructor.
+        auto* separator = owner.ensureStemSeparatorLoaded();
+        if (separator == nullptr)
         {
-            owner.publishStems (nullptr, generation); // no models → stay on original
+            owner.publishStems (nullptr, generation); // no model / build failed → stay on original
             return jobHasFinished;
         }
 
@@ -1715,9 +1718,9 @@ public:
                 owner.stemProgress.store (juce::jlimit (0.0f, 1.0f, f), std::memory_order_release);
         };
 
-        const auto result = owner.stemSeparator->separate (sampleData->buffer,
-                                                            sampleData->sampleRate,
-                                                            onProgress, stale);
+        const auto result = separator->separate (sampleData->buffer,
+                                                 sampleData->sampleRate,
+                                                 onProgress, stale);
 
         if (stale())
             return jobHasFinished;
@@ -2177,13 +2180,17 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
         return {};
     };
 
+    // DEFERRED LOAD: only resolve the model PATH here (cheap file probes). Building
+    // the StemSeparator constructs the ONNX session and runs a full forward-pass
+    // probe — several seconds, and on a budget GPU it builds twice (GPU then CPU
+    // fallback). Doing that in the constructor stalled host plugin-instantiation,
+    // so the session is now built lazily on the first STEMS request (see
+    // ensureStemSeparatorLoaded, run on the stem thread).
     if (const auto stemModelFile = findStemModel(); stemModelFile != juce::File())
     {
-        StemSeparator::ModelPaths paths;
-        paths.model = stemModelFile.getFullPathName();
-        stemSeparator = std::make_unique<StemSeparator> (paths);
-        juce::Logger::writeToLog ("StemSeparator: model at " + stemModelFile.getFullPathName()
-                                  + " ready=" + juce::String (stemSeparator->isReady() ? "YES" : "NO"));
+        stemModelPath = stemModelFile.getFullPathName();
+        juce::Logger::writeToLog ("StemSeparator: model found at " + stemModelPath
+                                  + " (deferred — session built on first STEMS request)");
     }
     else
     {
@@ -3692,9 +3699,10 @@ void AudioPluginAudioProcessor::completeDeferredSampleRestore (const DeferredRes
     else
         touchTempoUiRevision();
 
-    // Re-separate on restore (stem audio is never serialized). The mute flags were
-    // already restored in applyParsedRestoreState; they apply once stems publish.
-    launchStemSeparation (restoredSample);
+    // Stem audio is never serialized. Separation is user-initiated now (STEMS
+    // button), so just clear stem state — don't auto-run a pass on restore. The
+    // restored mute flags are preserved and take effect once the user re-separates.
+    resetStemState();
 
     // Restored chops may carry warp markers — re-bake those entries.
     if (const auto restoredState = std::atomic_load (&chopState); restoredState != nullptr)
@@ -3877,12 +3885,12 @@ void AudioPluginAudioProcessor::loadAudioFile (const juce::File& file)
 
         launchTempoAnalysis (sampleData);
 
-        // A fresh sample starts unmuted; launchStemSeparation clears stem state and
-        // kicks the background pass (mutes apply automatically once stems publish).
+        // A fresh sample starts unmuted. Separation is user-initiated (STEMS
+        // button) now, so just clear any prior stem state — don't auto-run a pass.
         muteDrums.store (false, std::memory_order_release);
         muteBass.store (false, std::memory_order_release);
         muteVocals.store (false, std::memory_order_release);
-        launchStemSeparation (sampleData);
+        resetStemState();
 
         const auto keyGeneration = keyDetectionGeneration.fetch_add (1, std::memory_order_acq_rel) + 1;
         keyDetectionThreadPool.removeAllJobs (false, 0);
@@ -5000,25 +5008,74 @@ void AudioPluginAudioProcessor::publishTempoAnalysis (std::shared_ptr<TempoAnaly
 
 //==============================================================================
 // Stem separation — mirrors the launchTempoAnalysis / publishTempoAnalysis pair.
-void AudioPluginAudioProcessor::launchStemSeparation (std::shared_ptr<LoadedSampleData> sampleData)
+void AudioPluginAudioProcessor::resetStemState()
 {
     // Abandon any in-flight separation / queued remix for the previous sample and
     // reset stem state. appliedStemMask = -1 marks loadedSample as the raw original.
+    // Does NOT touch the mute flags (restore preserves them) and does NOT launch a
+    // pass — separation is user-initiated via requestStemSeparation().
     stemThreadPool.removeAllJobs (false, 0);
     std::atomic_store (&stemSet, std::shared_ptr<const StemSet> {});
     stemsReady.store (false, std::memory_order_release);
+    stemSeparationInProgress.store (false, std::memory_order_release);
     stemProgress.store (0.0f, std::memory_order_release);
     stemSeparationSkipped.store (false, std::memory_order_release);
     appliedStemMask.store (-1, std::memory_order_release);
+}
 
-    // No separator (models missing / failed) → behave exactly as before: original
-    // plays, mutes stay disabled.
-    if (stemSeparator == nullptr || ! stemSeparator->isReady()
+StemSeparator* AudioPluginAudioProcessor::ensureStemSeparatorLoaded()
+{
+    // Stem-thread only (single-threaded pool), so no lock is needed around the
+    // one-time build. Already built → return it (or nullptr if it failed before).
+    if (stemSeparator != nullptr)
+        return stemSeparator->isReady() ? stemSeparator.get() : nullptr;
+
+    if (stemModelPath.isEmpty())
+        return nullptr;
+
+    stemModelLoading.store (true, std::memory_order_release);
+    juce::Logger::writeToLog ("StemSeparator: building ONNX session on first request…");
+
+    StemSeparator::ModelPaths paths;
+    paths.model = stemModelPath;
+    auto built = std::make_unique<StemSeparator> (paths);
+    const bool ok = built->isReady();
+
+    stemSeparator = std::move (built);
+    stemModelLoadFailed.store (! ok, std::memory_order_release);
+    stemModelLoading.store (false, std::memory_order_release);
+
+    juce::Logger::writeToLog ("StemSeparator: session build "
+        + juce::String (ok ? "succeeded" : "FAILED"));
+
+    return ok ? stemSeparator.get() : nullptr;
+}
+
+void AudioPluginAudioProcessor::requestStemSeparation()
+{
+    // Message-thread entry point for the STEMS button. Separate the pristine
+    // original currently loaded: once stems exist, stemSet->source holds it;
+    // otherwise loadedSample is the raw original (appliedStemMask == -1).
+    std::shared_ptr<LoadedSampleData> original;
+    if (const auto stems = std::atomic_load (&stemSet); stems != nullptr && stems->source != nullptr)
+        original = stems->source;
+    else
+        original = std::atomic_load (&loadedSample);
+
+    launchStemSeparation (std::move (original));
+}
+
+void AudioPluginAudioProcessor::launchStemSeparation (std::shared_ptr<LoadedSampleData> sampleData)
+{
+    resetStemState();
+
+    // No model installed, or nothing to separate → behave as before: original
+    // plays, mutes stay disabled. The session is built lazily inside the job.
+    if (stemModelPath.isEmpty()
         || sampleData == nullptr || sampleData->buffer.getNumSamples() <= 0)
     {
-        stemSeparationInProgress.store (false, std::memory_order_release);
-        if (stemSeparator == nullptr || ! stemSeparator->isReady())
-            juce::Logger::writeToLog ("StemSeparator: separation unavailable (models not ready)");
+        if (stemModelPath.isEmpty())
+            juce::Logger::writeToLog ("StemSeparator: separation unavailable (no model installed)");
         return;
     }
 
@@ -5029,7 +5086,6 @@ void AudioPluginAudioProcessor::launchStemSeparation (std::shared_ptr<LoadedSamp
         : 0.0;
     if (durationSeconds > kMaxStemSeparationSeconds)
     {
-        stemSeparationInProgress.store (false, std::memory_order_release);
         stemSeparationSkipped.store (true, std::memory_order_release);
         juce::Logger::writeToLog ("StemSeparator: sample too long ("
             + juce::String (durationSeconds, 1) + "s > "
@@ -5167,7 +5223,11 @@ void AudioPluginAudioProcessor::setMuteVocals (bool shouldMute) noexcept
 
 bool AudioPluginAudioProcessor::areStemModelsAvailable() const noexcept
 {
-    return stemSeparator != nullptr && stemSeparator->isReady();
+    // A model file is installed and its session hasn't failed to build. The session
+    // is built lazily on the first request, so before that we report availability
+    // from the resolved path alone (stemModelPath is set once at construction and
+    // never mutated, so this is safe to read from the message thread).
+    return stemModelPath.isNotEmpty() && ! stemModelLoadFailed.load (std::memory_order_acquire);
 }
 
 void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData& analysis)

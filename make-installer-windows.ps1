@@ -28,14 +28,11 @@ if (Test-Path "EULA.md") {
 }
 
 # --- 2. Verify Release Build Artifacts Exist ---
+# VST3-only release: the standalone app is intentionally NOT shipped in the installer.
 $vst3Path = Join-Path $BuildDir "CueSampler_artefacts\Release\VST3\CUE SAMPLER.vst3"
-$standalonePath = Join-Path $BuildDir "CueSampler_artefacts\Release\Standalone\CUE SAMPLER.exe"
 
 if (-not (Test-Path $vst3Path)) {
     Write-Error "Required VST3 binary not found at: $vst3Path`nPlease build the CueSampler_VST3 target in Release mode first."
-}
-if (-not (Test-Path $standalonePath)) {
-    Write-Error "Required Standalone binary not found at: $standalonePath`nPlease build the CueSampler_Standalone target in Release mode first."
 }
 
 # --- 3. Locate Inno Setup Compiler (ISCC.exe) ---

@@ -6065,6 +6065,18 @@ public:
         drumsBtn.setToggleState (! processorRef.getMuteDrums(), juce::dontSendNotification);
         vocalsBtn.setToggleState (! processorRef.getMuteVocals(), juce::dontSendNotification);
 
+        // Manual trigger: separation no longer runs automatically on load (kept the
+        // plugin fast to instantiate). One click splits the loaded sample; the heavy
+        // ONNX model is built lazily on this first request, off the message thread.
+        // Visibility is state-driven in refresh() — it sits in the info column and is
+        // hidden while separating, once stems are ready, or when no model is installed.
+        configureButton (separateButton, "SEPARATE", textPrimary.withAlpha (0.9f));
+        separateButton.getProperties().set ("cueStyle", "flatAction");
+        separateButton.setTooltip ("Split this sample into DRUMS / BASS / VOCALS stems so you can mute each one. "
+                                   "Runs in the background - the first run takes a few extra seconds while the model loads.");
+        separateButton.onClick = [this] { processorRef.requestStemSeparation(); };
+        addChildComponent (separateButton); // visibility managed in refresh()
+
         lastReady = ! processorRef.areStemsReady(); // force the first refresh to apply
         refresh();
     }
@@ -6076,6 +6088,18 @@ public:
         const bool  ready      = processorRef.areStemsReady();
         const bool  separating = processorRef.isSeparatingStems();
         const float progress   = processorRef.getStemProgress();
+
+        // Show the manual SEPARATE trigger only when it can actually do something:
+        // a model is installed, a sample is loaded, and we're idle (no stems yet,
+        // not already running, and the sample wasn't rejected as too long). The
+        // status line is empty in exactly this state, so the button replaces it.
+        loadingModel = processorRef.isLoadingStemModel();
+        const bool showSeparate = processorRef.areStemModelsAvailable()
+                               && processorRef.getLoadedSample() != nullptr
+                               && ! ready && ! separating
+                               && ! processorRef.wasStemSeparationSkipped();
+        if (showSeparate != separateButton.isVisible())
+            separateButton.setVisible (showSeparate);
 
         // Keep toggles in sync with the processor (state restore, fresh-load reset)
         // without firing onClick. setToggleState no-ops when unchanged. Inverted:
@@ -6200,12 +6224,18 @@ public:
         const float p   = juce::jlimit (0.0f, 1.0f, displayProgress);
         const int   pct = juce::roundToInt (p * 100.0f);
 
-        // Label row: "SEPARATING" on the left, live % right-aligned over the bar.
+        // Label row: state on the left, live % right-aligned over the bar. While the
+        // model is still building there is no real progress, so it reads "PREPARING"
+        // with no percentage.
         g.setFont (heavyFont (9.5f).withExtraKerningFactor (0.06f));
         g.setColour (accentOrange);
-        g.drawText ("SEPARATING", juce::Rectangle<int> (27, 37, 160, 15), juce::Justification::centredLeft);
-        g.setColour (textPrimary);
-        g.drawText (juce::String (pct) + "%", juce::Rectangle<int> (27, 37, 210, 15), juce::Justification::centredRight);
+        g.drawText (loadingModel ? "PREPARING MODEL" : "SEPARATING",
+                    juce::Rectangle<int> (27, 37, 200, 15), juce::Justification::centredLeft);
+        if (! loadingModel)
+        {
+            g.setColour (textPrimary);
+            g.drawText (juce::String (pct) + "%", juce::Rectangle<int> (27, 37, 210, 15), juce::Justification::centredRight);
+        }
 
         // Recessed track.
         const juce::Rectangle<float> track (27.0f, 56.0f, 210.0f, 5.0f);
@@ -6214,6 +6244,27 @@ public:
         g.fillRoundedRectangle (track, r);
         g.setColour (juce::Colours::white.withAlpha (0.05f));
         g.drawRoundedRectangle (track, r, 1.0f);
+
+        // Model-load phase: no determinate value yet, so sweep an indeterminate
+        // highlight across the whole track (gated determinate fill below would draw
+        // nothing at 0% and look frozen during the multi-second build).
+        if (loadingModel)
+        {
+            juce::Graphics::ScopedSaveState ss (g);
+            juce::Path clip;
+            clip.addRoundedRectangle (track, r);
+            g.reduceClipRegion (clip);
+
+            const float sweepW = 70.0f;
+            const float sx     = -sweepW + (track.getWidth() + sweepW) * sweepPhase;
+            juce::Rectangle<float> sweepR (track.getX() + sx, track.getY(), sweepW, track.getHeight());
+            juce::ColourGradient grad (accentOrange.withAlpha (0.0f), sweepR.getX(),     sweepR.getCentreY(),
+                                       accentOrange.withAlpha (0.0f), sweepR.getRight(), sweepR.getCentreY(), false);
+            grad.addColour (0.5, accentOrange.withAlpha (0.85f));
+            g.setGradientFill (grad);
+            g.fillRect (sweepR);
+            return;
+        }
 
         // Determinate fill + shimmer, clipped to the rounded track so corners stay
         // clean and the sweep never spills past the ends.
@@ -6256,14 +6307,20 @@ public:
         bassBtn.setBounds   (leftEdge,                   y, w, h);
         drumsBtn.setBounds  (leftEdge + (w + gap),       y, w, h);
         vocalsBtn.setBounds (leftEdge + 2 * (w + gap),   y, w, h);
+
+        // Info column, just below the "STEMS" title (shares the row with the status
+        // line / progress bar, which are hidden whenever the button is shown).
+        separateButton.setBounds (27, 37, 158, 25);
     }
 
 private:
     AudioPluginAudioProcessor& processorRef;
     SmoothAnimatedSwitchButton bassBtn, drumsBtn, vocalsBtn;
+    juce::TextButton separateButton; // manual trigger; visibility managed in refresh()
     juce::String statusText;
     juce::Colour statusColour { glassTextMuted };
     bool lastReady = false;
+    bool loadingModel = false; // ONNX session building on first request (indeterminate bar)
 
     // Running-progress animation state (driven by the internal Timer while separating).
     bool  separatingNow   = false;
