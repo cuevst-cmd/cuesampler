@@ -57,6 +57,12 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
+      - name: Build Installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          .\make-installer-windows.ps1 -Version "1.0.0" -BuildDir "build"
+
       - name: List build artefacts
         shell: bash
         run: find build/CueSampler_artefacts -maxdepth 4 -name "*.vst3" -o -name "*.component" -o -name "*.exe" -o -name "*.app" 2>/dev/null || true
@@ -70,3 +76,4 @@ jobs:
             build/CueSampler_artefacts/Release/VST3/**
             build/CueSampler_artefacts/Release/AU/**
             build/CueSampler_artefacts/Release/Standalone/**
+            dist/**

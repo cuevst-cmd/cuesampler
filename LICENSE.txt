@@ -1,4 +1,4 @@
-CUE SAMPLER — End User License Agreement (EULA)
+﻿CUE SAMPLER â€” End User License Agreement (EULA)
 
 Last updated: May 31, 2026
 
@@ -93,4 +93,5 @@ Website: https://cuesampler.com
 
 ---
 
-By installing or using CUE SAMPLER, you acknowledge that you have read, understood, and agree to be bound by this Agreement.
+*By installing or using CUE SAMPLER, you acknowledge that you have read, understood, and agree to be bound by this Agreement.*
+
