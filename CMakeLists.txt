@@ -69,24 +69,67 @@ FetchContent_Declare(bungee
         -P ${CMAKE_CURRENT_SOURCE_DIR}/patches/apply_bungee_patch.cmake)
 FetchContent_MakeAvailable(bungee)
 
+# ── Windows/MSVC: make pristine Bungee + pffft compile under cl.exe ────────────
+# Upstream Bungee assumes a GCC/Clang + POSIX toolchain in three spots the MSVC
+# build trips over:
+#   * src/Assert.cpp           — #include <unistd.h>     (POSIX-only; used only
+#                                by the disabled BUNGEE_PETRIFY path)
+#   * src/Resample.h           — __attribute__((noinline)) (GCC/Clang attribute)
+#   * submodules/pffft/pffft.c — __builtin_prefetch()    (GCC/Clang builtin, used
+#                                outside pffft's own MSVC macro path)
+# Rather than fork Bungee, we put an empty <unistd.h> stub on the include path
+# and force-include a shim that no-ops __attribute__ and __builtin_prefetch
+# (both are hints — dropping them is correctness-neutral). Applied only to the
+# Bungee targets, only on MSVC, so macOS/Linux are untouched. Keeps us pinned to
+# pristine upstream (plus the stream-reset patch).
+if(WIN32 AND MSVC)
+    set(_bungee_win_compat "${CMAKE_CURRENT_SOURCE_DIR}/cmake/win-compat")
+    foreach(_btgt bungee_library pffft)
+        if(TARGET ${_btgt})
+            target_include_directories(${_btgt} PRIVATE "${_bungee_win_compat}")
+            target_compile_options(${_btgt} PRIVATE "/FI${_bungee_win_compat}/bungee_msvc_shim.h")
+        endif()
+    endforeach()
+endif()
+
 # ONNX Runtime 1.20.1 — official prebuilt package, downloaded per-platform.
 # Not committed to the repo (binaries are gitignored). The archive has no
 # CMakeLists.txt, so FetchContent_MakeAvailable just populates it.
+#
+# macOS uses the GitHub CPU build (CoreML is off by default — see StemSeparator).
+# Windows uses the DirectML-enabled NuGet build instead of the GitHub CPU zip so
+# the htdemucs stem pass can run on any DX12 GPU (NVIDIA/AMD/Intel), ~10x faster
+# than the CPU path. The NuGet packages are zips with a different internal layout
+# (headers under build/native/include, lib+dll under runtimes/win-x64/native);
+# DOWNLOAD_NAME gives each .nupkg a .zip extension so FetchContent extracts it.
+# onnxruntime 1.20.1's DML EP needs the matching DirectML 1.15.2 redistributable,
+# shipped as its own NuGet (Microsoft.AI.DirectML) — staged next to the DLL below.
 if(APPLE)
     FetchContent_Declare(onnxruntime
         URL https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-osx-universal2-1.20.1.tgz
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    FetchContent_MakeAvailable(onnxruntime)
 elseif(WIN32)
     FetchContent_Declare(onnxruntime
-        URL https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-win-x64-1.20.1.zip
+        URL https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/1.20.1
+        DOWNLOAD_NAME onnxruntime-directml-1.20.1.zip
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    FetchContent_Declare(directml
+        URL https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/1.15.2
+        DOWNLOAD_NAME directml-1.15.2.zip
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    FetchContent_MakeAvailable(onnxruntime directml)
 endif()
-FetchContent_MakeAvailable(onnxruntime)
+
 set(ONNXRUNTIME_ROOT "${onnxruntime_SOURCE_DIR}")
 if(APPLE)
-    set(ORT_LINK_LIB "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.1.20.1.dylib")
+    set(ORT_INCLUDE_DIR "${ONNXRUNTIME_ROOT}/include")
+    set(ORT_LINK_LIB    "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.1.20.1.dylib")
 elseif(WIN32)
-    set(ORT_LINK_LIB "${ONNXRUNTIME_ROOT}/lib/onnxruntime.lib")
+    set(ORT_INCLUDE_DIR "${ONNXRUNTIME_ROOT}/build/native/include")
+    set(ORT_LINK_LIB    "${ONNXRUNTIME_ROOT}/runtimes/win-x64/native/onnxruntime.lib")
+    set(ORT_RUNTIME_DLL "${ONNXRUNTIME_ROOT}/runtimes/win-x64/native/onnxruntime.dll")
+    set(DIRECTML_DLL    "${directml_SOURCE_DIR}/bin/x64-win/DirectML.dll")
 endif()
 
 # If you are building a VST2 or AAX plugin, CMake needs to be told where to find these SDKs on your
@@ -165,6 +208,15 @@ target_compile_definitions(CueSampler
         # newest GitHub Release). Single source of truth: project(... VERSION).
         CUE_VERSION_STRING="${PROJECT_VERSION}")
 
+# chromaprint.h declares its API as __declspec(dllimport) on Windows unless
+# CHROMAPRINT_NODLL is defined. We link chromaprint as a STATIC library, so
+# without this the linker looks for __imp_chromaprint_* (DLL-import symbols)
+# that the static .lib doesn't contain → LNK2019. Define it on Windows only;
+# the non-Windows header path uses visibility attributes and is unaffected.
+if(WIN32)
+    target_compile_definitions(CueSampler PRIVATE CHROMAPRINT_NODLL)
+endif()
+
 # If your target needs extra binary assets, you can add them here. The first argument is the name of
 # a new static library target that will include all the binary resources. There is an optional
 # `NAMESPACE` argument that can specify the namespace of the generated binary data class. Finally,
@@ -205,7 +257,7 @@ target_include_directories(CueSampler
         "${bungee_SOURCE_DIR}"
         "${bungee_SOURCE_DIR}/submodules/eigen"
         "${chromaprint_SOURCE_DIR}/src"
-        "${ONNXRUNTIME_ROOT}/include")
+        "${ORT_INCLUDE_DIR}")
 
 # ── Self-contained macOS/Windows bundles (libonnxruntime + ONNX models) ───────
 # macOS: copy libonnxruntime into Contents/MacOS/ (so @loader_path resolves it)
@@ -310,8 +362,14 @@ elseif(WIN32)
                     -P "${CUE_COPY_IF_EXISTS}")
             add_custom_command(TARGET CueSampler_${_fmt} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${ONNXRUNTIME_ROOT}/lib/onnxruntime.dll"
+                    "${ORT_RUNTIME_DLL}"
                     "$<TARGET_FILE_DIR:CueSampler_${_fmt}>/onnxruntime.dll"
+                # DirectML.dll must sit next to onnxruntime.dll: the DML execution
+                # provider loads it at session-create time, and Windows resolves a
+                # DLL's dependencies from its own directory.
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${DIRECTML_DLL}"
+                    "$<TARGET_FILE_DIR:CueSampler_${_fmt}>/DirectML.dll"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "${CMAKE_CURRENT_SOURCE_DIR}/assets/beat_this.onnx"
                     "$<TARGET_FILE_DIR:CueSampler_${_fmt}>/beat_this.onnx"
@@ -319,7 +377,7 @@ elseif(WIN32)
                     "${CMAKE_CURRENT_SOURCE_DIR}/assets/beat_this.onnx.data"
                     "$<TARGET_FILE_DIR:CueSampler_${_fmt}>/beat_this.onnx.data"
                 ${_stem_copies}
-                COMMENT "Windows: staging onnxruntime.dll + ONNX + stem models next to CueSampler_${_fmt}")
+                COMMENT "Windows: staging onnxruntime.dll + DirectML.dll + ONNX + stem models next to CueSampler_${_fmt}")
         endif()
     endforeach()
 endif() # APPLE / WIN32 — platform-specific bundling
@@ -347,7 +405,7 @@ if(CUE_BUILD_STEM_TEST)
         JUCE_USE_CURL=0
         JUCE_STANDALONE_APPLICATION=1)
     target_include_directories(test_stem_separator PRIVATE
-        "${ONNXRUNTIME_ROOT}/include"
+        "${ORT_INCLUDE_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(test_stem_separator PRIVATE
         juce::juce_audio_formats

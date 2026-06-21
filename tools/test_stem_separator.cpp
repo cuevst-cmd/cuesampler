@@ -78,6 +78,14 @@ double maxAbsDiff (const juce::AudioBuffer<float>& a, const juce::AudioBuffer<fl
             m = juce::jmax (m, (double) std::abs (a.getReadPointer (c)[i] - b.getReadPointer (c)[i]));
     return m;
 }
+
+// Surfaces StemSeparator's juce::Logger diagnostics (which EP bound, per-run
+// realtime metric) on stdout — without a current logger they go to the platform
+// debug output and are invisible from a console.
+struct StdoutLogger : juce::Logger
+{
+    void logMessage (const juce::String& msg) override { std::cout << "  [log] " << msg << "\n"; }
+};
 } // namespace
 
 int main (int argc, char* argv[])
@@ -87,6 +95,9 @@ int main (int argc, char* argv[])
         std::cerr << "usage: test_stem_separator <song.wav> [model=assets/htdemucs/htdemucs.onnx]\n";
         return 2;
     }
+
+    static StdoutLogger stdoutLogger;
+    juce::Logger::setCurrentLogger (&stdoutLogger);
 
     const juce::File wavFile { juce::String (argv[1]) };
     // argv[2] may be the model .onnx file, or a directory containing htdemucs.onnx.

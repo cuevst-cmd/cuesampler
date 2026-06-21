@@ -6,6 +6,8 @@
 #if defined(__APPLE__)
  #include <coreml_provider_factory.h>
  #include <sys/sysctl.h>
+#elif defined(_WIN32)
+ #include <dml_provider_factory.h>
 #endif
 
 #include <algorithm>
@@ -61,6 +63,25 @@ namespace
         }
         return fallback;
     }
+
+    // Per-inference segment length in samples. The htdemucs graph takes a dynamic
+    // length, so a SHORTER segment cuts the activation memory of each forward pass
+    // — the lever that lets a memory-constrained accelerator run this graph, since
+    // DirectML pre-allocates the whole fused segment up front (a full 7.8 s segment
+    // can blow the GPU's memory budget and fail graph fusion with E_OUTOFMEMORY).
+    // The cost is more inferences and more overlap-add seams. Override with
+    // CUE_STEM_SEGMENT (samples @ 44.1 kHz; clamped [44100, kSegmentSamples], i.e.
+    // 1 s .. 7.8 s) to fit the accelerator without a rebuild.
+    int resolveSegment (int fallback)
+    {
+        if (const char* env = std::getenv ("CUE_STEM_SEGMENT"))
+        {
+            const int n = std::atoi (env);
+            if (n >= 44100)
+                return juce::jlimit (44100, fallback, n);
+        }
+        return fallback;
+    }
 }
 
 //==============================================================================
@@ -89,20 +110,73 @@ std::unique_ptr<StemSeparator::Model> StemSeparator::loadModel (Ort::Env& env,
         return m; // ready == false
     }
 
+    // ONNX takes the model path as ORTCHAR_T*: wchar_t* on Windows, char*
+    // elsewhere. Build the matching owned string so p.c_str() has the right
+    // type for both Ort::Session constructions below.
+   #ifdef _WIN32
+    const std::wstring p (path.toWideCharPointer());
+   #else
     const std::string p = path.toStdString();
+   #endif
 
-    // Prefer the CoreML-accelerated options; fall back to CPU if CoreML can't
-    // create the session for this graph.
+    // Validate that a session can actually RUN this graph (one silent forward
+    // pass), not merely be created. An accelerator EP can build the session fine
+    // and then fail at run time — DirectML on a memory-constrained GPU throws
+    // E_OUTOFMEMORY during graph fusion or hangs the device (TDR); CoreML has
+    // produced NaNs. Probing at load time lets us fall back to CPU here, instead
+    // of silently returning no stems on every separation.
+    auto canRun = [&] (Ort::Session& s) -> bool
+    {
+        try
+        {
+            Ort::AllocatorWithDefaultOptions a;
+            const std::string inName = s.GetInputNameAllocated (0, a).get();
+            auto shape = s.GetInputTypeInfo (0).GetTensorTypeAndShapeInfo().GetShape();
+            size_t n = 1;
+            for (auto& d : shape) { if (d < 0) d = 1; n *= (size_t) d; }
+
+            std::vector<float> zeros (n, 0.0f);
+            Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu (OrtArenaAllocator, OrtMemTypeDefault);
+            Ort::Value in = Ort::Value::CreateTensor<float> (mem, zeros.data(), zeros.size(),
+                                                             shape.data(), shape.size());
+
+            std::vector<std::string> outOwned;
+            for (size_t i = 0, e = s.GetOutputCount(); i < e; ++i)
+                outOwned.emplace_back (s.GetOutputNameAllocated (i, a).get());
+            std::vector<const char*> outPtrs;
+            for (auto& o : outOwned) outPtrs.push_back (o.c_str());
+
+            const char* inPtr = inName.c_str();
+            auto outs = s.Run (Ort::RunOptions { nullptr }, &inPtr, &in, 1,
+                               outPtrs.data(), outPtrs.size());
+            return ! outs.empty();
+        }
+        catch (const Ort::Exception& e)
+        {
+            juce::Logger::writeToLog ("StemSeparator: " + juce::String (label)
+                + " accelerator probe failed, falling back to CPU: "
+                + juce::String::fromUTF8 (e.what()));
+            return false;
+        }
+    };
+
+    // Prefer the accelerated options (DirectML on Windows / CoreML on macOS); fall
+    // back to CPU if the accelerator can't create OR run the session for this graph.
+    bool boundAccel = false;
     if (accelOpts != nullptr)
     {
         try
         {
             m->session = std::make_unique<Ort::Session> (env, p.c_str(), *accelOpts);
+            if (canRun (*m->session))
+                boundAccel = true;
+            else
+                m->session.reset(); // probe failed → fall through to CPU below
         }
         catch (const Ort::Exception& e)
         {
             juce::Logger::writeToLog ("StemSeparator: " + juce::String (label)
-                                      + " CoreML session failed, retrying on CPU: "
+                                      + " accelerated session failed, retrying on CPU: "
                                       + juce::String::fromUTF8 (e.what()));
             m->session.reset();
         }
@@ -120,6 +194,19 @@ std::unique_ptr<StemSeparator::Model> StemSeparator::loadModel (Ort::Env& env,
             m->outputNames.emplace_back (m->session->GetOutputNameAllocated (i, alloc).get());
 
         m->ready = ! m->outputNames.empty();
+        if (m->ready)
+        {
+            // Log the input rank/dims so it's clear whether the length axis is
+            // dynamic (-1) — i.e. whether CUE_STEM_SEGMENT can shrink it to fit a
+            // memory-constrained accelerator.
+            const auto inShape = m->session->GetInputTypeInfo (0)
+                                     .GetTensorTypeAndShapeInfo().GetShape();
+            juce::String dims;
+            for (const auto d : inShape) dims << juce::String (d) << " ";
+            juce::Logger::writeToLog ("StemSeparator: " + juce::String (label)
+                + " session bound to " + juce::String (boundAccel ? "GPU/accelerator EP" : "CPU EP")
+                + ", input dims [" + dims.trim() + "]  (-1 = dynamic)");
+        }
     }
     catch (const Ort::Exception& e)
     {
@@ -160,14 +247,14 @@ StemSeparator::StemSeparator (const ModelPaths& paths)
         {
             try
             {
-                ortOptionsCoreML = std::make_unique<Ort::SessionOptions> (ortOptions->Clone());
+                ortOptionsAccel = std::make_unique<Ort::SessionOptions> (ortOptions->Clone());
                 Ort::ThrowOnError (OrtSessionOptionsAppendExecutionProvider_CoreML (
-                    *ortOptionsCoreML, COREML_FLAG_USE_NONE));
+                    *ortOptionsAccel, COREML_FLAG_USE_NONE));
                 juce::Logger::writeToLog ("StemSeparator: CoreML execution provider enabled (CUE_ENABLE_COREML)");
             }
             catch (const Ort::Exception& e)
             {
-                ortOptionsCoreML.reset();
+                ortOptionsAccel.reset();
                 juce::Logger::writeToLog ("StemSeparator: CoreML EP unavailable, using CPU: "
                                           + juce::String::fromUTF8 (e.what()));
             }
@@ -178,7 +265,60 @@ StemSeparator::StemSeparator (const ModelPaths& paths)
         }
 #endif
 
-        Ort::SessionOptions* accel = ortOptionsCoreML.get();
+#if defined(_WIN32)
+        // DirectML execution provider — runs the htdemucs graph on any DX12 GPU
+        // (NVIDIA/AMD/Intel), ~10x faster than the CPU path (which, in a VM, may
+        // see only a handful of cores). ON by default; set CUE_DISABLE_DIRECTML=1
+        // to force CPU (headless/CI, or to A/B). The DML EP has two hard
+        // requirements: memory pattern OFF and SEQUENTIAL execution mode (it does
+        // not support ORT's parallel mem-pattern planner). loadModel still retries
+        // on CPU if the DML session fails to build, and runModel guards against
+        // non-finite GPU output (an earlier CoreML attempt on this model NaN'd).
+        if (std::getenv ("CUE_DISABLE_DIRECTML") == nullptr)
+        {
+            try
+            {
+                ortOptionsAccel = std::make_unique<Ort::SessionOptions> (ortOptions->Clone());
+                ortOptionsAccel->DisableMemPattern();
+                ortOptionsAccel->SetExecutionMode (ORT_SEQUENTIAL);
+                // Full optimization by default: fastest on GPUs that have the memory
+                // budget for this model's fixed 7.8 s segment. On a budget-constrained
+                // GPU it fails cleanly and instantly with E_OUTOFMEMORY during graph
+                // fusion (caught by the load-time probe → CPU fallback). Lowering the
+                // level keeps the graph as smaller ops so ORT can reuse buffers (less
+                // peak memory) but can run long enough per dispatch to trip the GPU
+                // watchdog (TDR, a disruptive device reset) — so it's opt-in only.
+                // Tune with CUE_STEM_DML_OPT (0=disable_all, 1=basic, 2=extended,
+                // 3=enable_all).
+                {
+                    auto lvl = GraphOptimizationLevel::ORT_ENABLE_ALL;
+                    if (const char* o = std::getenv ("CUE_STEM_DML_OPT"))
+                        switch (juce::jlimit (0, 3, std::atoi (o)))
+                        {
+                            case 0:  lvl = GraphOptimizationLevel::ORT_DISABLE_ALL;     break;
+                            case 1:  lvl = GraphOptimizationLevel::ORT_ENABLE_BASIC;    break;
+                            case 2:  lvl = GraphOptimizationLevel::ORT_ENABLE_EXTENDED; break;
+                            default: lvl = GraphOptimizationLevel::ORT_ENABLE_ALL;      break;
+                        }
+                    ortOptionsAccel->SetGraphOptimizationLevel (lvl);
+                }
+                Ort::ThrowOnError (OrtSessionOptionsAppendExecutionProvider_DML (*ortOptionsAccel, 0));
+                juce::Logger::writeToLog ("StemSeparator: DirectML execution provider enabled (device 0)");
+            }
+            catch (const Ort::Exception& e)
+            {
+                ortOptionsAccel.reset();
+                juce::Logger::writeToLog ("StemSeparator: DirectML EP unavailable, using CPU: "
+                                          + juce::String::fromUTF8 (e.what()));
+            }
+        }
+        else
+        {
+            juce::Logger::writeToLog ("StemSeparator: DirectML disabled (CUE_DISABLE_DIRECTML), using CPU");
+        }
+#endif
+
+        Ort::SessionOptions* accel = ortOptionsAccel.get();
         stemModel = loadModel (*ortEnv, accel, *ortOptions, paths.model, "htdemucs");
 
         sessionReady.store (stemModel->ready);
@@ -296,7 +436,7 @@ StemSeparator::Stems44 StemSeparator::runModel (const Model& model,
     const double t0      = juce::Time::getMillisecondCounterHiRes();
     const double overlap = resolveOverlap (kOverlap);
 
-    const int seg    = kSegmentSamples;
+    const int seg    = resolveSegment (kSegmentSamples);
     const int stride = juce::jmax (1, (int) std::llround ((double) seg * (1.0 - overlap)));
 
     // Triangular overlap-add weight (Demucs, transition_power = 1): ramp 1..max
@@ -414,6 +554,24 @@ StemSeparator::Stems44 StemSeparator::runModel (const Model& model,
                 if (w > 1e-8)
                     d[i] = (float) ((double) d[i] / w);
             }
+        }
+
+    // Safety net for a misbehaving accelerator EP: an earlier CoreML attempt on
+    // this exact model produced all-NaN stems (see constructor notes). If the GPU
+    // path returns non-finite audio, bail so the caller keeps the original buffer
+    // instead of writing NaN/Inf into the project. (Set CUE_DISABLE_DIRECTML=1 to
+    // force the CPU path.)
+    for (auto* b : outBufs)
+        for (int ch = 0; ch < kModelChannels; ++ch)
+        {
+            const float* d = b->getReadPointer (ch);
+            for (int i = 0; i < L; ++i)
+                if (! std::isfinite (d[i]))
+                {
+                    juce::Logger::writeToLog ("StemSeparator: non-finite output detected — aborting "
+                        "(set CUE_DISABLE_DIRECTML=1 to force CPU)");
+                    return empty;
+                }
         }
 
     // Field metric: wall-clock vs audio length, so EP/thread/overlap changes are

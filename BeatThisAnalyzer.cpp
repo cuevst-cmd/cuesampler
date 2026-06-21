@@ -31,8 +31,14 @@ BeatThisAnalyzer::BeatThisAnalyzer (const juce::String& onnxModelPath)
         ortOptions->SetIntraOpNumThreads (1);
         ortOptions->SetGraphOptimizationLevel (GraphOptimizationLevel::ORT_ENABLE_ALL);
 
-        // Load from file path — convert juce::String to std::string
+        // Load from file path. ONNX takes the path as ORTCHAR_T*: that is
+        // wchar_t* on Windows but char* elsewhere, so build the matching owned
+        // string. path.c_str() then has the correct type on each platform.
+       #ifdef _WIN32
+        const std::wstring path (onnxModelPath.toWideCharPointer());
+       #else
         const std::string path = onnxModelPath.toStdString();
+       #endif
         ortSession = std::make_unique<Ort::Session> (*ortEnv, path.c_str(), *ortOptions);
         sessionReady.store (true);
     }

@@ -117,7 +117,9 @@ private:
 
     std::unique_ptr<Ort::Env>            ortEnv;
     std::unique_ptr<Ort::SessionOptions> ortOptions;        // CPU-only base
-    std::unique_ptr<Ort::SessionOptions> ortOptionsCoreML;  // CoreML (macOS); null if unavailable
+    std::unique_ptr<Ort::SessionOptions> ortOptionsAccel;   // GPU/ANE accelerator EP options
+                                                            // (DirectML on Windows, CoreML on macOS);
+                                                            // null if unavailable/disabled
     std::unique_ptr<Model>               stemModel;
     std::atomic<bool>                    sessionReady { false };
 
