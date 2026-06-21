@@ -90,6 +90,9 @@ if(WIN32 AND MSVC)
             target_compile_options(${_btgt} PRIVATE "/FI${_bungee_win_compat}/bungee_msvc_shim.h")
         endif()
     endforeach()
+    if(TARGET bungee_executable)
+        set_target_properties(bungee_executable PROPERTIES OUTPUT_NAME "bungee_cli")
+    endif()
 endif()
 
 # ONNX Runtime 1.20.1 — official prebuilt package, downloaded per-platform.
@@ -419,3 +422,13 @@ if(CUE_BUILD_STEM_TEST)
             BUILD_RPATH "${ONNXRUNTIME_ROOT}/lib")
     endif()
 endif()
+
+if(WIN32 AND MSVC)
+    foreach(_tgt CueSampler_VST3 CueSampler_Standalone)
+        if(TARGET ${_tgt})
+            target_link_libraries(${_tgt} PRIVATE delayimp.lib)
+            target_link_options(${_tgt} PRIVATE "/DELAYLOAD:onnxruntime.dll")
+        endif()
+    endforeach()
+endif()
+

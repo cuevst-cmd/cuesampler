@@ -1,6 +1,33 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#include <string>
+struct DllPathHelper {
+    DllPathHelper() {
+        wchar_t path[MAX_PATH];
+        HMODULE hModule = NULL;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)&DllPathHelper::getModuleAddress,
+                           &hModule);
+        if (hModule != NULL) {
+            GetModuleFileNameW(hModule, path, MAX_PATH);
+            std::wstring wpath(path);
+            size_t pos = wpath.find_last_of(L"\\/");
+            if (pos != std::wstring::npos) {
+                std::wstring dir = wpath.substr(0, pos);
+                SetDllDirectoryW(dir.c_str());
+            }
+        }
+    }
+    static void getModuleAddress() {}
+};
+static DllPathHelper dllPathHelperInstance;
+#endif
+
 #include <bungee/Stream.h>
 
 #include <array>
