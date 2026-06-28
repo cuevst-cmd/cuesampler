@@ -2111,6 +2111,14 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
     std::atomic_store (&tempoEditState, std::make_shared<TempoEditState>());
     std::atomic_store (&chopState, std::make_shared<ChopState>());
 
+    // TEMP dropout diagnostics: one log line/sec while audio runs (see timerCallback).
+    {
+        const auto diagFile = juce::File::getSpecialLocation (juce::File::userHomeDirectory)
+                                  .getChildFile ("Library/Logs/CueSampler-diag.log");
+        diagLog = std::make_unique<juce::FileLogger> (diagFile,
+                                                      "CUE SAMPLER audio diagnostics", 0);
+    }
+
     // Kick off the (throttled) software-update check. Loads any cached result
     // immediately and refreshes from GitHub Releases at most once per day.
     updateChecker.start();
@@ -2225,6 +2233,31 @@ AudioPluginAudioProcessor::~AudioPluginAudioProcessor()
 void AudioPluginAudioProcessor::timerCallback()
 {
     warmPreparedCacheTick();
+
+    // TEMP dropout diagnostics: emit one summary line/sec (20 Hz timer → /20) while
+    // audio is flowing. Remove once the dropout root cause is identified.
+    if (++diagTickCounter >= 20)
+    {
+        diagTickCounter = 0;
+        const auto blocks = diagBlocks.exchange (0, std::memory_order_relaxed);
+        if (blocks > 0 && diagLog != nullptr)
+        {
+            const auto overruns = diagOverruns.exchange (0, std::memory_order_relaxed);
+            const auto maxUs    = diagMaxMicros.exchange (0, std::memory_order_relaxed);
+            const auto unity    = diagPathUnity.exchange (0, std::memory_order_relaxed);
+            const auto prepared = diagPathPrepared.exchange (0, std::memory_order_relaxed);
+            const auto bungee   = diagPathBungee.exchange (0, std::memory_order_relaxed);
+            const auto warp     = diagPathWarp.exchange (0, std::memory_order_relaxed);
+            diagLog->logMessage (juce::Time::getCurrentTime().toString (false, true, true, true)
+                + "  blocks=" + juce::String ((juce::int64) blocks)
+                + " overruns=" + juce::String ((juce::int64) overruns)
+                + " maxBlockUs=" + juce::String ((juce::int64) maxUs)
+                + "  | paths: unity=" + juce::String ((juce::int64) unity)
+                + " prepared=" + juce::String ((juce::int64) prepared)
+                + " bungee=" + juce::String ((juce::int64) bungee)
+                + " warp=" + juce::String ((juce::int64) warp));
+        }
+    }
 }
 
 void AudioPluginAudioProcessor::warmPreparedCacheTick()
@@ -2463,6 +2496,7 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                                               juce::MidiBuffer& midiMessages)
 {
     juce::ScopedNoDenormals noDenormals;
+    const auto diagStartTicks = juce::Time::getHighResolutionTicks(); // TEMP diag
     auto totalNumInputChannels  = getTotalNumInputChannels();
     auto totalNumOutputChannels = juce::jmin (getTotalNumOutputChannels(), buffer.getNumChannels());
     const auto analysis = std::atomic_load (&tempoAnalysis);
@@ -2813,6 +2847,7 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                     // must re-prime from the new position.
                     v.bungeeResetPending = true;
                     handledByPrepared = true;
+                    diagPathPrepared.fetch_add (1, std::memory_order_relaxed); // TEMP diag
                 }
             }
 
@@ -2962,6 +2997,7 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                 v.playbackSamplePosition += (double) chunk * bungeePosStep;
                 segmentWriteOffset += chunk;
                 handledByBungee = true;
+                diagPathBungee.fetch_add (1, std::memory_order_relaxed); // TEMP diag
             }
 
             if (! handledByBungee && ! handledByPrepared)
@@ -3005,6 +3041,7 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
                     segmentWriteOffset += chunk;
                     v.bungeeResetPending = true; // re-prime Bungee if pitch/stretch re-engages
+                    diagPathWarp.fetch_add (1, std::memory_order_relaxed); // TEMP diag
                 }
                 else
                 {
@@ -3036,6 +3073,7 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
                     segmentWriteOffset += chunk;
                     v.bungeeResetPending = true;
+                    diagPathUnity.fetch_add (1, std::memory_order_relaxed); // TEMP diag
                 }
             }
 
@@ -3130,6 +3168,23 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     const auto currentMeter = outputMeterLevel.load (std::memory_order_acquire);
     const auto releasedMeter = juce::jmax (blockPeak, currentMeter - 0.045f);
     outputMeterLevel.store (juce::jlimit (0.0f, 1.0f, releasedMeter), std::memory_order_release);
+
+    // TEMP dropout diagnostics: how long did this block take vs. the time the host
+    // budgeted for it? An "overrun" (> 80% of budget) is where audible dropouts come
+    // from. Drained once/sec in timerCallback.
+    {
+        const auto elapsedSec = juce::Time::highResolutionTicksToSeconds (
+            juce::Time::getHighResolutionTicks() - diagStartTicks);
+        const auto blockSec = (double) buffer.getNumSamples() / juce::jmax (1.0, currentHostRate);
+        const auto micros = (uint64_t) (elapsedSec * 1.0e6);
+        diagBlocks.fetch_add (1, std::memory_order_relaxed);
+        auto prevMax = diagMaxMicros.load (std::memory_order_relaxed);
+        while (micros > prevMax
+               && ! diagMaxMicros.compare_exchange_weak (prevMax, micros, std::memory_order_relaxed))
+        {}
+        if (blockSec > 0.0 && elapsedSec > 0.8 * blockSec)
+            diagOverruns.fetch_add (1, std::memory_order_relaxed);
+    }
 }
 
 void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg, 

@@ -546,6 +546,21 @@ private:
     double lastWarmHostRate    = 0.0;
     std::shared_ptr<const VoicePitchEngineSet> pitchEngineSet;
 
+    // ===== TEMP audio-thread dropout diagnostics (remove after diagnosis) =====
+    // Per-block timing + render-path tally, drained once/sec by timerCallback to a
+    // FileLogger at ~/Library/Logs/CueSampler-diag.log. Tells us whether the audio
+    // thread is overrunning its buffer (the dropouts) and which path is hot.
+    std::unique_ptr<juce::FileLogger> diagLog;
+    std::atomic<uint64_t> diagBlocks       { 0 };
+    std::atomic<uint64_t> diagOverruns     { 0 }; // blocks that took > 80% of buffer time
+    std::atomic<uint64_t> diagMaxMicros    { 0 }; // worst single-block wall time this window
+    std::atomic<uint64_t> diagPathUnity    { 0 }; // cheap Lanczos / fallback chunks
+    std::atomic<uint64_t> diagPathPrepared { 0 }; // pre-baked cache-hit chunks
+    std::atomic<uint64_t> diagPathBungee   { 0 }; // live real-time Bungee chunks
+    std::atomic<uint64_t> diagPathWarp     { 0 }; // warp-buffer playback chunks
+    int diagTickCounter { 0 };
+    // ==========================================================================
+
     enum class TransportCommand : int
     {
         none = 0,
