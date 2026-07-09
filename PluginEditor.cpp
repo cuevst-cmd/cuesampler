@@ -2062,6 +2062,14 @@ public:
                                           (int) std::ceil (lockupW) + 60, 28),
                     juce::Justification::centredLeft, false);
 
+        // Draw the version number next to SAMPLER on the top left
+        g.setColour (textPrimary.withAlpha (0.45f));
+        g.setFont (brandFont (10.0f));
+        g.drawText ("v" + juce::String (CUE_VERSION_STRING),
+                    juce::Rectangle<int> ((int) std::round (logoX + lockupW + 8.0f), samplerTop + 5,
+                                          80, 28),
+                    juce::Justification::centredLeft, false);
+
         g.setColour (textPrimary.withAlpha (0.85f));
         g.setFont (heavyFont (12.0f));
         g.drawFittedText ("CUE SOFTWARE", juce::Rectangle<int> (bounds.getRight() - 125, 38, 125, 16),

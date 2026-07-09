@@ -2213,13 +2213,12 @@ AudioPluginAudioProcessor::~AudioPluginAudioProcessor()
     prepareWarmGeneration.fetch_add (1, std::memory_order_acq_rel);
     stemGeneration.fetch_add (1, std::memory_order_acq_rel);
     stemRemixGeneration.fetch_add (1, std::memory_order_acq_rel);
-    restoreThreadPool.removeAllJobs (true, 2000);
-    analysisThreadPool.removeAllJobs (true, 2000);
-    warpRenderThreadPool.removeAllJobs (true, 2000);
-    keyDetectionThreadPool.removeAllJobs (true, 2000);
-    prepareRenderThreadPool.removeAllJobs (true, 2000);
-    // Separation can be mid-flight (tens of seconds); give it a generous window.
-    stemThreadPool.removeAllJobs (true, 10000);
+    restoreThreadPool.removeAllJobs (true, -1);
+    analysisThreadPool.removeAllJobs (true, -1);
+    warpRenderThreadPool.removeAllJobs (true, -1);
+    keyDetectionThreadPool.removeAllJobs (true, -1);
+    prepareRenderThreadPool.removeAllJobs (true, -1);
+    stemThreadPool.removeAllJobs (true, -1);
 }
 
 void AudioPluginAudioProcessor::timerCallback()

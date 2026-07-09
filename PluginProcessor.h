@@ -515,19 +515,7 @@ private:
     VoiceState voices[2];
     int activeVoiceIdx = 0;
 
-    juce::ThreadPool restoreThreadPool { 1 };
-    juce::ThreadPool analysisThreadPool { 1 };
-    juce::ThreadPool warpRenderThreadPool { 1 };
-    juce::ThreadPool keyDetectionThreadPool { 1 };
-    // Offline HTDemucs-FT separation + mute remixes. Single thread (one pass at a
-    // time), default priority — below the host's realtime audio thread so it can
-    // never glitch playback. Runs both StemSeparationJob and RemixJob.
-    juce::ThreadPool stemThreadPool { 1 };
-    // Higher priority so the background bake finishes fast — and is biased onto a
-    // performance core on Apple Silicon instead of a slow efficiency core. Still
-    // below the host's real-time audio thread, so it cannot glitch playback.
-    juce::ThreadPool prepareRenderThreadPool { 1, juce::Thread::osDefaultStackSize,
-                                               juce::Thread::Priority::high };
+
     cuesampler::ChopAudioCache chopAudioCache;
 
     // Bumped on every warm kick so an in-flight PreparedWarmJob can detect it has
@@ -694,6 +682,21 @@ private:
                           bool blockHasHostPpq,
                           bool blockHostTransportPlaying,
                           double blockStartHostPpq);
+
+    // Thread pools moved to the end of the class so they are destroyed first.
+    juce::ThreadPool restoreThreadPool { 1 };
+    juce::ThreadPool analysisThreadPool { 1 };
+    juce::ThreadPool warpRenderThreadPool { 1 };
+    juce::ThreadPool keyDetectionThreadPool { 1 };
+    // Offline HTDemucs-FT separation + mute remixes. Single thread (one pass at a
+    // time), default priority — below the host's realtime audio thread so it can
+    // never glitch playback. Runs both StemSeparationJob and RemixJob.
+    juce::ThreadPool stemThreadPool { 1 };
+    // Higher priority so the background bake finishes fast — and is biased onto a
+    // performance core on Apple Silicon instead of a slow efficiency core. Still
+    // below the host's real-time audio thread, so it cannot glitch playback.
+    juce::ThreadPool prepareRenderThreadPool { 1, juce::Thread::osDefaultStackSize,
+                                               juce::Thread::Priority::high };
 
     //==============================================================================
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioPluginAudioProcessor)
