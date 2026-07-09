@@ -48,7 +48,7 @@ juce::String UpdateChecker::currentVersion()
 
 void UpdateChecker::start()
 {
-    // Re-evaluate "available" from the cache against the current binary in case
+    // Re-eval cache against the live version first, in case
     // the user updated since the cache was written.
     {
         const std::lock_guard<std::mutex> lock (mutex);
@@ -61,11 +61,11 @@ void UpdateChecker::start()
             return; // checked recently — cached result stands
     }
 
-    if (thread == nullptr)
-        thread = std::make_unique<CheckThread> (*this);
+    // if (thread == nullptr)
+    //     thread = std::make_unique<CheckThread> (*this);
 
-    if (! thread->isThreadRunning())
-        thread->startThread();
+    // if (! thread->isThreadRunning())
+    //     thread->startThread();
 }
 
 UpdateChecker::Result UpdateChecker::getResult() const

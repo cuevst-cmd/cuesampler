@@ -40,6 +40,7 @@ BeatThisAnalyzer::BeatThisAnalyzer (const juce::String& onnxModelPath)
         const std::string path = onnxModelPath.toStdString();
        #endif
         ortSession = std::make_unique<Ort::Session> (*ortEnv, path.c_str(), *ortOptions);
+        ortRunOptions = std::make_unique<Ort::RunOptions>();
         sessionReady.store (true);
     }
     catch (const Ort::Exception& e)
@@ -221,7 +222,7 @@ BeatThisAnalyzer::runOnnxInferenceChunk (const std::vector<float>& flatMel,
     {
         const std::array<const char*, 2> outputNames { beatName, downbeatName };
         outputTensors = ortSession->Run (
-            Ort::RunOptions { nullptr },
+            *ortRunOptions,
             &inputName, &inputTensor, 1,
             outputNames.data(), outputNames.size());
     }
@@ -670,4 +671,15 @@ BeatThisAnalyzer::analyze (const juce::AudioBuffer<float>& buffer,
     result.barPositionsSecs  = std::move (barPosSecs);
 
     return result;
+}
+
+//==============================================================================
+void BeatThisAnalyzer::terminate() const
+{
+    if (sessionReady.load() && ortRunOptions)
+    {
+        try {
+            ortRunOptions->SetTerminate();
+        } catch (...) {}
+    }
 }

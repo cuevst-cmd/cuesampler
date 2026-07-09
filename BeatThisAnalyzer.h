@@ -10,7 +10,7 @@
 #include <vector>
 
 // Forward declare ORT types to avoid polluting all translation units
-namespace Ort { struct Env; struct Session; struct SessionOptions; }
+namespace Ort { struct Env; struct Session; struct SessionOptions; struct RunOptions; }
 
 /**
  * BeatThisAnalyzer
@@ -65,6 +65,9 @@ public:
                     int startSample = 0,
                     int endSample   = -1) const;
 
+    /** Aborts any currently executing ONNX inference. */
+    void terminate() const;
+
 private:
     //==========================================================================
     // Constants matching beat_this's training configuration
@@ -88,6 +91,7 @@ private:
     std::unique_ptr<Ort::Env>            ortEnv;
     std::unique_ptr<Ort::SessionOptions> ortOptions;
     std::unique_ptr<Ort::Session>        ortSession;
+    std::unique_ptr<Ort::RunOptions>     ortRunOptions;
     std::atomic<bool>                    sessionReady { false };
 
     //==========================================================================

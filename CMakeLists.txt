@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.22)
 # `project()` command. `project()` sets up some helpful variables that describe source/binary
 # directories, and the current project version. This is a standard CMake command.
 
-project(CUESAMPLER VERSION 1.0.2)
+project(CueSampler VERSION 1.0.4)
 include(FetchContent)
 
 # Copy the built plugin into the OS plugin directory after each build. On by
@@ -148,7 +148,7 @@ endif()
 # Check the readme at `docs/CMake API.md` in the JUCE repo for the full list.
 
 juce_add_plugin(CueSampler
-    # VERSION ...                               # Set this if the plugin version is different to the project version
+    VERSION ${PROJECT_VERSION}                  # Set the version from PROJECT_VERSION
     # ICON_BIG ...                              # ICON_* arguments specify a path to an image file to use as an icon for the Standalone
     # ICON_SMALL ...
     # COMPANY_NAME ...                          # Specify the name of the plugin's author

@@ -92,6 +92,7 @@ struct StemSeparator::Model
     std::unique_ptr<Ort::Session> session;
     std::string                   inputName;
     std::vector<std::string>      outputNames;
+    std::unique_ptr<Ort::RunOptions> runOpts;
     bool                          ready = false;
 };
 
@@ -196,6 +197,8 @@ std::unique_ptr<StemSeparator::Model> StemSeparator::loadModel (Ort::Env& env,
         m->ready = ! m->outputNames.empty();
         if (m->ready)
         {
+            m->runOpts = std::make_unique<Ort::RunOptions>();
+
             // Log the input rank/dims so it's clear whether the length axis is
             // dynamic (-1) — i.e. whether CUE_STEM_SEGMENT can shrink it to fit a
             // memory-constrained accelerator.
@@ -491,7 +494,7 @@ StemSeparator::Stems44 StemSeparator::runModel (const Model& model,
         std::vector<Ort::Value> outs;
         try
         {
-            outs = model.session->Run (Ort::RunOptions { nullptr },
+            outs = model.session->Run (*model.runOpts,
                                        &inName, &inputTensor, 1,
                                        outNames.data(), outNames.size());
         }
@@ -625,4 +628,15 @@ StemSeparator::StemResult StemSeparator::separate (const juce::AudioBuffer<float
 
     if (progress) progress (1.0f);
     return result;
+}
+
+//==============================================================================
+void StemSeparator::terminate() const
+{
+    if (stemModel && stemModel->ready && stemModel->runOpts)
+    {
+        try {
+            stemModel->runOpts->SetTerminate();
+        } catch (...) {}
+    }
 }

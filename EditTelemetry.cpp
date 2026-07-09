@@ -42,8 +42,8 @@ EditTelemetry::EditTelemetry()
       sharedSecret (juce::String (APIKeys::TelemetrySharedSecret).trim())
 {
     loadSettings();
-    if (isEnabled())
-        startUploads();
+    // if (isEnabled())
+    //     startUploads();
 }
 
 EditTelemetry::~EditTelemetry()
@@ -245,14 +245,14 @@ juce::File EditTelemetry::settingsFile() const  { return baseDir().getChildFile 
 
 void EditTelemetry::startUploads()
 {
-    if (endpointUrl.isEmpty() || ! isEnabled())
-        return;
+    // if (endpointUrl.isEmpty() || ! isEnabled())
+    //     return;
 
-    if (uploadThread == nullptr)
-        uploadThread = std::make_unique<UploadThread> (*this);
+    // if (uploadThread == nullptr)
+    //     uploadThread = std::make_unique<UploadThread> (*this);
 
-    if (! uploadThread->isThreadRunning())
-        uploadThread->startThread();
+    // if (! uploadThread->isThreadRunning())
+    //     uploadThread->startThread();
 }
 
 void EditTelemetry::stopUploads()

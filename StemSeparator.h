@@ -81,6 +81,9 @@ public:
                          std::function<void(float)> progress = {},
                          std::function<bool()>       shouldAbort = {}) const;
 
+    /** Aborts any currently executing ONNX inference. */
+    void terminate() const;
+
     //==========================================================================
     // Model / preprocessing constants (from the export spec).
     static constexpr double kModelSampleRate = 44100.0;

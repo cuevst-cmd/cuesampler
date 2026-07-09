@@ -6,6 +6,9 @@
 #include <windows.h>
 #include <string>
 struct DllPathHelper {
+    HMODULE hDml = NULL;
+    HMODULE hOnnx = NULL;
+
     DllPathHelper() {
         wchar_t path[MAX_PATH];
         HMODULE hModule = NULL;
@@ -19,10 +22,21 @@ struct DllPathHelper {
             size_t pos = wpath.find_last_of(L"\\/");
             if (pos != std::wstring::npos) {
                 std::wstring dir = wpath.substr(0, pos);
-                SetDllDirectoryW(dir.c_str());
+                std::wstring dmlPath = dir + L"\\DirectML.dll";
+                std::wstring onnxPath = dir + L"\\onnxruntime.dll";
+                hDml = LoadLibraryExW(dmlPath.c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+                hOnnx = LoadLibraryExW(onnxPath.c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
             }
         }
     }
+    
+    ~DllPathHelper() {
+        // Do NOT call FreeLibrary here. Destructors of static globals run during
+        // DLL_PROCESS_DETACH under the OS loader lock. Calling FreeLibrary from
+        // DllMain / DLL detach causes deadlocks or crashes due to the loader lock
+        // or background threads in ONNX Runtime/DirectML still shutting down.
+    }
+
     static void getModuleAddress() {}
 };
 static DllPathHelper dllPathHelperInstance;
@@ -2213,6 +2227,11 @@ AudioPluginAudioProcessor::~AudioPluginAudioProcessor()
     prepareWarmGeneration.fetch_add (1, std::memory_order_acq_rel);
     stemGeneration.fetch_add (1, std::memory_order_acq_rel);
     stemRemixGeneration.fetch_add (1, std::memory_order_acq_rel);
+
+    // Abort any long-running ONNX inferences so removeAllJobs doesn't hang the DAW
+    if (stemSeparator != nullptr) stemSeparator->terminate();
+    if (beatThisAnalyzer != nullptr) beatThisAnalyzer->terminate();
+
     restoreThreadPool.removeAllJobs (true, -1);
     analysisThreadPool.removeAllJobs (true, -1);
     warpRenderThreadPool.removeAllJobs (true, -1);
