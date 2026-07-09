@@ -93,7 +93,8 @@ void sanitiseAndNormalisePreparedBuffer (juce::AudioBuffer<float>& buffer) noexc
 
 bool renderPreparedWithInterpolation (const juce::AudioBuffer<float>& base,
                                       juce::AudioBuffer<float>& prepared,
-                                      double sourceFramesPerOutputFrame) noexcept
+                                      double sourceFramesPerOutputFrame,
+                                      int preRollSourceFrames = 0) noexcept
 {
     const int channels = base.getNumChannels();
     const int sourceLength = base.getNumSamples();
@@ -117,7 +118,10 @@ bool renderPreparedWithInterpolation (const juce::AudioBuffer<float>& base,
         if (src == nullptr || dst == nullptr)
             return false;
 
-        double sourcePosition = 0.0;
+        // base[] begins with preRollSourceFrames of pre-chop lead-in; the prepared
+        // buffer starts at the chop, so skip the lead-in. (Linear interp is
+        // stateless, so there is no startup latency to prime — just an offset.)
+        double sourcePosition = (double) preRollSourceFrames;
         for (int frame = 0; frame < targetFrames; ++frame)
         {
             dst[frame] = readLinear (src, sourceLength, sourcePosition);
@@ -134,7 +138,8 @@ bool renderPreparedWithBungee (const juce::AudioBuffer<float>& base,
                                double sourceSampleRate,
                                double outputSampleRate,
                                float pitchSemitones,
-                               float stretchRatio)
+                               float stretchRatio,
+                               int preRollSourceFrames = 0)
 {
     const int channels = base.getNumChannels();
     const int sourceLength = base.getNumSamples();
@@ -171,14 +176,23 @@ bool renderPreparedWithBungee (const juce::AudioBuffer<float>& base,
         (sourceSampleRate / outputSampleRate) / (double) stretchRatio;
     const auto pitchFactor = std::pow (2.0, (double) pitchSemitones / 12.0);
 
-    int outputWriteOffset = 0;
+    // base[] starts with preRollSourceFrames of pre-chop lead-in. We render the
+    // matching pre-roll OUTPUT first and discard it: that warms the stretcher's
+    // look-ahead so the captured chop window begins at full amplitude instead of
+    // Bungee's startup silence/ramp. The capture window in output-frame space is
+    // [preRollOutputFrames, preRollOutputFrames + targetFrames).
+    const int preRollOutputFrames = juce::jmax (0,
+        (int) std::llround ((double) preRollSourceFrames / sourceFramesPerOutputFrame));
+    const int totalOutputWanted = preRollOutputFrames + targetFrames;
+
+    int outputRendered = 0; // total output produced so far, including discarded pre-roll
     int zeroRenderStreak = 0;
     double sourcePosition = 0.0;
 
-    while (outputWriteOffset < targetFrames)
+    while (outputRendered < totalOutputWanted)
     {
         const int segmentOutputFrames =
-            juce::jmin (kBungeeBlockSize, targetFrames - outputWriteOffset);
+            juce::jmin (kBungeeBlockSize, totalOutputWanted - outputRendered);
         const int inputFramesRequested = juce::jlimit (
             1, maxInputFrames,
             (int) std::ceil ((double) segmentOutputFrames * sourceFramesPerOutputFrame));
@@ -217,18 +231,26 @@ bool renderPreparedWithBungee (const juce::AudioBuffer<float>& base,
 
         if (renderedFrames > 0)
         {
-            const int writable = juce::jmin (renderedFrames,
-                                             targetFrames - outputWriteOffset);
-            for (int ch = 0; ch < channels; ++ch)
+            // Keep only the part of this output block inside the capture window;
+            // everything before preRollOutputFrames is primed-away startup latency.
+            const int winStart = juce::jmax (outputRendered, preRollOutputFrames);
+            const int winEnd   = juce::jmin (outputRendered + renderedFrames, totalOutputWanted);
+            if (winEnd > winStart)
             {
-                const auto* src = outputChunk.getReadPointer (ch);
-                auto* dst = prepared.getWritePointer (ch, outputWriteOffset);
-                if (src == nullptr || dst == nullptr)
-                    return false;
-                std::copy (src, src + writable, dst);
+                const int copyLen   = winEnd - winStart;
+                const int srcOffset = winStart - outputRendered;       // into outputChunk
+                const int dstOffset = winStart - preRollOutputFrames;  // into prepared
+                for (int ch = 0; ch < channels; ++ch)
+                {
+                    const auto* src = outputChunk.getReadPointer (ch);
+                    auto* dst = prepared.getWritePointer (ch, dstOffset);
+                    if (src == nullptr || dst == nullptr)
+                        return false;
+                    std::copy (src + srcOffset, src + srcOffset + copyLen, dst);
+                }
             }
 
-            outputWriteOffset += writable;
+            outputRendered += renderedFrames;
             zeroRenderStreak = 0;
         }
         else
@@ -245,7 +267,8 @@ bool renderPreparedWithBungee (const juce::AudioBuffer<float>& base,
             return false;
     }
 
-    if (outputWriteOffset <= 0)
+    // Need at least some real (post-pre-roll) chop output to count as a success.
+    if (outputRendered <= preRollOutputFrames)
         return false;
 
     sanitiseAndNormalisePreparedBuffer (prepared);
@@ -757,19 +780,36 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
     // time (the streamed chops are exactly the non-warp ones) and makes the result
     // match the live fallback exactly, since that path also stretches straight from
     // the source. Warped chops still bake their marker timing first.
+    // Pre-chop lead-in (source frames) baked into the FRONT of `base` so the Bungee
+    // pass can prime its look-ahead and the captured chop starts at full amplitude
+    // instead of Bungee's startup silence/ramp. Mirrors the live note-on prime.
+    // 0 for warp chops (their base is a pre-rendered warped buffer — no source
+    // lead-in available). chopBaseFrames is the chop length WITHOUT the lead-in.
+    int preRollFrames  = 0;
+    int chopBaseFrames = 0;
+
     std::shared_ptr<const juce::AudioBuffer<float>> baseHolder;
     if (markers.empty())
     {
         const int sliceStart = juce::jlimit (0, juce::jmax (0, source.getNumSamples() - 1), chopStartSample);
         const int sliceEnd   = juce::jlimit (sliceStart, source.getNumSamples(), chopEndSample);
-        const int sliceLen   = juce::jmax (0, sliceEnd - sliceStart);
-        if (sliceLen <= 0)
+        const int chopLen    = juce::jmax (0, sliceEnd - sliceStart);
+        if (chopLen <= 0)
             return entry;
+
+        // Grab up to ~0.37s of audio before the chop (>= Bungee's look-ahead) when
+        // it exists; chops at the very start of the sample get whatever is available.
+        const int preRollWanted = 16384;
+        const int preRoll  = juce::jmin (sliceStart, preRollWanted);
+        const int sliceLen = preRoll + chopLen;
 
         auto slice = std::make_shared<juce::AudioBuffer<float>> (source.getNumChannels(), sliceLen);
         for (int ch = 0; ch < source.getNumChannels(); ++ch)
-            slice->copyFrom (ch, 0, source, ch, sliceStart, sliceLen);
+            slice->copyFrom (ch, 0, source, ch, sliceStart - preRoll, sliceLen);
         baseHolder = std::move (slice);
+
+        preRollFrames  = preRoll;
+        chopBaseFrames = chopLen;
     }
     else
     {
@@ -787,6 +827,7 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
         }
 
         baseHolder = warpedEntry->warpedBuffer;
+        chopBaseFrames = warpedEntry->warpedBuffer->getNumSamples(); // no lead-in
     }
 
     const auto& base = *baseHolder;
@@ -795,8 +836,9 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
     const auto clampedStretch = juce::jlimit (0.25f, 4.0f, stretchRatio);
     const auto sourceFramesPerOutputFrame =
         (sourceSampleRate / outputSampleRate) / (double) clampedStretch;
+    // Output length is the CHOP only — base may carry pre-roll lead-in at the front.
     const int outputFrames = juce::jmax (
-        1, (int) std::llround ((double) baseFrames / sourceFramesPerOutputFrame));
+        1, (int) std::llround ((double) chopBaseFrames / sourceFramesPerOutputFrame));
 
     WarpMap warpMap;
     warpMap.build (chopStartSample, chopEndSample, markers, sourceSampleRate);
@@ -819,8 +861,9 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
     bool renderedWithBungee = false;
     if (pitchIsUnity && stretchIsUnity && ratesMatch)
     {
+        // Skip the pre-roll lead-in baked into the front of base (chop starts there).
         for (int ch = 0; ch < channels; ++ch)
-            prepared->copyFrom (ch, 0, base, ch, 0, juce::jmin (baseFrames, outputFrames));
+            prepared->copyFrom (ch, 0, base, ch, preRollFrames, juce::jmin (chopBaseFrames, outputFrames));
     }
     else
     {
@@ -829,11 +872,13 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
                                                        sourceSampleRate,
                                                        outputSampleRate,
                                                        pitchSemitones,
-                                                       clampedStretch);
+                                                       clampedStretch,
+                                                       preRollFrames);
         if (! renderedWithBungee
             && ! renderPreparedWithInterpolation (base,
                                                   *prepared,
-                                                  sourceFramesPerOutputFrame))
+                                                  sourceFramesPerOutputFrame,
+                                                  preRollFrames))
         {
             return entry;
         }
