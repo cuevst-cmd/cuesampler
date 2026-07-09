@@ -6810,32 +6810,48 @@ void AudioPluginAudioProcessorEditor::loadSampleFromFile()
 
 void AudioPluginAudioProcessorEditor::changeListenerCallback (juce::ChangeBroadcaster* source)
 {
-    juce::MessageManager::callAsync ([this, source]
+    // The broadcast already arrives on the message thread, but we defer the UI
+    // re-sync one more hop so the setValue() calls below (some with a synchronous
+    // notification) can't re-enter the broadcaster mid-callback. That deferral
+    // outlives this function, so the lambda must NOT capture a raw `this`: if the
+    // host tears the editor down (plugin removed, or DAW closed) while the hop is
+    // still sitting in the message queue, running it against the freed editor is a
+    // use-after-free that crashes the host. A SafePointer makes the queued lambda
+    // a no-op once the editor is gone. (Mirrors the SafePointer pattern already
+    // used in TransportSectionComponent's deferred callbacks.)
+    juce::Component::SafePointer<AudioPluginAudioProcessorEditor> safeThis (this);
+    juce::MessageManager::callAsync ([safeThis, source]
     {
-        if (source == &processorRef.sampleChangeBroadcaster)
+        auto* editor = safeThis.getComponent();
+        if (editor == nullptr)
+            return; // editor was destroyed before this hop ran — nothing to update
+
+        auto& processor = editor->processorRef;
+
+        if (source == &processor.sampleChangeBroadcaster)
         {
-            utilityStripComponent->getZoomSlider().setValue ((double) processorRef.getWaveformZoom(),
-                                                             juce::sendNotificationSync);
-            utilityStripComponent->getScrollSlider().setValue ((double) processorRef.getWaveformScroll(),
-                                                               juce::sendNotificationSync);
+            editor->utilityStripComponent->getZoomSlider().setValue ((double) processor.getWaveformZoom(),
+                                                                     juce::sendNotificationSync);
+            editor->utilityStripComponent->getScrollSlider().setValue ((double) processor.getWaveformScroll(),
+                                                                       juce::sendNotificationSync);
         }
 
         // Always re-sync utility strip controls from the processor so the UI
         // stays correct after a host-initiated state restore (e.g. FL Studio
         // undo / auto-save recall).
-        utilityStripComponent->getPitchSlider().setValue ((double) processorRef.getPitchSemitones(),
-                                                          juce::dontSendNotification);
-        utilityStripComponent->getTempoSlider().setValue ((double) processorRef.getGridBpmTrim(),
-                                                          juce::dontSendNotification);
-        utilityStripComponent->getSyncButton().setToggleState (processorRef.getSyncToHost(),
-                                                               juce::dontSendNotification);
+        editor->utilityStripComponent->getPitchSlider().setValue ((double) processor.getPitchSemitones(),
+                                                                  juce::dontSendNotification);
+        editor->utilityStripComponent->getTempoSlider().setValue ((double) processor.getGridBpmTrim(),
+                                                                  juce::dontSendNotification);
+        editor->utilityStripComponent->getSyncButton().setToggleState (processor.getSyncToHost(),
+                                                                       juce::dontSendNotification);
 
-        transportSectionComponent->refreshDisplays();
+        editor->transportSectionComponent->refreshDisplays();
 
         // Light the on-screen keyboard key that maps to the previewed
         // (selected) chop; -1 clears it when nothing is selected.
-        if (midiKeyboardComponent != nullptr)
-            midiKeyboardComponent->setHighlightedNote (processorRef.getSelectedChopMidiNote());
+        if (editor->midiKeyboardComponent != nullptr)
+            editor->midiKeyboardComponent->setHighlightedNote (processor.getSelectedChopMidiNote());
     });
 }
 
