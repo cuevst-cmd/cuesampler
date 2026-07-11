@@ -2111,6 +2111,18 @@ private:
     std::uint64_t generation = 0;
 };
 
+class AudioPluginAudioProcessor::CachePollerTimer final : public juce::Timer
+{
+public:
+    explicit CachePollerTimer (AudioPluginAudioProcessor& ownerIn) : owner (ownerIn) {}
+    void timerCallback() override
+    {
+        owner.warmPreparedCacheTick();
+    }
+private:
+    AudioPluginAudioProcessor& owner;
+};
+
 //==============================================================================
 AudioPluginAudioProcessor::AudioPluginAudioProcessor()
      : AudioProcessor (BusesProperties()
@@ -2211,16 +2223,28 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
         juce::Logger::writeToLog ("StemSeparator: htdemucs model not found, stem separation disabled");
     }
 
-    // Keep the prepared-render cache warm independently of the editor (the UI may
-    // be closed). Polls often enough to start baking promptly after a sample loads
-    // or settings change; it only kicks a background bake when something relevant
-    // actually changed.
-    startTimerHz (20);
+
+    cachePollerTimer = std::make_unique<CachePollerTimer> (*this);
+    cachePollerTimer->startTimerHz (20);
 }
 
 AudioPluginAudioProcessor::~AudioPluginAudioProcessor()
 {
-    stopTimer();
+    if (auto* helper = cachePollerTimer.release())
+    {
+        if (auto* mm = juce::MessageManager::getInstanceWithoutCreating())
+        {
+            if (mm->isThisTheMessageThread())
+                delete helper;
+            else
+                juce::MessageManager::callAsync ([helper] { delete helper; });
+        }
+        else
+        {
+            // MessageManager is dead, let it leak safely
+        }
+    }
+
     cancelPendingUpdate();
     editTelemetry.flush();
     keyDetectionGeneration.fetch_add (1, std::memory_order_acq_rel);
@@ -2240,10 +2264,6 @@ AudioPluginAudioProcessor::~AudioPluginAudioProcessor()
     stemThreadPool.removeAllJobs (true, -1);
 }
 
-void AudioPluginAudioProcessor::timerCallback()
-{
-    warmPreparedCacheTick();
-}
 
 void AudioPluginAudioProcessor::warmPreparedCacheTick()
 {

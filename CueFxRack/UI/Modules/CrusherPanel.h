@@ -24,7 +24,7 @@ namespace cue
         void paint (juce::Graphics& g) override
         {
             const auto b = getLocalBounds().toFloat().reduced (6.0f, 4.0f);
-            if (b.getWidth() < 60.0f || b.getHeight() < 30.0f)   // mid-animation / tiny panel
+            if (b.getWidth() < 56.0f || b.getHeight() < 28.0f)   // mid-animation / tiny panel
                 return;
 
             constexpr int cols = 18, rows = 9;
@@ -110,11 +110,14 @@ namespace cue
 
         void layoutContent (juce::Rectangle<int> area) override
         {
-            screen.setBounds (area.removeFromTop (area.getHeight() - 224).reduced (4, 2));
-            auto row1 = area.removeFromTop (112);
-            auto row2 = area;
+            if (area.isEmpty())
+                return;
 
-            placeKnob (bits,  row1.removeFromLeft (row1.getWidth() / 2), 62);
+            auto row2 = area.removeFromBottom (72);
+            auto row1 = area.removeFromBottom (72);
+            screen.setBounds (area.reduced (4, 2));
+
+            placeKnob (bits,  row1.removeFromLeft (row1.getWidth() / 2), 56);
             placeKnob (rate,  row1, 52);
             placeKnob (drive, row2.removeFromLeft (row2.getWidth() / 2), 52);
             placeKnob (mix,   row2, 52);

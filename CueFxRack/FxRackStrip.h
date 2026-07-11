@@ -32,11 +32,12 @@ namespace cue
         FxRackStrip (juce::AudioProcessorValueTreeState& state, const FxRackMeterHooks& hooks);
         ~FxRackStrip() override;
 
+        void paint (juce::Graphics&) override;
         void resized() override;
 
         // Bridge to CUERACK's theme system (cue::colours foundation used by
         // the rack subtree), then re-skin the panels/toolbar.
-        static void applyRackTheme (bool light);
+        static void applyRackTheme (bool light, bool warpActive = false, bool halftimeActive = false);
         void refreshColours();
 
     private:

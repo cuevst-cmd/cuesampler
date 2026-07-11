@@ -69,7 +69,9 @@ void CueLookAndFeel::drawRotarySlider (juce::Graphics& g, int x, int y, int widt
     // Pointer
     const auto pIn  = centre.getPointOnCircumference (knobR * 0.25f, angle);
     const auto pOut = centre.getPointOnCircumference (knobR * 0.85f, angle);
-    g.setColour (colours::dark.withAlpha (enabled ? 0.9f : 0.5f));
+    const auto brightness = 0.2126f * cream.getFloatRed() + 0.7152f * cream.getFloatGreen() + 0.0722f * cream.getFloatBlue();
+    const auto pointerColour = (brightness > 0.5f) ? colours::dark : juce::Colours::white;
+    g.setColour (pointerColour.withAlpha (enabled ? 0.9f : 0.5f));
     g.drawLine ({ pIn, pOut }, juce::jmax (2.0f, knobR * 0.09f));
 }
 
@@ -112,7 +114,9 @@ void CueLookAndFeel::drawLinearSlider (juce::Graphics& g, int x, int y, int widt
         g.fillRoundedRectangle (cap.translated (0.0f, 1.5f), 2.0f);
         g.setColour (cream);
         g.fillRoundedRectangle (cap, 2.0f);
-        g.setColour (colours::dark);
+        const auto brightness = 0.2126f * cream.getFloatRed() + 0.7152f * cream.getFloatGreen() + 0.0722f * cream.getFloatBlue();
+        const auto lineColour = (brightness > 0.5f) ? colours::dark : juce::Colours::white;
+        g.setColour (lineColour);
         g.drawLine (cap.getX() + 2.0f, cap.getCentreY(), cap.getRight() - 2.0f, cap.getCentreY(), 1.4f);
     }
     else // horizontal
@@ -128,7 +132,9 @@ void CueLookAndFeel::drawLinearSlider (juce::Graphics& g, int x, int y, int widt
         juce::Rectangle<float> cap (sliderPos - capW * 0.5f, cy - capH * 0.5f, capW, capH);
         g.setColour (cream);
         g.fillRoundedRectangle (cap, 2.0f);
-        g.setColour (colours::dark);
+        const auto brightness = 0.2126f * cream.getFloatRed() + 0.7152f * cream.getFloatGreen() + 0.0722f * cream.getFloatBlue();
+        const auto lineColour = (brightness > 0.5f) ? colours::dark : juce::Colours::white;
+        g.setColour (lineColour);
         g.drawLine (cap.getCentreX(), cap.getY() + 2.0f, cap.getCentreX(), cap.getBottom() - 2.0f, 1.4f);
     }
 }

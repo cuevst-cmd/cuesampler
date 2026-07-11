@@ -22,8 +22,7 @@
 
 //==============================================================================
 class AudioPluginAudioProcessor final : public juce::AudioProcessor,
-                                        private juce::AsyncUpdater,
-                                        private juce::Timer
+                                        private juce::AsyncUpdater
 {
 public:
     struct LoadedSampleData
@@ -380,8 +379,7 @@ private:
     // audio into the ChopAudioCache prepared-entry cache so the audio thread can
     // stream it 1:1 instead of running Bungee in real time. Polled from a message-
     // thread timer (editor-independent) so it keeps the cache warm even with the
-    // UI closed. See timerCallback() / PreparedWarmJob.
-    void timerCallback() override;
+    // UI closed. See CachePollerTimer / PreparedWarmJob.
     void warmPreparedCacheTick();
 
     // Per-voice Bungee stretcher/stream wrapper. Defined in the .cpp so the
@@ -425,6 +423,9 @@ private:
     cuesampler::UpdateChecker updateChecker;
     KeyDetector::Result detectedKeyResult;
     mutable std::mutex keyResultMutex;
+
+    class CachePollerTimer;
+    std::unique_ptr<CachePollerTimer> cachePollerTimer;
 
     struct VoiceState
     {

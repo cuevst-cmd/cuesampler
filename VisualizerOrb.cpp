@@ -171,6 +171,8 @@ static const char* kFragmentShader = R"(
         vec3 teal   = vec3 (0.440, 0.760, 0.660);   // reverb atmosphere
         vec3 violet = vec3 (0.610, 0.530, 0.870);   // delay echoes
         vec3 bg     = uBg.rgb;
+        if (length (bg) < 0.01)
+            bg = vec3 (0.0902, 0.0784, 0.0706);
 
         vec3 col = bg;
 
@@ -215,13 +217,17 @@ static const char* kFragmentShader = R"(
                 float rim   = exp (-abs (ghost) * 46.0);
                 col += violet * rim * uOn2.x * uDly.x * pow (uDly.z, float (k)) * 0.9;
             }
+
+            // Apply exposure and color grade to the orb itself
+            col *= 0.72 + 0.55 * uMaster.y;
+            col = pow (col, vec3 (0.92));
         }
         else
         {
             // warm halo, breathing with the audio
             float glow = 1.0 / (1.0 + minD * minD * 260.0);
-            col += orange * glow * (0.18 + 0.55 * uLevel);
-            col += white * glow * glow * 0.12;
+            vec3 halo = orange * glow * (0.18 + 0.55 * uLevel);
+            halo += white * glow * glow * 0.12;
 
             // REVERB builds the atmosphere: teal fog drifting around the orb.
             // SIZE extends its reach, DECAY thickens it, MIX sets density.
@@ -231,8 +237,8 @@ static const char* kFragmentShader = R"(
                 float fogN = 0.5 + 0.5 * fbm (vec3 (uv * 2.3, 0.7)
                                               + vec3 (0.0, -uTime * 0.06, uTime * 0.04));
                 float reach = 1.0 / (1.0 + minD * minD * (34.0 - 26.0 * uVerb.y));
-                col += teal  * fogN * reach * verbAmt * (0.40 + 0.40 * uVerb.z);
-                col += white * fogN * reach * verbAmt * 0.10;
+                halo += teal  * fogN * reach * verbAmt * (0.40 + 0.40 * uVerb.z);
+                halo += white * fogN * reach * verbAmt * 0.10;
             }
 
             // DELAY populates the environment: violet ghost orbs trailing
@@ -241,18 +247,20 @@ static const char* kFragmentShader = R"(
             vec3 ocA = ro - gcA;
             float bA = dot (ocA, rd);
             float perpA = length (ocA - bA * rd);
-            col += violet * exp (-abs (perpA - uRadius * 0.92) * 26.0) * uGhostA.w;
+            halo += violet * exp (-abs (perpA - uRadius * 0.92) * 26.0) * uGhostA.w;
 
             vec3 gcB = uCenter.xyz + uGhostB.xyz;
             vec3 ocB = ro - gcB;
             float bB = dot (ocB, rd);
             float perpB = length (ocB - bB * rd);
-            col += violet * exp (-abs (perpB - uRadius * 0.92) * 26.0) * uGhostB.w * 0.7;
-        }
+            halo += violet * exp (-abs (perpB - uRadius * 0.92) * 26.0) * uGhostB.w * 0.7;
 
-        // OUTPUT trim = exposure
-        col *= 0.72 + 0.55 * uMaster.y;
-        col = pow (col, vec3 (0.92));
+            // Apply exposure and color grade to the light halo
+            halo *= 0.72 + 0.55 * uMaster.y;
+            halo = pow (halo, vec3 (0.92));
+
+            col = bg + halo;
+        }
 
         gl_FragColor = vec4 (col, 1.0);
     }
@@ -417,7 +425,10 @@ void VisualizerOrb::renderOpenGL()
     glViewport (0, 0, juce::roundToInt (scale * (float) getWidth()),
                       juce::roundToInt (scale * (float) getHeight()));
 
-    const juce::Colour backdrop { bgArgb.load() };
+    auto argb = bgArgb.load();
+    if (argb == 0 || argb == 0xff000000)
+        argb = 0xff171412;
+    const juce::Colour backdrop { argb };
     juce::OpenGLHelpers::clear (backdrop);
 
     if (! shaderOk || shader == nullptr)
@@ -594,7 +605,10 @@ void VisualizerOrb::paint (juce::Graphics& g)
     if (r < 4.0f)
         return;
 
-    g.fillAll (juce::Colour { bgArgb.load() });
+    auto argb = bgArgb.load();
+    if (argb == 0 || argb == 0xff000000)
+        argb = 0xff171412;
+    g.fillAll (juce::Colour { argb });
 
     juce::ColourGradient grad (juce::Colour (0xffe2532e), c.x - r * 0.4f, c.y - r * 0.6f,
                                juce::Colour (0xffefa98c), c.x + r * 0.7f, c.y + r * 0.9f, true);

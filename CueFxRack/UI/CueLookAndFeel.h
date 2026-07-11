@@ -56,7 +56,7 @@ namespace cue
     inline Theme currentTheme = Theme::dark;
     inline bool  isLight() { return currentTheme == Theme::light; }
 
-    inline void applyTheme (Theme t)
+    inline void applyTheme (Theme t, bool warpActive = false, bool halftimeActive = false)
     {
         currentTheme = t;
 
@@ -83,6 +83,28 @@ namespace cue
             colours::creamDim = juce::Colour (0xff9c9082);
             colours::dark     = juce::Colour (0xff171009);
             colours::chip     = juce::Colour (0xfff2e7da);
+        }
+
+        // Drastic dynamic tints so the FX rack recolours with the rest of the UI
+        // when WARP or HALFTIME is active. Text/mark colours are left untouched.
+        const bool isL = (t == Theme::light);
+        if (warpActive)
+        {
+            // Extreme, electric violet/grape — matches the main UI's full-tilt warp read
+            colours::bg      = isL ? juce::Colour (0xffc9a6f5) : juce::Colour (0xff2a0d5c);
+            colours::panel   = isL ? juce::Colour (0xffd9bdfa) : juce::Colour (0xff3d1785);
+            colours::panelHi = isL ? juce::Colour (0xffe8d4fd) : juce::Colour (0xff4e1fa8);
+            colours::slot    = isL ? juce::Colour (0xffab7fee) : juce::Colour (0xff1f0847);
+            colours::line    = isL ? juce::Colour (0xff7d3fe0) : juce::Colour (0xff7d45d6);
+        }
+        else if (halftimeActive)
+        {
+            // Extreme, electric glacial ice/cyan — matches the main UI's full-tilt halftime read
+            colours::bg      = isL ? juce::Colour (0xff9fdff0) : juce::Colour (0xff042838);
+            colours::panel   = isL ? juce::Colour (0xffbaebf7) : juce::Colour (0xff073f56);
+            colours::panelHi = isL ? juce::Colour (0xffd2f5fc) : juce::Colour (0xff0a5170);
+            colours::slot    = isL ? juce::Colour (0xff72c8e2) : juce::Colour (0xff031e2c);
+            colours::line    = isL ? juce::Colour (0xff28a0c6) : juce::Colour (0xff14657f);
         }
     }
 

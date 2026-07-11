@@ -103,7 +103,7 @@ void ModulePanel::refreshColours()
 // Header strip = drag handle for reordering the rack
 void ModulePanel::mouseDown (const juce::MouseEvent& e)
 {
-    if (e.position.y < 34.0f && onDragStarted != nullptr)
+    if (onDragStarted != nullptr)
     {
         draggingHeader = true;
         dragGrabOffset = e.getPosition();

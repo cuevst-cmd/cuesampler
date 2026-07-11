@@ -28,7 +28,7 @@ namespace cue
             const auto centre = b.getCentre();
             const auto radius = juce::jmin (b.getWidth(), b.getHeight()) * 0.5f - 10.0f;
 
-            if (radius < 8.0f)                                   // mid-animation / tiny panel
+            if (radius < 4.0f)                                   // mid-animation / tiny panel
                 return;
 
             // frame: ring + crosshair + diagonals
@@ -118,12 +118,16 @@ namespace cue
 
         void layoutContent (juce::Rectangle<int> area) override
         {
-            scope.setBounds (area.removeFromTop (area.getHeight() - 166).reduced (2));
+            if (area.isEmpty())
+                return;
+
             auto toggleRow = area.removeFromBottom (22);
             bassMono.setBounds (toggleRow.withSizeKeepingCentre (110, 20));
+            auto knobRow = area.removeFromBottom (72);
+            scope.setBounds (area.reduced (2));
 
-            placeKnob (width, area.removeFromLeft (area.getWidth() / 2), 68);
-            placeKnob (xover, area, 52);
+            placeKnob (width, knobRow.removeFromLeft (knobRow.getWidth() / 2), 52);
+            placeKnob (xover, knobRow, 52);
         }
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ImagerPanel)

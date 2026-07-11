@@ -78,7 +78,7 @@ void RackToolbar::resized()
     auto r = getLocalBounds().reduced (8, 5);
 
     // unused modules from the left (after the section label)
-    r.removeFromLeft (58);
+    r.removeFromLeft (98);
     for (auto* chip : moduleChips)
     {
         chip->setBounds (r.removeFromLeft (74));
@@ -94,17 +94,17 @@ void RackToolbar::paint (juce::Graphics& g)
     g.fillAll (colours::bg.darker (0.25f));
     g.setColour (colours::line);
     g.drawLine (0.0f, 0.5f, (float) getWidth(), 0.5f, 1.0f);
+    g.drawLine (0.0f, (float) getHeight() - 0.5f, (float) getWidth(), (float) getHeight() - 0.5f, 1.0f);
 
     g.setColour (colours::creamDim.withAlpha (0.8f));
-    g.setFont (monoFont (8.5f));
-    g.drawFittedText ("MOD-\nULES", 10, 8, 44, juce::jmax (0, getHeight() - 16),
-                      juce::Justification::centredLeft, 2);
+    g.setFont (monoFont (11.5f, true));
+    g.drawText ("FX MODULES", 12, 0, 90, getHeight(), juce::Justification::centredLeft, false);
 
     if (moduleChips.isEmpty())
     {
         g.setColour (colours::creamDim.withAlpha (0.4f));
         g.setFont (monoFont (9.5f));
-        g.drawText ("ALL MODULES RACKED", 58, 0, 220, getHeight(),
+        g.drawText ("ALL MODULES RACKED", 114, 0, 220, getHeight(),
                     juce::Justification::centredLeft, false);
     }
 }

@@ -37,11 +37,25 @@ private:
     EditTelemetry& owner;
 };
 
+class EditTelemetry::BpmCoalesceTimer final : public juce::Timer
+{
+public:
+    explicit BpmCoalesceTimer (EditTelemetry& ownerIn) : owner (ownerIn) {}
+    void timerCallback() override
+    {
+        stopTimer();
+        owner.flushPendingBpmFromTimer();
+    }
+private:
+    EditTelemetry& owner;
+};
+
 EditTelemetry::EditTelemetry()
     : endpointUrl (juce::String (APIKeys::TelemetryEndpointUrl).trim()),
       sharedSecret (juce::String (APIKeys::TelemetrySharedSecret).trim())
 {
     loadSettings();
+    bpmTimer = std::make_unique<BpmCoalesceTimer> (*this);
     // if (isEnabled())
     //     startUploads();
 }
@@ -50,7 +64,22 @@ EditTelemetry::~EditTelemetry()
 {
     // Worker first (may touch files), then timer (message thread), then flush.
     stopUploads();
-    stopTimer();
+
+    if (auto* helper = bpmTimer.release())
+    {
+        if (auto* mm = juce::MessageManager::getInstanceWithoutCreating())
+        {
+            if (mm->isThisTheMessageThread())
+                delete helper;
+            else
+                juce::MessageManager::callAsync ([helper] { delete helper; });
+        }
+        else
+        {
+            // MessageManager is dead, let it leak safely
+        }
+    }
+
     flush();
 }
 
@@ -120,7 +149,8 @@ void EditTelemetry::recordBpmCorrection (double algorithmBpm,
 
     // Coalesce rapid edits (slider drags): (re)start the settle timer. Safe
     // because this method is only called from the message thread.
-    startTimer (kBpmCoalesceMs);
+    if (bpmTimer != nullptr)
+        bpmTimer->startTimer (kBpmCoalesceMs);
 }
 
 void EditTelemetry::recordKeyObservation (const std::string& localKey,
@@ -172,9 +202,8 @@ void EditTelemetry::flush()
     flushPendingBpmLocked();
 }
 
-void EditTelemetry::timerCallback()
+void EditTelemetry::flushPendingBpmFromTimer()
 {
-    stopTimer();
     const std::lock_guard<std::mutex> lock (mutex);
     flushPendingBpmLocked();
 }

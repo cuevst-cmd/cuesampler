@@ -61,10 +61,10 @@ struct FxRackStrip::Impl
         // id, panel, layout weight, power param, starts-in-toolbar — the
         // CUERACK set (minus CUE / MASTER / HALF, which the sampler covers
         // elsewhere). Default row: EQ | COMP | TAPE DELAY | REVERB.
-        items = { { "EQ",      &eq,           380.0f, pid::eqOn,    false },
-                  { "COMP",    &comp,         300.0f, pid::compOn,  false },
-                  { "DLY",     &delay,        300.0f, pid::dlyOn,   false },
-                  { "VERB",    &reverb,       330.0f, pid::revOn,   false },
+        items = { { "EQ",      &eq,           380.0f, pid::eqOn,    true  },
+                  { "COMP",    &comp,         300.0f, pid::compOn,  true  },
+                  { "DLY",     &delay,        300.0f, pid::dlyOn,   true  },
+                  { "VERB",    &reverb,       330.0f, pid::revOn,   true  },
                   { "LIM",     &limiter,      165.0f, pid::limOn,   true  },
                   { "CRUSH",   &crusher,      250.0f, pid::crushOn, true  },
                   { "IMG",     &imager,       268.0f, pid::imgOn,   true  },
@@ -414,7 +414,7 @@ struct FxRackStrip::Impl
     void removePanel (const juce::String& id)
     {
         auto* item = itemFor (id);
-        if (item == nullptr || ! order.contains (id) || order.size() <= 1)
+        if (item == nullptr || ! order.contains (id))
             return;
 
         order.removeString (id);
@@ -444,6 +444,7 @@ struct FxRackStrip::Impl
         applyLayout (true);
         syncToolbar();
         saveArrangement();
+        owner.repaint();
     }
 
     void restorePanel (const juce::String& id)
@@ -475,6 +476,21 @@ struct FxRackStrip::Impl
         applyLayout (true);
         syncToolbar();
         saveArrangement();
+        owner.repaint();
+    }
+
+    bool isEmpty() const { return order.isEmpty(); }
+
+    void paint (juce::Graphics& g)
+    {
+        if (isEmpty())
+        {
+            auto area = viewport.getBounds();
+            g.setColour (colours::creamDim.withAlpha (0.4f));
+            g.setFont (monoFont (13.0f));
+            g.drawFittedText ("FX RACK EMPTY\nCLICK MODULE CHIPS ABOVE TO ADD EFFECTS",
+                              area, juce::Justification::centred, 2);
+        }
     }
 
     //==================================================================
@@ -482,8 +498,8 @@ struct FxRackStrip::Impl
     {
         animator.cancelAllAnimations (false);
         auto r = owner.getLocalBounds();
-        toolbar.setBounds (r.removeFromBottom (kToolbarH));
-        r.removeFromBottom (kGap);
+        toolbar.setBounds (r.removeFromTop (kToolbarH));
+        r.removeFromTop (kGap);
         viewport.setBounds (r);
         rebuildTargets();
         applyLayout (false);
@@ -540,12 +556,13 @@ FxRackStrip::FxRackStrip (juce::AudioProcessorValueTreeState& state, const FxRac
 
 FxRackStrip::~FxRackStrip() = default;
 
+void FxRackStrip::paint (juce::Graphics& g)   { impl->paint (g); }
 void FxRackStrip::resized()                 { impl->resized(); }
 void FxRackStrip::refreshColours()          { impl->refreshColours(); }
 
-void FxRackStrip::applyRackTheme (bool light)
+void FxRackStrip::applyRackTheme (bool light, bool warpActive, bool halftimeActive)
 {
-    cue::applyTheme (light ? Theme::light : Theme::dark);
+    cue::applyTheme (light ? Theme::light : Theme::dark, warpActive, halftimeActive);
 }
 
 } // namespace cue

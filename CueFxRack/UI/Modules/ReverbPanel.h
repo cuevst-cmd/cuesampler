@@ -49,7 +49,7 @@ namespace cue
             const auto centre = b.getCentre();
             const auto maxR   = juce::jmin (b.getWidth(), b.getHeight()) * 0.5f - 6.0f;
 
-            if (maxR < 8.0f)                                     // mid-animation / tiny panel
+            if (maxR < 4.0f)                                     // mid-animation / tiny panel
                 return;
 
             const auto size01  = norm (pid::revSize)  / 100.0f;
@@ -156,10 +156,12 @@ namespace cue
 
         void layoutContent (juce::Rectangle<int> area) override
         {
-            // the animated space takes every pixel the knobs don't need
-            space.setBounds (area.removeFromTop (area.getHeight() - 152).reduced (2, 0));
-            auto row1 = area.removeFromTop (76);
-            auto row2 = area;
+            if (area.isEmpty())
+                return;
+
+            auto row2 = area.removeFromBottom (72);
+            auto row1 = area.removeFromBottom (72);
+            space.setBounds (area.reduced (2, 0));
 
             const int colW = row1.getWidth() / 3;
             placeKnob (size,  row1.removeFromLeft (colW), 46);

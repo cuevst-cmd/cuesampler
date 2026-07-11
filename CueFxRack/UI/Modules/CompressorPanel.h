@@ -48,11 +48,13 @@ namespace cue
 
         void layoutContent (juce::Rectangle<int> area) override
         {
-            meterRect    = area.removeFromBottom (44);
-            auto row3    = area.removeFromBottom (84);
-            const int h2 = area.getHeight() / 2;
-            auto row1    = area.removeFromTop (h2);
-            auto row2    = area;
+            if (area.isEmpty())
+                return;
+
+            auto row1    = area.removeFromTop (72);
+            auto row2    = area.removeFromTop (72);
+            auto row3    = area.removeFromTop (64);
+            meterRect    = area;
 
             const int colW = row1.getWidth() / 3;
             placeKnob (thresh,  row1.removeFromLeft (colW), 56);

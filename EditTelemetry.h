@@ -26,11 +26,11 @@ namespace cuesampler
 // the coalescing Timer). setSampleContext()/recordKeyObservation() may be
 // called from the key-detection background thread. All shared state is guarded
 // by a mutex; file appends are serialized through the same lock.
-class EditTelemetry : private juce::Timer
+class EditTelemetry
 {
 public:
     EditTelemetry();
-    ~EditTelemetry() override;
+    ~EditTelemetry();
 
     // --- Consent -----------------------------------------------------------
     bool isEnabled() const noexcept { return enabled.load (std::memory_order_acquire); }
@@ -89,7 +89,10 @@ private:
     class UploadThread;
     friend class UploadThread;
 
-    void timerCallback() override;
+    class BpmCoalesceTimer;
+    std::unique_ptr<BpmCoalesceTimer> bpmTimer;
+    void flushPendingBpmFromTimer();
+
     void writeEvent (const juce::String& type, juce::DynamicObject::Ptr fields);
     void writeEventLocked (const juce::String& type, juce::DynamicObject::Ptr fields);
     void flushPendingBpmLocked();
