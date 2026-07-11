@@ -2373,6 +2373,11 @@ void AudioPluginAudioProcessor::prepareToPlay (double sampleRate, int samplesPer
     compressor.prepare (sampleRate, juce::jmax (1, samplesPerBlock), compChannels);
     bitCrusher.prepare (sampleRate, juce::jmax (1, samplesPerBlock), compChannels);
 
+    // CUE FX rack chain. The limiter's lookahead delay runs even when the
+    // module is bypassed, so the reported latency stays constant.
+    fxEngine.prepare (sampleRate, juce::jmax (1, samplesPerBlock), compChannels);
+    setLatencySamples (fxEngine.getLatencySamples());
+
     for (auto& v : voices)
         v.reset();
 
@@ -3114,29 +3119,13 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     playbackActive.store (activeVoice.playbackActive, std::memory_order_release);
     playbackSamplePosition.store (activeVoice.playbackSamplePosition, std::memory_order_release);
 
-    bitCrusher.process (buffer);
-
-    // Capture a rolling mono window of the crushed output for the UI scope
-    // visualizer (before the compressor colours it). Cheap: a handful of ring
-    // writes plus a 64-slot relaxed publish, only while the crusher is on.
-    if (bitCrusher.isEnabled())
+    // CUE FX rack: CUERACK's master chain (EQ > COMP > CRUSH > AMP > mod trio
+    // > TAPE DELAY > REVERB > IMAGER > LIMITER). It replaces the legacy
+    // crusher + compressor pair — those modules now live inside the rack.
     {
-        const int   n  = buffer.getNumSamples();
-        const auto* L  = buffer.getReadPointer (0);
-        const auto* R  = buffer.getNumChannels() > 1 ? buffer.getReadPointer (1) : nullptr;
-        for (int i = 0; i < n; ++i)
-        {
-            bitCrusherScopeRing[(size_t) bitCrusherScopeWritePos] = R != nullptr ? 0.5f * (L[i] + R[i]) : L[i];
-            bitCrusherScopeWritePos = (bitCrusherScopeWritePos + 1) % kBitCrusherScopeSize;
-        }
-        for (int i = 0; i < kBitCrusherScopeSize; ++i)
-        {
-            const int idx = (bitCrusherScopeWritePos + i) % kBitCrusherScopeSize; // oldest first
-            bitCrusherScope[(size_t) i].store (bitCrusherScopeRing[(size_t) idx], std::memory_order_relaxed);
-        }
+        const auto rackBpm = hostBpm.load (std::memory_order_acquire);
+        fxEngine.process (buffer, rackBpm > 0.0 ? rackBpm : 120.0);
     }
-
-    compressor.process (buffer);
 
     float blockPeak = 0.0f;
     for (int ch = 0; ch < totalNumOutputChannels; ++ch)
@@ -3320,6 +3309,10 @@ void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData
         state.addChild (chopStateTree, -1, nullptr);
     }
 
+    // CUE FX rack: parameters + rack arrangement nest inside the session
+    // state as the APVTS tree ("PARAMS").
+    state.addChild (apvts.copyState(), -1, nullptr);
+
     juce::MemoryOutputStream output (destData, false);
     output.write (cueSamplerStateMagic, 4);
     state.writeToStream (output);
@@ -3351,6 +3344,11 @@ void AudioPluginAudioProcessor::setStateInformation (const void* data, int sizeI
 
     if (! state.isValid() || ! state.hasType ("CueSamplerState"))
         return;
+
+    // CUE FX rack: restore the nested APVTS tree (parameters + rack
+    // arrangement) first — it applies even when no sample state follows.
+    if (const auto fxState = state.getChildWithName (apvts.state.getType()); fxState.isValid())
+        apvts.replaceState (fxState.createCopy());
 
     const auto restoreState = parseDeferredRestoreState (state);
     if (! restoreState.hasExplicitSampleState)

@@ -11,10 +11,11 @@ namespace cue
 class CueSamplerLookAndFeel;
 class HelpOverlayComponent;
 class HeaderComponent;
+class VisualizerOrb;
 class WaveformDisplayComponent;
 class TransportSectionComponent;
 class UtilityStripComponent;
-class EffectsRackComponent;
+class FxRackStrip;
 class StemRackComponent;
 class StartKnobComponent;
 class UpdateBannerComponent;
@@ -41,17 +42,18 @@ public:
 
 private:
     float getUiScale() const noexcept;
+    int getUiFluidWidth() const noexcept;   // design-space width the layout fills
 
     // Reveals the "new version available" banner from the update checker's
     // result. Idempotent: only builds/shows the banner once per session.
     void showUpdateBannerIfNeeded();
 
-    void paintSideRail (juce::Graphics&, juce::Rectangle<int>, bool isLeftRail) const;
-    void paintScrew (juce::Graphics&, juce::Point<float>) const;
+    // Light/dark theme swap (CUERACK-style). The choice persists in a
+    // per-user settings file; plugin state is untouched.
+    void toggleTheme();
+    void applyThemeToUi();
 
     AudioPluginAudioProcessor& processorRef;
-
-    juce::Image backgroundImage;
 
     juce::Component contentComponent;
 
@@ -60,12 +62,13 @@ private:
     std::unique_ptr<cue::WaveformDisplayComponent> waveformDisplayComponent;
     std::unique_ptr<cue::TransportSectionComponent> transportSectionComponent;
     std::unique_ptr<cue::UtilityStripComponent> utilityStripComponent;
-    std::unique_ptr<cue::EffectsRackComponent> effectsRackComponent;
+    std::unique_ptr<cue::FxRackStrip> fxRackStrip;
     std::unique_ptr<cue::StemRackComponent> stemRackComponent;
 
     std::unique_ptr<cue::HelpOverlayComponent> helpOverlayComponent;
     std::unique_ptr<cue::UpdateBannerComponent> updateBannerComponent;
     std::unique_ptr<cue::GlassKeyboard> midiKeyboardComponent;
+    std::unique_ptr<cue::VisualizerOrb> cueOrbComponent;
     std::unique_ptr<juce::FileChooser> fileChooser;
 
     juce::TooltipWindow tooltipWindow { this, 500 };

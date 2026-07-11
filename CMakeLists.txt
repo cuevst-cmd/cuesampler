@@ -189,6 +189,11 @@ target_sources(CueSampler
         PluginProcessor.cpp
         BeatThisAnalyzer.cpp
         StemSeparator.cpp
+        VisualizerOrb.cpp
+        CueFxRack/FxRackStrip.cpp
+        CueFxRack/UI/CueLookAndFeel.cpp
+        CueFxRack/UI/ModulePanel.cpp
+        CueFxRack/UI/RackToolbar.cpp
         WarpMap.cpp
         ChopAudioCache.cpp
         SSLBusCompressor.cpp
@@ -247,6 +252,7 @@ target_link_libraries(CueSampler
         juce::juce_audio_utils
         juce::juce_cryptography
         juce::juce_dsp
+        juce::juce_opengl
         chromaprint
         bungee_library
         "${ORT_LINK_LIB}"
@@ -257,6 +263,7 @@ target_link_libraries(CueSampler
 
 target_include_directories(CueSampler
     PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/CueFxRack"
         "${bungee_SOURCE_DIR}"
         "${bungee_SOURCE_DIR}/submodules/eigen"
         "${chromaprint_SOURCE_DIR}/src"

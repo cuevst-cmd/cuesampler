@@ -13,6 +13,7 @@
 #include "SSLBusCompressor.h"
 #include "BitCrusher.h"
 #include "WarpMap.h"
+#include "CueFxRack/FxEngine.h"
 
 #include <atomic>
 #include <memory>
@@ -194,6 +195,17 @@ public:
     // published lock-free from the audio thread and read on the editor timer.
     static constexpr int kBitCrusherScopeSize = 64;
     void  readBitCrusherScope (float* dest, int maxSamples) const noexcept;
+
+    //==============================================================================
+    // CUE FX rack — CUERACK's master chain, ported (see CueFxRack/FxEngine.h).
+    // Parameters live in an APVTS whose state nests inside the sampler's
+    // session state; the editor's rack strip attaches its panels directly.
+    juce::AudioProcessorValueTreeState apvts { *this, nullptr, "PARAMS", cue::createParameterLayout() };
+
+    float getFxCompGainReductionDb() const        { return fxEngine.getCompGainReductionDb(); }
+    int   getFxLimiterNumBands() const            { return fxEngine.getLimiterNumBands(); }
+    float getFxLimiterBandGRDb (int band) const   { return fxEngine.getLimiterBandGRDb (band); }
+    juce::Point<float> getFxImagerMidSide() const { return { fxEngine.getMidLevel(), fxEngine.getSideLevel() }; }
 
     bool isPlaying() const noexcept;
     double getPlaybackSamplePosition() const noexcept;
@@ -615,6 +627,10 @@ private:
     std::atomic<bool>  compressorEnabledUi     { false };
 
     cuesampler::BitCrusher bitCrusher;
+
+    // CUERACK master chain (post sample/stem mix; replaces the legacy
+    // crusher + compressor pair above, whose modules now live in the rack).
+    cue::FxEngine fxEngine { apvts };
     std::atomic<float> bitCrusherBitsUi    { 0.0f };
     std::atomic<float> bitCrusherCrushUi   { 0.0f };
     std::atomic<bool>  bitCrusherEnabledUi { false };
