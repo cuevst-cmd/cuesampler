@@ -2115,6 +2115,8 @@ class AudioPluginAudioProcessor::CachePollerTimer final : public juce::Timer
 {
 public:
     explicit CachePollerTimer (AudioPluginAudioProcessor& ownerIn) : owner (ownerIn) {}
+    ~CachePollerTimer() override { stopTimer(); }
+
     void timerCallback() override
     {
         owner.warmPreparedCacheTick();
@@ -2230,19 +2232,15 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
 
 AudioPluginAudioProcessor::~AudioPluginAudioProcessor()
 {
-    if (auto* helper = cachePollerTimer.release())
+    if (juce::MessageManager::getInstanceWithoutCreating() != nullptr)
     {
-        if (auto* mm = juce::MessageManager::getInstanceWithoutCreating())
-        {
-            if (mm->isThisTheMessageThread())
-                delete helper;
-            else
-                juce::MessageManager::callAsync ([helper] { delete helper; });
-        }
-        else
-        {
-            // MessageManager is dead, let it leak safely
-        }
+        cachePollerTimer.reset();
+    }
+    else if (auto* helper = cachePollerTimer.release())
+    {
+        // The JUCE TimerThread asserts if its last owner is destroyed after the
+        // MessageManager, so stop callbacks and leak only during process shutdown.
+        helper->stopTimer();
     }
 
     cancelPendingUpdate();

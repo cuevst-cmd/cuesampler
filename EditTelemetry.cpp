@@ -62,22 +62,18 @@ EditTelemetry::EditTelemetry()
 
 EditTelemetry::~EditTelemetry()
 {
-    // Worker first (may touch files), then timer (message thread), then flush.
+    // Worker first (may touch files), then unregister the coalescing timer, then flush.
     stopUploads();
 
-    if (auto* helper = bpmTimer.release())
+    if (juce::MessageManager::getInstanceWithoutCreating() != nullptr)
     {
-        if (auto* mm = juce::MessageManager::getInstanceWithoutCreating())
-        {
-            if (mm->isThisTheMessageThread())
-                delete helper;
-            else
-                juce::MessageManager::callAsync ([helper] { delete helper; });
-        }
-        else
-        {
-            // MessageManager is dead, let it leak safely
-        }
+        bpmTimer.reset();
+    }
+    else if (auto* helper = bpmTimer.release())
+    {
+        // The JUCE TimerThread asserts if its last owner is destroyed after the
+        // MessageManager, so stop callbacks and leak only during process shutdown.
+        helper->stopTimer();
     }
 
     flush();
