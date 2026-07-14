@@ -27,6 +27,7 @@ namespace cue
 
             startTimerHz (30);
         }
+        ~ReverbSpace() override { stopTimer(); }
 
         void mouseDown (const juce::MouseEvent& e) override
         {

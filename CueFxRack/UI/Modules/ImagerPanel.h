@@ -19,6 +19,7 @@ namespace cue
             setInterceptsMouseClicks (false, false);
             startTimerHz (30);
         }
+        ~ImagerScope() override { stopTimer(); }
 
         std::function<juce::Point<float>()> levelSource;   // returns (mid, side)
 

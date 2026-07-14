@@ -25,6 +25,7 @@ namespace cue
             setInterceptsMouseClicks (false, false);
             startTimerHz (30);
         }
+        ~ModViz() override { stopTimer(); }
 
         void paint (juce::Graphics& g) override
         {

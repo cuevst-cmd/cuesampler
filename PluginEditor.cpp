@@ -253,10 +253,11 @@ const juce::String& brandFontName()
     return name;
 }
 
-// Brand text font (Syne). heavyFont() is the bold weight used for nearly all UI
-// text — labels, buttons, headers, the stacked title. brandFont() is the plain
-// weight for lighter/secondary text. Numeric readouts deliberately stay
-// monospaced (monoFont / cousineFont) so live-updating digits keep their width.
+juce::Font brandFont (float height)
+{
+    return { juce::FontOptions (brandFontName(), height, juce::Font::plain) };
+}
+
 juce::Font heavyFont (float height)
 {
     return { juce::FontOptions (brandFontName(), height, juce::Font::bold) };
@@ -748,8 +749,9 @@ static void drawKeycap (juce::Graphics& g, juce::Rectangle<float> bounds, float 
 // with a dark centre mark when on. One code path keeps hover/press/on
 // states consistent between the switches.
 static void drawGlassToggle (juce::Graphics& g, juce::Rectangle<float> bounds,
-                      float position, float hover, bool isDown,
-                      float ledRadius, float ledOffsetY)
+                             float position, float hover, bool isDown,
+                             float ledRadius, float ledOffsetY,
+                             bool isHalfTime = false)
 {
     const float pos = juce::jlimit (0.0f, 1.0f, position);
 
@@ -762,10 +764,11 @@ static void drawGlassToggle (juce::Graphics& g, juce::Rectangle<float> bounds,
 
     if (pos > 0.01f)
     {
-        g.setColour (accentOrange.withAlpha (pos));
+        const auto activeColour = isHalfTime ? juce::Colour (0xff38bdf8) : accentOrange;
+        g.setColour (activeColour.withAlpha (pos));
         g.fillEllipse (ledBounds);
         g.setColour (darkInk.withAlpha (pos));
-        g.fillEllipse (ledBounds.reduced (ledRadius * 0.62f));
+        g.fillEllipse (ledBounds.reduced (ledRadius * 0.60f));
     }
 
     if (pos < 0.99f)
@@ -1075,7 +1078,8 @@ public:
                 const bool isHalfTime = style == "halfTime";
                 drawGlassToggle (g, bounds, position, hover, isButtonDown,
                                  isHalfTime ? 3.5f : 4.0f,   // LED radius
-                                 isHalfTime ? 11.0f : 14.0f); // LED y-offset
+                                 isHalfTime ? 11.0f : 14.0f, // LED y-offset
+                                 isHalfTime);
                 return;
             }
 
@@ -1193,13 +1197,13 @@ public:
                 position = animatedButton->getCurrentAnimationPosition();
             float clampedPos = juce::jlimit (0.0f, 1.0f, position);
 
-            auto textOff = textMuted;
-            auto textOn = textPrimary;
+            auto textOff = textPrimary.withAlpha (0.75f);
+            auto textOn  = juce::Colour (0xff38bdf8); // vibrant ice-blue
             g.setColour (textOff.interpolatedWith (textOn, clampedPos));
-            g.setFont (monoFont (7.5f));
-            // Below the status LED (radius 3.5 at capY + 11), inside the face.
+            g.setFont (heavyFont (10.5f).withExtraKerningFactor (0.05f));
+            // Below the status LED inside the face.
             g.drawFittedText (button.getButtonText(),
-                              bounds.withTop ((int) (cap.getY() + 16.0f)).withTrimmedBottom (1),
+                              bounds.withTop (juce::roundToInt (cap.getY() + 15.0f)),
                               juce::Justification::centred, 2);
             return;
         }
@@ -1720,6 +1724,120 @@ private:
     }
 };
 
+class WarpHelpOverlayComponent final : public juce::Component,
+                                       public juce::KeyListener
+{
+public:
+    using juce::Component::keyPressed;
+
+    WarpHelpOverlayComponent()
+    {
+        setInterceptsMouseClicks (true, true);
+
+        okButton.setButtonText ("OK");
+        okButton.getProperties().set ("cueStyle", "flatAction");
+        okButton.onClick = [this] { setVisible (false); };
+        addAndMakeVisible (okButton);
+    }
+
+    void resized() override
+    {
+        const auto card = getLocalBounds().toFloat().withSizeKeepingCentre (680.0f, 440.0f);
+        okButton.setBounds (juce::roundToInt (card.getCentreX() - 70.0f),
+                            juce::roundToInt (card.getBottom() - 62.0f),
+                            140, 44);
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto bounds = getLocalBounds().toFloat();
+
+        // Dark translucent overlay backdrop behind popup
+        g.setColour (juce::Colours::black.withAlpha (0.50f));
+        g.fillAll();
+
+        // Dialog card frame centered in bounds (large card: 680x440)
+        const auto card = bounds.withSizeKeepingCentre (680.0f, 440.0f);
+
+        // Card background
+        g.setColour (panelDark.withAlpha (0.98f));
+        g.fillRoundedRectangle (card, mediumCorner);
+        g.setColour (borderMid);
+        g.drawRoundedRectangle (card, mediumCorner, 1.5f);
+
+        // WARP accent stripe (glowing purple 0xffa855f7)
+        g.setColour (juce::Colour (0xffa855f7));
+        juce::Path stripe;
+        stripe.addRoundedRectangle (card.getX(), card.getY(), card.getWidth(), 5.0f,
+                                    mediumCorner, mediumCorner, true, true, false, false);
+        g.fillPath (stripe);
+
+        // Header Title
+        g.setColour (themedTitleColour (juce::Colour (0xffa855f7)));
+        g.setFont (heavyFont (22.0f).withExtraKerningFactor (0.10f));
+        g.drawText ("WARP MODE GUIDE", card.withTrimmedTop (20.0f).withHeight (32.0f),
+                    juce::Justification::centred, false);
+
+        // Separator line
+        g.setColour (borderMid.withAlpha (0.75f));
+        g.drawLine (card.getX() + 24.0f, card.getY() + 60.0f,
+                    card.getRight() - 24.0f, card.getY() + 60.0f, 1.2f);
+
+        // Feature instructions list
+        struct Bullet { const char* label; const char* desc; };
+        const Bullet bullets[] = {
+            { "DROP MARKERS",  "Click inside any chop on the waveform to add warp markers." },
+            { "TIME STRETCH",  "Drag markers left or right to shift local audio timing." },
+            { "GRID SNAP",     "Markers auto-snap to your grid. Right-click to snap or remove." },
+            { "CLEAR ALL",     "Use the CLEAR ALL button to wipe markers for the active chop." },
+            { "EXITING WARP",  "Click WARP again or press Escape anytime to exit WARP mode." }
+        };
+
+        float y = card.getY() + 78.0f;
+        const float x = card.getX() + 32.0f;
+        const float labelW = 145.0f;
+        const float textW  = card.getWidth() - 64.0f - labelW;
+
+        for (const auto& b : bullets)
+        {
+            // Accent label (prominent purple)
+            g.setFont (monoFont (13.5f).withExtraKerningFactor (0.06f));
+            g.setColour (juce::Colour (0xffc084fc));
+            g.drawText (b.label, juce::Rectangle<float> (x, y, labelW, 26.0f),
+                        juce::Justification::centredLeft, false);
+
+            // Description (large clear text)
+            g.setFont (brandFont (15.5f));
+            g.setColour (textPrimary.withAlpha (0.95f));
+            g.drawText (b.desc, juce::Rectangle<float> (x + labelW, y, textW, 26.0f),
+                        juce::Justification::centredLeft, false);
+
+            y += 38.0f;
+        }
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        // Dismiss if clicking backdrop outside the dialog card
+        const auto card = getLocalBounds().toFloat().withSizeKeepingCentre (680.0f, 440.0f);
+        if (! card.contains (e.position))
+            setVisible (false);
+    }
+
+    bool keyPressed (const juce::KeyPress& key, juce::Component*) override
+    {
+        if (isVisible() && (key == juce::KeyPress::escapeKey || key == juce::KeyPress::returnKey))
+        {
+            setVisible (false);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    cue::SmoothHoverButton okButton;
+};
+
 // The "CUE." brand wordmark (the bundled cue_logo_white.svg, including its
 // trailing square period), recoloured to CUERACK cream ink. Rendered as vector
 // so it stays crisp at any UI scale and sits on the top line of the lockup.
@@ -1731,6 +1849,8 @@ class HeaderComponent final : public juce::Component,
                               private juce::Timer
 {
 public:
+    ~HeaderComponent() override { stopTimer(); }
+
     explicit HeaderComponent (AudioPluginAudioProcessor& p)
         : processor (p)
     {
@@ -1790,6 +1910,16 @@ public:
         themeButton.setTooltip ("Switch between light and dark themes.");
         themeButton.onClick = [this] { if (onThemeToggled) onThemeToggled(); };
         addAndMakeVisible (themeButton);
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        windowDragger.startDraggingComponent (getTopLevelComponent(), e);
+    }
+
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        windowDragger.dragComponent (getTopLevelComponent(), e, nullptr);
     }
 
     void resized() override
@@ -1909,6 +2039,7 @@ private:
     }
 
     AudioPluginAudioProcessor& processor;
+    juce::ComponentDragger windowDragger;
     SmoothHoverButton helpButton;
     SmoothHoverButton dataButton;
     SmoothHoverButton undoButton;
@@ -1959,6 +2090,7 @@ public:
 
     ~WaveformDisplayComponent() override
     {
+        stopTimer();
         processor.sampleChangeBroadcaster.removeChangeListener (this);
         processor.editChangeBroadcaster.removeChangeListener (this);
         horizontalScrollBar.removeListener (this);
@@ -4677,6 +4809,8 @@ class TransportSectionComponent final : public juce::Component,
                                         private juce::Timer
 {
 public:
+    ~TransportSectionComponent() override { stopTimer(); }
+
     explicit TransportSectionComponent (AudioPluginAudioProcessor& p)
         : processor (p),
           timeDisplay ("", "00:00:00", 16.0f, "timeBox"),
@@ -4693,7 +4827,7 @@ public:
         configureButton (playButton, "", textPrimary);
         configureButton (pauseButton, "", textPrimary);
         configureButton (stopButton, "", textPrimary);
-        configureButton (halfSpeedButton, "HALF\nTIME", textMuted);
+        configureButton (halfSpeedButton, "HALF\nTIME", textPrimary.withAlpha (0.90f));
         configureButton (chopTransientsButton, "CHOP @ TRANS.", textPrimary.withAlpha (0.75f));
         configureButton (barsButton, "# OF BARS", textPrimary.withAlpha (0.75f));
         configureButton (loadButton, "LOAD SAMPLE", textPrimary.withAlpha (0.75f));
@@ -4801,6 +4935,8 @@ public:
                 for (auto* c : parent->getChildren())
                     c->repaint();
             }
+            if (onWarpToggled)
+                onWarpToggled (active);
         };
         addAndMakeVisible (warpButton);
 
@@ -4962,16 +5098,50 @@ public:
         const auto topPanel = getTopPanelBounds();
         const int topCenterY = topPanel.getCentreY();
         
-        loadButton.setBounds (16, topCenterY - 24, 140, 48);
-        const int transportX = 168; 
-        playButton.setBounds (transportX, topCenterY - 24, 48, 48);
-        pauseButton.setBounds (transportX + 64, topCenterY - 24, 48, 48);
-        stopButton.setBounds (transportX + 128, topCenterY - 24, 48, 48);
-        halfSpeedButton.setBounds (transportX + 225, topCenterY - 24, 56, 48);
-        startKnob.setBounds (transportX + 306, topCenterY - 34, smallKnobDiameter, smallKnobDiameter + 19);
-        timeDisplay.setBounds (transportX + 397, topCenterY - 24, 160, 48);
-        tempoDisplay.setBounds (transportX + 573, topCenterY - 24, 80, 48);
-        keyDisplay.setBounds (transportX + 661, topCenterY - 24, 80, 48);
+        const int sideMargin = 16;
+        const int totalW = getWidth() - (sideMargin * 2);
+
+        // 5 Functional Blocks:
+        // 1. loadButton (140)
+        // 2. transportGroup (play 48 + gap 12 + pause 48 + gap 12 + stop 48 = 168)
+        // 3. halfSpeedButton (76)
+        // 4. startKnob (smallKnobDiameter = 54)
+        // 5. displaysGroup (time 160 + gap 12 + tempo 80 + gap 12 + key 80 = 344)
+        constexpr int loadW = 140;
+        constexpr int innerTransportGap = 12;
+        constexpr int transportGroupW = 48 + innerTransportGap + 48 + innerTransportGap + 48; // 168
+        constexpr int halfW = 76;
+        const int knobW = smallKnobDiameter; // 54
+        constexpr int innerDisplayGap = 12;
+        constexpr int displaysGroupW = 160 + innerDisplayGap + 80 + innerDisplayGap + 80; // 344
+
+        const int sumBlockWidths = loadW + transportGroupW + halfW + knobW + displaysGroupW;
+        const float blockGap = juce::jmax (8.0f, (float) (totalW - sumBlockWidths) / 4.0f);
+
+        float currentX = (float) sideMargin;
+
+        // Block 1: Load Sample
+        loadButton.setBounds (juce::roundToInt (currentX), topCenterY - 24, loadW, 48);
+        currentX += (float) loadW + blockGap;
+
+        // Block 2: Transport Group (Play / Pause / Stop)
+        playButton.setBounds (juce::roundToInt (currentX), topCenterY - 24, 48, 48);
+        pauseButton.setBounds (juce::roundToInt (currentX + 48 + innerTransportGap), topCenterY - 24, 48, 48);
+        stopButton.setBounds (juce::roundToInt (currentX + 48 + innerTransportGap + 48 + innerTransportGap), topCenterY - 24, 48, 48);
+        currentX += (float) transportGroupW + blockGap;
+
+        // Block 3: Half-Time Button
+        halfSpeedButton.setBounds (juce::roundToInt (currentX), topCenterY - 24, halfW, 48);
+        currentX += (float) halfW + blockGap;
+
+        // Block 4: GRID Start Knob
+        startKnob.setBounds (juce::roundToInt (currentX), topCenterY - 34, knobW, knobW + 19);
+        currentX += (float) knobW + blockGap;
+
+        // Block 5: LED Displays Group (Time / Tempo / Key)
+        timeDisplay.setBounds (juce::roundToInt (currentX), topCenterY - 24, 160, 48);
+        tempoDisplay.setBounds (juce::roundToInt (currentX + 160 + innerDisplayGap), topCenterY - 24, 80, 48);
+        keyDisplay.setBounds (juce::roundToInt (currentX + 160 + innerDisplayGap + 80 + innerDisplayGap), topCenterY - 24, 80, 48);
 
         auto bottomPanel = getBottomPanelBounds();
 
@@ -5035,6 +5205,7 @@ public:
     // Fired when HALF-TIME or WARP toggles, so the editor can re-apply the
     // theme (including the dynamic warp/halftime tints) across the whole UI.
     std::function<void()> onModeThemeChanged;
+    std::function<void (bool)> onWarpToggled;
 
 private:
     void timerCallback() override
@@ -5478,6 +5649,8 @@ class StemRackComponent final : public juce::Component,
                                 private juce::Timer
 {
 public:
+    ~StemRackComponent() override { stopTimer(); }
+
     explicit StemRackComponent (AudioPluginAudioProcessor& p)
         : processorRef (p)
     {
@@ -6011,6 +6184,27 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     contentComponent.addChildComponent (*helpOverlayComponent); // invisible by default
     addKeyListener (helpOverlayComponent.get()); // so ? and Escape reach it
 
+    warpHelpOverlayComponent = std::make_unique<cue::WarpHelpOverlayComponent>();
+    addChildComponent (*warpHelpOverlayComponent); // invisible by default
+    addKeyListener (warpHelpOverlayComponent.get()); // so Escape/Return reach it
+
+    transportSectionComponent->onWarpToggled = [this] (bool active)
+    {
+        if (warpHelpOverlayComponent != nullptr)
+        {
+            if (active)
+            {
+                warpHelpOverlayComponent->setBounds (getLocalBounds());
+                warpHelpOverlayComponent->setVisible (true);
+                warpHelpOverlayComponent->toFront (true);
+            }
+            else
+            {
+                warpHelpOverlayComponent->setVisible (false);
+            }
+        }
+    };
+
     headerComponent->onHelpRequested = [this]
     {
         const bool nowVisible = ! helpOverlayComponent->isVisible();
@@ -6279,6 +6473,12 @@ void AudioPluginAudioProcessorEditor::resized()
         const int bannerH = 34;
         updateBannerComponent->setBounds ((getWidth() - bannerW) / 2, 10, bannerW, bannerH);
         updateBannerComponent->toFront (false);
+    }
+
+    if (warpHelpOverlayComponent != nullptr && warpHelpOverlayComponent->isVisible())
+    {
+        warpHelpOverlayComponent->setBounds (getLocalBounds());
+        warpHelpOverlayComponent->toFront (true);
     }
 }
 

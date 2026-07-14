@@ -33,7 +33,8 @@ namespace cue
     class VisualizerOrb final : public juce::Component,
                                 private juce::OpenGLRenderer,
                                 private juce::Timer,
-                                private juce::AudioProcessorValueTreeState::Listener
+                                private juce::AudioProcessorValueTreeState::Listener,
+                                private juce::ComponentListener
     {
     public:
         explicit VisualizerOrb (juce::AudioProcessorValueTreeState& state);
@@ -44,6 +45,8 @@ namespace cue
         void setBackgroundColour (juce::Colour backdrop);
 
         void paint (juce::Graphics&) override;   // software fallback only
+        void parentHierarchyChanged() override;
+        void componentMovedOrResized (juce::Component& component, bool wasMoved, bool wasResized) override;
 
     private:
         //==================================================================
@@ -58,6 +61,9 @@ namespace cue
         float raw (const char* paramID) const;   // current plain value of a param
 
         static int moduleIndexForParam (const juce::String& parameterID);
+
+        juce::Component* observedTopLevel = nullptr;
+        double lastMoveTime = 0.0;
 
         //==================================================================
         juce::AudioProcessorValueTreeState& apvts;

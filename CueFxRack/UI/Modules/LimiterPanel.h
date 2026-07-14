@@ -18,6 +18,7 @@ namespace cue
         {
             setTagline ("multiband maximizer");
         }
+        ~LimiterPanel() override { stopTimer(); }
 
         // negative dB per band, from the processor
         void setBandGRSource (std::function<float (int)> src, int numBands)

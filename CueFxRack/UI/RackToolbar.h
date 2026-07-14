@@ -39,6 +39,9 @@ namespace cue
     private:
         void timerCallback() override;
 
+        std::unique_ptr<juce::Drawable> cueWordmark;
+        juce::Colour wordmarkColour = colours::cream;
+
         //==================================================================
         class ModuleChip;
 

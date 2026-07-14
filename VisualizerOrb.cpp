@@ -281,22 +281,53 @@ VisualizerOrb::VisualizerOrb (juce::AudioProcessorValueTreeState& state)
     context.setComponentPaintingEnabled (false);   // pure GL layer: no per-frame UI compositing (fixes window-drag stutter)
 
     // Timer-driven rendering (not continuous/vsync): frames are requested at
-    // 30 Hz from the message thread, which avoids the GL-thread/UI-thread
-    // contention that causes periodic micro-freezes on macOS.
+    // 120 Hz from the message thread for buttery smooth 120 FPS orb animation.
     context.setContinuousRepainting (false);
     context.attachTo (*this);
-    startTimerHz (30);
+    startTimerHz (120);
 }
 
 void VisualizerOrb::timerCallback()
 {
     if (isShowing())
+    {
+        // Pause OpenGL repaints while the plugin window is actively being moved
+        // or resized to prevent OpenGL surface/Cocoa window synchronization stutter.
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        if (now - lastMoveTime < 150.0)
+            return;
+
         context.triggerRepaint();
+    }
+}
+
+void VisualizerOrb::parentHierarchyChanged()
+{
+    if (auto* top = getTopLevelComponent())
+    {
+        if (top != observedTopLevel)
+        {
+            if (observedTopLevel != nullptr)
+                observedTopLevel->removeComponentListener (this);
+
+            observedTopLevel = top;
+            observedTopLevel->addComponentListener (this);
+        }
+    }
+}
+
+void VisualizerOrb::componentMovedOrResized (juce::Component&, bool wasMoved, bool wasResized)
+{
+    if (wasMoved || wasResized)
+        lastMoveTime = juce::Time::getMillisecondCounterHiRes();
 }
 
 VisualizerOrb::~VisualizerOrb()
 {
     stopTimer();
+    if (observedTopLevel != nullptr)
+        observedTopLevel->removeComponentListener (this);
+
     context.detach();
 
     for (const auto& id : listenedIDs)

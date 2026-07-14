@@ -26,6 +26,87 @@ namespace
     // per-panel, proportional to their design weight.
     constexpr int   kMinRowH = 240;
     constexpr float kMinWidthFactor = 0.72f;
+
+    class SmoothRackViewport final : public juce::Viewport, private juce::Timer
+    {
+    public:
+        SmoothRackViewport()
+        {
+            setScrollOnDragMode (ScrollOnDragMode::all);
+        }
+
+        ~SmoothRackViewport() override
+        {
+            stopTimer();
+        }
+
+        void mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) override
+        {
+            const auto* content = getViewedComponent();
+            if (content == nullptr)
+            {
+                juce::Viewport::mouseWheelMove (e, wheel);
+                return;
+            }
+
+            const int maxX = juce::jmax (0, content->getWidth() - getWidth());
+            if (maxX <= 0)
+                return;
+
+            if (std::abs ((float) getViewPositionX() - targetX) > 24.0f)
+                targetX = (float) getViewPositionX();
+
+            float delta = std::abs (wheel.deltaX) > std::abs (wheel.deltaY)
+                              ? wheel.deltaX
+                              : (wheel.isReversed ? -wheel.deltaY : wheel.deltaY);
+
+            if (std::abs (delta) > 0.0001f)
+            {
+                const float scale = wheel.isSmooth ? 520.0f : 110.0f;
+                const float impulse = -delta * scale;
+
+                velocity += impulse * 0.35f;
+                targetX = juce::jlimit (0.0f, (float) maxX, targetX + impulse);
+
+                if (! isTimerRunning())
+                    startTimerHz (60);
+            }
+        }
+
+        void syncTargetPosition()
+        {
+            targetX = (float) getViewPositionX();
+            velocity = 0.0f;
+        }
+
+    private:
+        void timerCallback() override
+        {
+            const auto* content = getViewedComponent();
+            const int maxX = content != nullptr ? juce::jmax (0, content->getWidth() - getWidth()) : 0;
+
+            targetX = juce::jlimit (0.0f, (float) maxX, targetX + velocity);
+            velocity *= 0.82f;
+
+            const float currentX = (float) getViewPositionX();
+            const float diff = targetX - currentX;
+
+            if (std::abs (diff) < 0.25f && std::abs (velocity) < 0.25f)
+            {
+                setViewPosition (juce::roundToInt (targetX), getViewPositionY());
+                velocity = 0.0f;
+                stopTimer();
+            }
+            else
+            {
+                const float newX = currentX + diff * 0.32f;
+                setViewPosition (juce::roundToInt (newX), getViewPositionY());
+            }
+        }
+
+        float targetX = 0.0f;
+        float velocity = 0.0f;
+    };
 }
 
 //==============================================================================
@@ -503,6 +584,7 @@ struct FxRackStrip::Impl
         viewport.setBounds (r);
         rebuildTargets();
         applyLayout (false);
+        viewport.syncTargetPosition();
     }
 
     void refreshColours()
@@ -537,7 +619,7 @@ struct FxRackStrip::Impl
     AmpPanel        ampPanel;
 
     RackToolbar toolbar;
-    juce::Viewport viewport;
+    SmoothRackViewport viewport;
     juce::Component rackContent;
 
     std::vector<RackItem> items;

@@ -10,6 +10,7 @@ namespace cue
 {
 class CueSamplerLookAndFeel;
 class HelpOverlayComponent;
+class WarpHelpOverlayComponent;
 class HeaderComponent;
 class VisualizerOrb;
 class WaveformDisplayComponent;
@@ -66,6 +67,7 @@ private:
     std::unique_ptr<cue::StemRackComponent> stemRackComponent;
 
     std::unique_ptr<cue::HelpOverlayComponent> helpOverlayComponent;
+    std::unique_ptr<cue::WarpHelpOverlayComponent> warpHelpOverlayComponent;
     std::unique_ptr<cue::UpdateBannerComponent> updateBannerComponent;
     std::unique_ptr<cue::GlassKeyboard> midiKeyboardComponent;
     std::unique_ptr<cue::VisualizerOrb> cueOrbComponent;

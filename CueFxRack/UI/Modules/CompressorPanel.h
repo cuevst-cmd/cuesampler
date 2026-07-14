@@ -13,6 +13,7 @@ namespace cue
     public:
         explicit CompressorPanel (juce::AudioProcessorValueTreeState& s)
             : ModulePanel (s, "COMPRESSOR", pid::compOn, colours::cueMid) {}
+        ~CompressorPanel() override { stopTimer(); }
 
         void setGRSource (std::function<float()> sourceDb)   // negative dB from processor
         {

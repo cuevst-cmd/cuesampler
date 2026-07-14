@@ -19,6 +19,7 @@ namespace cue
             setInterceptsMouseClicks (false, false);
             startTimerHz (30);
         }
+        ~TapeReels() override { stopTimer(); }
 
         void paint (juce::Graphics& g) override
         {

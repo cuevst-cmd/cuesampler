@@ -20,6 +20,7 @@ namespace cue
             setInterceptsMouseClicks (false, false);
             startTimerHz (24);
         }
+        ~CrusherScreen() override { stopTimer(); }
 
         void paint (juce::Graphics& g) override
         {

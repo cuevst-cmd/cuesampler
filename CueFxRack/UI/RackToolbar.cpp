@@ -47,14 +47,23 @@ public:
 };
 
 //==============================================================================
+static const char* const cueWordmarkSvg =
+R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="20 -700 4123 760"><path fill="#F2E7DA" d="M1255.0 -267Q1250.0 -172 1186.0 -108.0Q1122.0 -44 997.5 -12.0Q873.0 20 683.0 20Q538.0 20 423.0 4.5Q308.0 -11 227.0 -48.5Q146.0 -86 103.0 -151.0Q60.0 -216 60.0 -315Q60.0 -414 103.0 -480.5Q146.0 -547 227.0 -586.5Q308.0 -626 423.0 -643.0Q538.0 -660 683.0 -660Q873.0 -660 998.0 -625.5Q1123.0 -591 1187.0 -524.0Q1251.0 -457 1256.0 -361H996.0Q984.0 -393 952.0 -417.5Q920.0 -442 856.0 -456.0Q792.0 -470 683.0 -470Q555.0 -470 475.0 -454.5Q395.0 -439 358.0 -405.0Q321.0 -371 321.0 -315Q321.0 -264 358.0 -232.0Q395.0 -200 475.0 -185.0Q555.0 -170 683.0 -170Q792.0 -170 855.5 -183.0Q919.0 -196 951.0 -218.5Q983.0 -241 995.0 -267Z M2303.0 -365V-640H2553.0V-320Q2553.0 -235 2521.5 -175.5Q2490.0 -116 2434.0 -77.5Q2378.0 -39 2305.0 -18.0Q2232.0 3 2148.5 11.5Q2065.0 20 1979.0 20Q1888.0 20 1803.0 11.5Q1718.0 3 1645.5 -18.0Q1573.0 -39 1519.0 -77.5Q1465.0 -116 1434.5 -175.5Q1404.0 -235 1404.0 -320V-640H1654.0V-365Q1654.0 -285 1693.0 -243.0Q1732.0 -201 1804.5 -185.5Q1877.0 -170 1979.0 -170Q2078.0 -170 2151.0 -185.5Q2224.0 -201 2263.5 -243.0Q2303.0 -285 2303.0 -365Z M2961.0 -270V-190H3721.0V0H2711.0V-640H3719.0V-450H2961.0V-370H3581.0V-270Z M4103.0 -151V0H3849.0V-151Z"/></svg>)SVG";
+
 // Toolbar
 //==============================================================================
 RackToolbar::RackToolbar()
 {
     startTimerHz (24);
+    const juce::String svg (cueWordmarkSvg);
+    cueWordmark = juce::Drawable::createFromImageData (svg.toRawUTF8(),
+                                                       (size_t) svg.getNumBytesAsUTF8());
 }
 
-RackToolbar::~RackToolbar() = default;
+RackToolbar::~RackToolbar()
+{
+    stopTimer();
+}
 
 void RackToolbar::timerCallback()
 {
@@ -77,8 +86,16 @@ void RackToolbar::resized()
 {
     auto r = getLocalBounds().reduced (8, 5);
 
-    // unused modules from the left (after the section label)
-    r.removeFromLeft (98);
+    float lockupW = 108.0f;
+    if (cueWordmark != nullptr)
+    {
+        const auto db = cueWordmark->getDrawableBounds();
+        if (db.getHeight() > 0.0f)
+            lockupW = 20.0f * db.getWidth() / db.getHeight();
+    }
+    const int rightReserved = juce::roundToInt (lockupW) + 20;
+    r.removeFromRight (rightReserved);
+
     for (auto* chip : moduleChips)
     {
         chip->setBounds (r.removeFromLeft (74));
@@ -96,15 +113,56 @@ void RackToolbar::paint (juce::Graphics& g)
     g.drawLine (0.0f, 0.5f, (float) getWidth(), 0.5f, 1.0f);
     g.drawLine (0.0f, (float) getHeight() - 0.5f, (float) getWidth(), (float) getHeight() - 0.5f, 1.0f);
 
-    g.setColour (colours::creamDim.withAlpha (0.8f));
-    g.setFont (monoFont (11.5f, true));
-    g.drawText ("FX MODULES", 12, 0, 90, getHeight(), juce::Justification::centredLeft, false);
+    // --- Stacked brand lockup: "CUE." over wide-tracked "RACK" right-anchored ---
+    const float logoH = 20.0f;
+    float lockupW = 108.0f;
+
+    if (cueWordmark != nullptr)
+    {
+        const auto db = cueWordmark->getDrawableBounds();
+        if (db.getHeight() > 0.0f)
+            lockupW = logoH * db.getWidth() / db.getHeight();
+    }
+
+    const float rightMargin = 14.0f;
+    const float logoX = juce::jmax (8.0f, (float) getWidth() - lockupW - rightMargin);
+    const float logoY = 4.0f;
+    const auto targetInk = colours::cream;
+
+    if (cueWordmark != nullptr)
+    {
+        if (wordmarkColour != targetInk)
+        {
+            cueWordmark->replaceColour (wordmarkColour, targetInk);
+            wordmarkColour = targetInk;
+        }
+        cueWordmark->drawWithin (g, { logoX, logoY, lockupW, logoH },
+                                 juce::RectanglePlacement::stretchToFit, 1.0f);
+    }
+
+    const float rackSize = 10.5f;
+    auto rackFont = juce::Font (juce::FontOptions (juce::Font::getDefaultSansSerifFontName(), rackSize, juce::Font::bold));
+    {
+        juce::GlyphArrangement ga;
+        ga.addLineOfText (rackFont, "RACK", 0.0f, 0.0f);
+        const float naturalW = ga.getBoundingBox (0, -1, true).getWidth();
+        const float kern = juce::jmax (0.0f, (lockupW - naturalW) / (rackSize * 4.0f));
+        rackFont = rackFont.withExtraKerningFactor (kern);
+    }
+
+    const int rackTop = (int) std::round (logoY + logoH - 1.0f);
+    g.setColour (targetInk);
+    g.setFont (rackFont);
+    g.drawText ("RACK",
+                juce::Rectangle<int> ((int) std::round (logoX), rackTop,
+                                      (int) std::ceil (lockupW) + 20, 18),
+                juce::Justification::centredLeft, false);
 
     if (moduleChips.isEmpty())
     {
         g.setColour (colours::creamDim.withAlpha (0.4f));
         g.setFont (monoFont (9.5f));
-        g.drawText ("ALL MODULES RACKED", 114, 0, 220, getHeight(),
+        g.drawText ("ALL MODULES RACKED", 12, 0, 180, getHeight(),
                     juce::Justification::centredLeft, false);
     }
 }
