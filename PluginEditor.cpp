@@ -1056,7 +1056,7 @@ public:
         const auto style = getCueStyle (button);
 
         if (style == "transportSquare" || style == "halfTime"
-            || style == "flatAction" || style == "utilitySync" || style == "effectSwitch")
+            || style == "flatAction" || style == "separateAction" || style == "utilitySync" || style == "effectSwitch")
         {
             // Keycap travel is applied inside drawKeycap; effectSwitch is a
             // left/right toggle, not a press button, and never dips.
@@ -1219,6 +1219,17 @@ public:
             return;
         }
 
+        if (style == "separateAction")
+        {
+            float hover = getHoverAlpha (button, false);
+            auto textOff = textPrimary.withAlpha (0.92f);
+            auto textOn  = themedTitleColour (accentOrange);
+            g.setColour (textOff.interpolatedWith (textOn, hover));
+            g.setFont (heavyFont (14.0f).withExtraKerningFactor (0.08f));
+            g.drawFittedText (button.getButtonText().toUpperCase(), bounds, juce::Justification::centred, 1);
+            return;
+        }
+
         if (style == "helpButton")
         {
             float hover = getHoverAlpha (button, false);
@@ -1237,13 +1248,13 @@ public:
                 position = animatedButton->getCurrentAnimationPosition();
             float clampedPos = juce::jlimit (0.0f, 1.0f, position);
 
-            auto textOff = textMuted;
-            auto textOn = textPrimary;
+            auto textOff = textPrimary.withAlpha (0.75f);
+            auto textOn  = textPrimary;
             g.setColour (textOff.interpolatedWith (textOn, clampedPos));
-            g.setFont (monoFont (8.5f));
+            g.setFont (heavyFont (12.5f).withExtraKerningFactor (0.06f));
             // Below the status LED (radius 4 at capY + 14), inside the face.
             g.drawFittedText (button.getButtonText().toUpperCase(),
-                              bounds.withTop ((int) (cap.getY() + 20.0f)).withTrimmedBottom (1),
+                              bounds.withTop (juce::roundToInt (cap.getY() + 19.0f)),
                               juce::Justification::centred, 1);
             return;
         }
@@ -5694,7 +5705,7 @@ public:
         // Visibility is state-driven in refresh() — it sits in the info column and is
         // hidden while separating, once stems are ready, or when no model is installed.
         configureButton (separateButton, "SEPARATE", textPrimary.withAlpha (0.9f));
-        separateButton.getProperties().set ("cueStyle", "flatAction");
+        separateButton.getProperties().set ("cueStyle", "separateAction");
         separateButton.setTooltip ("Split this sample into DRUMS / BASS / VOCALS stems so you can mute each one. "
                                    "Runs in the background - the first run takes a few extra seconds while the model loads.");
         separateButton.onClick = [this] { processorRef.requestStemSeparation(); };
@@ -5921,9 +5932,8 @@ public:
         drumsBtn.setBounds  (leftEdge + (w + gap),       y, w, h);
         vocalsBtn.setBounds (leftEdge + 2 * (w + gap),   y, w, h);
 
-        // Info column, just below the "STEMS" title (shares the row with the status
-        // line / progress bar, which are hidden whenever the button is shown).
-        separateButton.setBounds (27, 37, 158, 25);
+        // Info column, centered vertically in the stems strip.
+        separateButton.setBounds (24, 18, 204, 38);
     }
 
 private:
