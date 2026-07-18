@@ -104,17 +104,18 @@ namespace cue::dsp
             inGain  = juce::Decibels::decibelsToGain (gainDb);
             ceiling = juce::Decibels::decibelsToGain (ceilingDb);
 
-            // true-peak: leave ~0.6 dB extra so inter-sample peaks stay under
-            const auto finalCeil = truePeak ? ceiling * 0.933f : ceiling;
-
             const auto relSec = juce::jmax (1.0f, releaseMs) * 0.001f;
             for (auto& b : bands)
             {
                 b.limiter.setCeiling (ceiling);
                 b.limiter.setRelease (relSec, autoRelease);
             }
-            finalStage.setCeiling (finalCeil);
+            // True-peak: the final stage detects inter-sample peaks (half-sample
+            // interpolated estimates) instead of eating a fixed 0.6 dB of
+            // headroom, so TP mode no longer costs loudness on normal material.
+            finalStage.setCeiling (ceiling);
             finalStage.setRelease (relSec, autoRelease);
+            finalStage.setInterSamplePeakDetection (truePeak);
         }
 
         //==================================================================
@@ -267,6 +268,7 @@ namespace cue::dsp
                 writeIdx = 0;
                 envFast = envSmooth = 1.0f;
                 arcRamp = 0.0f;
+                for (auto& h : ispHist) h.fill (0.0f);
                 grDb.store (0.0f);
             }
             void setCeiling (float lin) noexcept
@@ -280,6 +282,18 @@ namespace cue::dsp
                 aRelFast = timeCoef (relSec * 0.15f);
                 aRelSlow = timeCoef (relSec * 1.4f);
             }
+            void setInterSamplePeakDetection (bool shouldDetect) noexcept
+            {
+                ispDetect = shouldDetect;
+            }
+
+            // Half-sample Catmull-Rom estimate between h[1] and h[2] — the
+            // standard cheap inter-sample-peak probe (equivalent to one 2x
+            // polyphase phase: -1/16, 9/16, 9/16, -1/16).
+            static float halfSamplePeak (const std::array<float, 4>& h) noexcept
+            {
+                return std::abs (-0.0625f * h[0] + 0.5625f * h[1] + 0.5625f * h[2] - 0.0625f * h[3]);
+            }
 
             void process (juce::AudioBuffer<float>& buffer)
             {
@@ -291,7 +305,25 @@ namespace cue::dsp
                 float minEnv = 1.0f;
                 for (int i = 0; i < n; ++i)
                 {
-                    const auto pk = juce::jmax (std::abs (l[i]), r != nullptr ? std::abs (r[i]) : 0.0f);
+                    auto pk = juce::jmax (std::abs (l[i]), r != nullptr ? std::abs (r[i]) : 0.0f);
+
+                    if (ispDetect)
+                    {
+                        // Fold in the estimated peak *between* samples. The
+                        // detector runs `look` samples ahead of the delayed
+                        // output, so the half-sample lag of the estimate is
+                        // comfortably inside the look-ahead window.
+                        auto& hl = ispHist[0];
+                        hl[0] = hl[1]; hl[1] = hl[2]; hl[2] = hl[3]; hl[3] = l[i];
+                        pk = juce::jmax (pk, halfSamplePeak (hl));
+                        if (r != nullptr)
+                        {
+                            auto& hr = ispHist[1];
+                            hr[0] = hr[1]; hr[1] = hr[2]; hr[2] = hr[3]; hr[3] = r[i];
+                            pk = juce::jmax (pk, halfSamplePeak (hr));
+                        }
+                    }
+
                     smax.push (pk);
 
                     const auto winMax = smax.currentMax();
@@ -337,13 +369,14 @@ namespace cue::dsp
             }
 
             std::array<std::vector<float>, 2> delayLine;
+            std::array<std::array<float, 4>, 2> ispHist {};
             SlidingMax smax;
             double sr = 44100.0;
             int look = 96, writeIdx = 0, nCh = 2;
             float ceiling = 1.0f, detCeiling = 0.983f;
             float aAtk = 0.1f, aRelFast = 0.01f, aRelSlow = 0.002f, arcDecay = 0.999f;
             float envFast = 1.0f, envSmooth = 1.0f, arcRamp = 0.0f;
-            bool arc = true;
+            bool arc = true, ispDetect = false;
             std::atomic<float> grDb { 0.0f };
         };
 

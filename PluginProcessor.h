@@ -3,15 +3,11 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_audio_formats/juce_audio_formats.h>
 
-#include "AudioFingerprinter.h"
 #include "BeatThisAnalyzer.h"
 #include "StemSeparator.h"
-#include "EditTelemetry.h"
 #include "UpdateChecker.h"
 #include "KeyDetector.h"
 #include "ChopAudioCache.h"
-#include "SSLBusCompressor.h"
-#include "BitCrusher.h"
 #include "WarpMap.h"
 #include "CueFxRack/FxEngine.h"
 
@@ -165,35 +161,12 @@ public:
     void setWaveformZoom (float zoomValue) noexcept;
     void setWaveformScroll (float scrollValue) noexcept;
 
-    // Compressor (SSL-style bus compressor on the master output).
-    void  setCompressorEnabled    (bool shouldEnable) noexcept;
-    void  setCompressorThresholdDb (float dB)         noexcept;
-    void  setCompressorMakeupDb   (float dB)          noexcept;
-    bool  isCompressorEnabled() const noexcept;
-    float getCompressorThresholdDb() const noexcept;
-    float getCompressorMakeupDb() const noexcept;
-    float getCompressorGainReductionDb() const noexcept;
-
-    // Bit Crusher (bit-depth quantization + sample-rate reduction).
-    void  setBitCrusherEnabled (bool shouldEnable) noexcept;
-    void  setBitCrusherBits    (float bits)        noexcept;
-    void  setBitCrusherCrush   (float percent)     noexcept;
-
     // Resize a chop by moving its left or right edge to a new sample position.
     // The implied chop length sets the new BPM trim, and the grid offset is
     // adjusted so the dragged edge lands on a fresh chop boundary. All other
     // chops are then rebuilt against this new grid.
     void  resizeChopBoundary (int chopId, int newStartSample, int newEndSample);
     void  setChopBounds (int chopId, int newStartSample, int newEndSample);
-    bool  isBitCrusherEnabled() const noexcept;
-    float getBitCrusherBits()   const noexcept;
-    float getBitCrusherCrush()  const noexcept;
-
-    // Live post-bit-crusher output snapshot for the on-module scope visualizer:
-    // a small rolling window of mono output samples in chronological order,
-    // published lock-free from the audio thread and read on the editor timer.
-    static constexpr int kBitCrusherScopeSize = 64;
-    void  readBitCrusherScope (float* dest, int maxSamples) const noexcept;
 
     //==============================================================================
     // CUE FX rack — CUERACK's master chain, ported (see CueFxRack/FxEngine.h).
@@ -260,14 +233,9 @@ public:
     bool  areStemModelsAvailable() const noexcept;
     bool  wasStemSeparationSkipped() const noexcept { return stemSeparationSkipped.load (std::memory_order_acquire); }
 
-    // Apply a user key override (rootIndex 0..11 = C..B). Replaces the displayed
-    // key and records a key_correction in the flywheel (user pick = ground truth).
+    // Apply a user key override (rootIndex 0..11 = C..B), replacing the
+    // displayed detector result for the current sample.
     void setUserKeyOverride (int rootIndex, bool isMajor);
-
-    // Opt-in data-flywheel consent. When enabled, anonymous BPM and key
-    // detection deltas are recorded locally (see EditTelemetry). Defaults off.
-    bool isTelemetryEnabled() const noexcept { return editTelemetry.isEnabled(); }
-    void setTelemetryEnabled (bool shouldEnable) { editTelemetry.setEnabled (shouldEnable); }
 
     // In-app software update checker (GitHub Releases). The editor reads its
     // result to show a "new version available" banner. See UpdateChecker.
@@ -377,9 +345,10 @@ private:
 
     // Background "pre-render" warm: bakes each non-warp chop's pitch+time-stretched
     // audio into the ChopAudioCache prepared-entry cache so the audio thread can
-    // stream it 1:1 instead of running Bungee in real time. Polled from a message-
-    // thread timer (editor-independent) so it keeps the cache warm even with the
-    // UI closed. See CachePollerTimer / PreparedWarmJob.
+    // stream it 1:1 instead of running Bungee in real time. Polled from a small
+    // processor-owned worker so it keeps the cache warm even with the UI closed,
+    // without depending on the host's MessageManager lifetime. See
+    // CachePollerThread / PreparedWarmJob.
     void warmPreparedCacheTick();
 
     // Per-voice Bungee stretcher/stream wrapper. Defined in the .cpp so the
@@ -418,22 +387,20 @@ private:
     std::unique_ptr<BeatThisAnalyzer> beatThisAnalyzer;
     std::unique_ptr<StemSeparator>    stemSeparator;
     KeyDetector keyDetector;
-    AudioFingerprinter audioFingerprinter;
-    cuesampler::EditTelemetry editTelemetry;
     cuesampler::UpdateChecker updateChecker;
     KeyDetector::Result detectedKeyResult;
     mutable std::mutex keyResultMutex;
 
-    class CachePollerTimer;
-    std::unique_ptr<CachePollerTimer> cachePollerTimer;
+    class CachePollerThread;
+    std::unique_ptr<CachePollerThread> cachePollerThread;
 
     struct VoiceState
     {
         double playbackSamplePosition = 0.0;
         double playbackStopSample = -1.0;
-        // Set by transport Play; when >= 0, the render loop wraps back to this
-        // sample after hitting playbackStopSample / sourceLength instead of
-        // deactivating. MIDI-triggered voices leave it at -1 (one-shot).
+        // When >= 0, the render loop wraps back to this sample after hitting
+        // playbackStopSample / sourceLength instead of deactivating. Transport
+        // playback loops continuously; MIDI playback loops until note-off.
         double playbackLoopStartSample = -1.0;
         bool playbackActive = false;
         bool bungeeResetPending = true;
@@ -525,17 +492,18 @@ private:
     static constexpr size_t maxEditUndoDepth = 64;
     static constexpr double editUndoCoalesceWindowMs = 600.0;
 
-    VoiceState voices[2];
-    int activeVoiceIdx = 0;
-
+    // Single playback voice: sampling pads are monophonic/choked (a new chop
+    // stops the previous one), so one voice + one Bungee engine is all the
+    // render path ever uses.
+    VoiceState voice;
 
     cuesampler::ChopAudioCache chopAudioCache;
 
     // Bumped on every warm kick so an in-flight PreparedWarmJob can detect it has
     // been superseded (params changed) and abort early. Read on the worker thread.
     std::atomic<uint64_t> prepareWarmGeneration { 0 };
-    // Message-thread-only state used by warmPreparedCacheTick() to decide whether a
-    // fresh warm is needed (avoids re-kicking when nothing relevant has changed).
+    // Cache-poller-thread-only state used by warmPreparedCacheTick() to decide
+    // whether a fresh warm is needed (avoids re-kicking when nothing changed).
     std::shared_ptr<const ChopState> lastWarmChopState;
     // Also tracked so a stem mute (which swaps loadedSample to a new buffer with
     // the SAME chopState) forces a prepared-cache re-warm against the new audio.
@@ -558,6 +526,12 @@ private:
     };
 
     std::atomic<int> pendingTransportCommand { (int) TransportCommand::none };
+    // Cross-thread voice mutations. VoiceState is audio-thread-owned; message-
+    // thread setters post these flags instead of touching the voice directly
+    // (the old direct writes were a data race). Consumed once per block.
+    std::atomic<bool> voiceResetRequest { false };        // → voice.bungeeResetPending
+    std::atomic<bool> clearVoiceStopRequest { false };    // → voice.playbackStopSample = -1
+    std::atomic<int>  pendingSyncAnchorCommand { 0 };     // 0 none, 1 rebase to current pos, 2 clear
     std::atomic<double> pendingTransportSeekPosition { 0.0 };
     std::atomic<double> pendingStartPosition { 0.0 };
     std::atomic<double> pendingStartStopSample { -1.0 };
@@ -622,26 +596,8 @@ private:
     std::atomic<float> waveformZoom { 0.25f };
     std::atomic<float> waveformScroll { 0.0f };
 
-    cuesampler::SSLBusCompressor compressor;
-    std::atomic<float> compressorThresholdUiDb { 0.0f };
-    std::atomic<float> compressorMakeupUiDb    { 0.0f };
-    std::atomic<bool>  compressorEnabledUi     { false };
-
-    cuesampler::BitCrusher bitCrusher;
-
-    // CUERACK master chain (post sample/stem mix; replaces the legacy
-    // crusher + compressor pair above, whose modules now live in the rack).
+    // CUERACK master chain (post sample/stem mix).
     cue::FxEngine fxEngine { apvts };
-    std::atomic<float> bitCrusherBitsUi    { 0.0f };
-    std::atomic<float> bitCrusherCrushUi   { 0.0f };
-    std::atomic<bool>  bitCrusherEnabledUi { false };
-
-    // Rolling mono window of the crushed output: the audio thread appends into
-    // the ring, then publishes a chronological copy into the atomic array the
-    // editor reads. Sized by kBitCrusherScopeSize.
-    std::array<float, kBitCrusherScopeSize>              bitCrusherScopeRing {};
-    int                                                  bitCrusherScopeWritePos = 0;
-    std::array<std::atomic<float>, kBitCrusherScopeSize> bitCrusherScope {};
 
     // (Re)build the per-voice Bungee stretcher/stream pair so it matches the
     // currently known source sample rate, host sample rate, and channel

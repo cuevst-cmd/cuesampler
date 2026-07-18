@@ -15,7 +15,7 @@ class HeaderComponent;
 class VisualizerOrb;
 class WaveformDisplayComponent;
 class TransportSectionComponent;
-class UtilityStripComponent;
+class WaveformFooterComponent;
 class FxRackStrip;
 class StemRackComponent;
 class StartKnobComponent;
@@ -55,6 +55,7 @@ private:
     void applyThemeToUi();
 
     AudioPluginAudioProcessor& processorRef;
+    std::unique_ptr<juce::PropertiesFile> uiSettingsFile;
 
     juce::Component contentComponent;
 
@@ -62,7 +63,7 @@ private:
     std::unique_ptr<cue::HeaderComponent> headerComponent;
     std::unique_ptr<cue::WaveformDisplayComponent> waveformDisplayComponent;
     std::unique_ptr<cue::TransportSectionComponent> transportSectionComponent;
-    std::unique_ptr<cue::UtilityStripComponent> utilityStripComponent;
+    std::unique_ptr<cue::WaveformFooterComponent> waveformFooterComponent;
     std::unique_ptr<cue::FxRackStrip> fxRackStrip;
     std::unique_ptr<cue::StemRackComponent> stemRackComponent;
 

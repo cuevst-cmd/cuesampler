@@ -19,7 +19,7 @@
       the Windows SDK, and the C++ standard library. This matches CI, which builds
       with MSVC `x64`.
 - [ ] **Git for Windows**, available on `PATH`. Required twice over: CMake's
-      FetchContent clones JUCE / Bungee / chromaprint, and the Bungee patch step
+      FetchContent clones JUCE / Bungee, and the Bungee patch step
       runs `git apply`.
 - [ ] CMake + Ninja — **no install needed**, CLion bundles both (well above the
       3.22 minimum). If you prefer system tools, CMake ≥ 3.22 is the floor.
@@ -37,20 +37,13 @@ The repo's `.gitattributes` already pins `*.patch` to LF, which protects the pat
 inside *this* repo. The global setting additionally protects the Bungee source that
 FetchContent clones separately. Do both.
 
-## 3. Get the code + the files Git won't bring
+## 3. Get the code + optional large assets
 
 - [ ] **Clone fresh from GitHub** on the VM. Do **not** share the Mac project folder
       into the VM — you'll hit path/artifact/`.idea` conflicts.
       ```
       git clone https://github.com/cuevst-cmd/cuesampler.git
       ```
-- [ ] **Create `APIKeys.h`** — it's gitignored and the build won't compile without
-      it. Placeholder keys are fine for a test build:
-      ```
-      copy APIKeys.h.example APIKeys.h
-      ```
-      (AcoustID fingerprinting just won't function with placeholders; everything
-      else builds.)
 - [ ] **Stem-separation model is NOT in the clone.** `assets/htdemucs/htdemucs.onnx`
       (~302 MB) is gitignored. The build **skips it gracefully** (stem separation
       disables, StemSeparator falls back; everything else works). Copy it onto the
@@ -66,7 +59,7 @@ FetchContent clones separately. Do both.
       `-DCMAKE_BUILD_TYPE=Release`). For faster debug iteration a Debug profile is
       fine too.
 - [ ] Let the first CMake configure run — it downloads JUCE, Bungee + Eigen,
-      chromaprint, and the ONNX Runtime zip. **Several minutes, needs internet.**
+      and the ONNX Runtime zip. **Several minutes, needs internet.**
 - [ ] Build the **`CueSampler_VST3`** target (or `CueSampler_Standalone`).
       `CMakeLists.txt` stages `onnxruntime.dll` + the models next to the binary
       automatically (the `elseif(WIN32)` POST_BUILD block).

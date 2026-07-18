@@ -36,6 +36,11 @@ namespace cue::dsp
             dryBuffer.setSize ((int) spec.numChannels, (int) spec.maximumBlockSize);
             levelSmooth.reset (sr, 0.03);
             mixSmooth.reset (sr, 0.03);
+            for (auto* s : { &bassSmooth, &midSmooth, &trebleSmooth })
+            {
+                s->reset (sr, 0.04);
+                s->setCurrentAndTargetValue (0.0f);
+            }
 
             curPreset = -1;                        // force voicing rebuild
             curBass = curMid = curTreble = -99.0f;
@@ -66,21 +71,9 @@ namespace cue::dsp
                 applyVoicing();
             }
 
-            if (! juce::approximatelyEqual (bassDb, curBass)
-             || ! juce::approximatelyEqual (midDb, curMid)
-             || ! juce::approximatelyEqual (trebleDb, curTreble))
-            {
-                curBass = bassDb; curMid = midDb; curTreble = trebleDb;
-                for (auto& f : bass)
-                    f.setCoefficients (juce::IIRCoefficients::makeLowShelf (sr, 110.0, 0.707,
-                                       juce::Decibels::decibelsToGain (bassDb)));
-                for (auto& f : mid)
-                    f.setCoefficients (juce::IIRCoefficients::makePeakFilter (sr, 650.0, 0.8,
-                                       juce::Decibels::decibelsToGain (midDb)));
-                for (auto& f : treble)
-                    f.setCoefficients (juce::IIRCoefficients::makeHighShelf (sr, 3200.0, 0.707,
-                                       juce::Decibels::decibelsToGain (trebleDb)));
-            }
+            bassSmooth.setTargetValue (bassDb);
+            midSmooth.setTargetValue (midDb);
+            trebleSmooth.setTargetValue (trebleDb);
 
             const auto& v = voicings()[(size_t) curPreset];
             drive = juce::Decibels::decibelsToGain (driveDb) * v.driveScale;
@@ -95,6 +88,27 @@ namespace cue::dsp
         {
             const auto n   = buffer.getNumSamples();
             const auto nCh = juce::jmin (numChannels, buffer.getNumChannels());
+
+            // Ramp the tone stack block-by-block so knob sweeps don't zipper.
+            bassSmooth.skip (n); midSmooth.skip (n); trebleSmooth.skip (n);
+            const auto bassDb   = bassSmooth.getCurrentValue();
+            const auto midDb    = midSmooth.getCurrentValue();
+            const auto trebleDb = trebleSmooth.getCurrentValue();
+            if (std::abs (bassDb - curBass) > 0.005f
+             || std::abs (midDb - curMid) > 0.005f
+             || std::abs (trebleDb - curTreble) > 0.005f)
+            {
+                curBass = bassDb; curMid = midDb; curTreble = trebleDb;
+                for (auto& f : bass)
+                    f.setCoefficients (juce::IIRCoefficients::makeLowShelf (sr, 110.0, 0.707,
+                                       juce::Decibels::decibelsToGain (bassDb)));
+                for (auto& f : mid)
+                    f.setCoefficients (juce::IIRCoefficients::makePeakFilter (sr, 650.0, 0.8,
+                                       juce::Decibels::decibelsToGain (midDb)));
+                for (auto& f : treble)
+                    f.setCoefficients (juce::IIRCoefficients::makeHighShelf (sr, 3200.0, 0.707,
+                                       juce::Decibels::decibelsToGain (trebleDb)));
+            }
 
             dryBuffer.makeCopyOf (buffer, true);
 
@@ -192,6 +206,7 @@ namespace cue::dsp
         std::unique_ptr<juce::dsp::Oversampling<float>> oversampler;
         juce::AudioBuffer<float> dryBuffer;
         juce::SmoothedValue<float> levelSmooth, mixSmooth;
+        juce::SmoothedValue<float> bassSmooth, midSmooth, trebleSmooth;
 
         std::array<juce::SingleThreadedIIRFilter, 2> preHp, bass, mid, treble, bright, cab;
         std::array<float, 2> dcX {}, dcY {};

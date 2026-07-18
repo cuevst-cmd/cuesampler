@@ -16,9 +16,12 @@ namespace
 // One continuous chassis: content spans the full design width inside a
 // slim 10px margin (the CUERACK kMargin), no side rails.
 constexpr int editorWidth = 1266;
-constexpr int editorHeight = 884; // the CORE design space (chassis + keyboard);
+constexpr int editorHeight = 734; // the CORE design space (chassis + keyboard);
                                   // the FX rack band below lays out in real
-                                  // window pixels and re-flows CUERACK-style
+                                  // window pixels and re-flows CUERACK-style.
+                                  // (Was 884 — the old right utility rail is
+                                  // dissolved, stems dock into the header, and
+                                  // the transport is one condensed band.)
 
 // Minimum height reserved for the FX rack band under the scaled core:
 // one row of panels at the rack's minimum usable height (240) + toolbar.
@@ -33,7 +36,6 @@ constexpr int waveformRefreshHz = 30;
 constexpr int transportRefreshHz = 20;
 // Unified knob size across the whole UI. Both names kept so call sites read
 // in context, but they intentionally hold the same value.
-constexpr int smallKnobDiameter = 66;
 constexpr int effectKnobDiameter = 66;
 constexpr int preciseMiniKnobDragSensitivity = 3200;
 constexpr int maxZoomedScrollDragSensitivity = 13200;
@@ -217,19 +219,17 @@ inline juce::Colour themedTitleColour (juce::Colour accent)
 
 // UI preferences (theme choice) live in a small per-user settings file, not in
 // plugin state — so the look follows the user, and the processor is untouched.
-inline juce::PropertiesFile& uiSettings()
+// The editor owns the PropertiesFile because it uses a JUCE Timer internally
+// for delayed saves and must be destroyed before the MessageManager shuts down.
+inline juce::PropertiesFile::Options uiSettingsOptions()
 {
-    static juce::PropertiesFile file { []
-    {
-        juce::PropertiesFile::Options options;
-        options.applicationName     = "CUESAMPLER";
-        options.filenameSuffix      = ".settings";
-        options.folderName          = "CUE/CUESAMPLER";
-        options.osxLibrarySubFolder = "Application Support";
-        options.millisecondsBeforeSaving = 500;
-        return options;
-    }() };
-    return file;
+    juce::PropertiesFile::Options options;
+    options.applicationName     = "CUESAMPLER";
+    options.filenameSuffix      = ".settings";
+    options.folderName          = "CUE/CUESAMPLER";
+    options.osxLibrarySubFolder = "Application Support";
+    options.millisecondsBeforeSaving = 500;
+    return options;
 }
 
 // The CUE brand typeface (Syne — same family as the logo wordmark). Loaded once
@@ -1410,45 +1410,6 @@ private:
     int highlightedNote = -1;
 };
 
-class StartKnobComponent final : public juce::Component
-{
-public:
-    StartKnobComponent()
-    {
-        slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
-        slider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
-        slider.setRange (-1000.0, 1000.0, 1.0);
-        slider.setValue (0.0, juce::dontSendNotification);
-        slider.getProperties().set ("cueStyle", "startTiltKnob");
-        slider.setPopupDisplayEnabled (true, false, nullptr);
-        slider.setTooltip ("GRID: shifts the beat-grid anchor in time (-1000 to +1000 ms). Use this when chop boundaries feel off-beat. Alt-click to reset to 0.");
-        slider.setTextValueSuffix (" ms");
-        slider.captureCurrentValueAsDefault();
-        addAndMakeVisible (slider);
-
-        configureTextLabel (label, "GRID", 16.0f, glassTextMuted, juce::Justification::centred);
-        addAndMakeVisible (label);
-    }
-
-    void resized() override
-    {
-        label.setBounds (0, 0, getWidth(), 18);
-        slider.setBounds ((getWidth() - smallKnobDiameter) / 2, 19, smallKnobDiameter, smallKnobDiameter);
-    }
-
-    juce::Slider& getSlider() noexcept { return slider; }
-
-    void refreshColours()
-    {
-        label.setColour (juce::Label::textColourId, glassTextMuted);
-        repaint();
-    }
-
-private:
-    OptResetSlider slider;
-    juce::Label label;
-};
-
 class DisplayBox final : public juce::Component,
                          public juce::SettableTooltipClient
 {
@@ -1698,7 +1659,7 @@ private:
         const juce::StringArray defs {
             "CHOP = auto-sliced bar segment   |   MIDI C2 = chop 1,  D2 = chop 2 ...",
             "CUE = loop-start point inside a chop   |   GRID = beat-grid anchor offset (ms)",
-            "PITCH (utility strip) = global shift   |   PITCH (transport) = per-chop shift",
+            "PITCH (under waveform) = global shift   |   PITCH (chop controls) = per-chop shift",
             "SYNC = auto-match speed to DAW BPM   |   TEMPO trim = nudge grid +/-10 BPM",
         };
         float fy = footer.getY() + 12.0f;
@@ -1888,32 +1849,6 @@ public:
         undoButton.onClick = [this] { processor.undoLastEdit(); };
         addAndMakeVisible (undoButton);
 
-        // Opt-in data-sharing toggle. Lights up (toggle "on" colour) when the
-        // user has consented to share anonymous BPM/key detection data.
-        configureButton (dataButton, "DATA", textPrimary);
-        dataButton.getProperties().set ("cueStyle", "helpButton");
-        dataButton.setToggleState (processor.isTelemetryEnabled(), juce::dontSendNotification);
-        dataButton.setTooltip ("Help improve BPM & key detection by sharing anonymous "
-                               "correction data. No audio or file names are ever sent.");
-        dataButton.onClick = [this]
-        {
-            juce::PopupMenu menu;
-            menu.addItem (1, "Share anonymous data to improve BPM & key detection",
-                          true, processor.isTelemetryEnabled());
-            menu.setLookAndFeel (&getLookAndFeel());
-            menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (dataButton),
-                                [this] (int result)
-                                {
-                                    if (result != 1)
-                                        return;
-                                    const bool newState = ! processor.isTelemetryEnabled();
-                                    processor.setTelemetryEnabled (newState);
-                                    dataButton.setToggleState (newState, juce::dontSendNotification);
-                                    dataButton.repaint();
-                                });
-        };
-        addAndMakeVisible (dataButton);
-
         // Light/dark theme toggle, mirroring CUERACK's header button. The
         // label names the CURRENT theme; the editor owns the actual swap.
         configureButton (themeButton, isLight() ? "LIGHT" : "DARK", textPrimary);
@@ -1938,13 +1873,11 @@ public:
         constexpr int buttonSize = 38;
         constexpr int rightMargin = 14;
         constexpr int topMargin = 16;
-        constexpr int dataWidth = 66;
         constexpr int undoWidth = 76;
         constexpr int themeWidth = 86;
         constexpr int gap = 8;
         helpButton.setBounds (getWidth() - rightMargin - buttonSize, topMargin, buttonSize, buttonSize);
-        dataButton.setBounds (helpButton.getX() - gap - dataWidth, topMargin, dataWidth, buttonSize);
-        undoButton.setBounds (dataButton.getX() - gap - undoWidth, topMargin, undoWidth, buttonSize);
+        undoButton.setBounds (helpButton.getX() - gap - undoWidth, topMargin, undoWidth, buttonSize);
         themeButton.setBounds (undoButton.getX() - gap - themeWidth, topMargin, themeWidth, buttonSize);
     }
 
@@ -1965,7 +1898,7 @@ public:
     // Re-apply cached colours + the theme button's label after a theme swap.
     void refreshColours()
     {
-        for (auto* b : { &helpButton, &dataButton, &undoButton, &themeButton })
+        for (auto* b : { &helpButton, &undoButton, &themeButton })
         {
             b->setColour (juce::TextButton::textColourOffId, textPrimary);
             b->setColour (juce::TextButton::textColourOnId, textPrimary);
@@ -2052,7 +1985,6 @@ private:
     AudioPluginAudioProcessor& processor;
     juce::ComponentDragger windowDragger;
     SmoothHoverButton helpButton;
-    SmoothHoverButton dataButton;
     SmoothHoverButton undoButton;
     SmoothHoverButton themeButton;
     std::unique_ptr<juce::Drawable> cueWordmark;
@@ -4822,15 +4754,17 @@ class TransportSectionComponent final : public juce::Component,
 public:
     ~TransportSectionComponent() override { stopTimer(); }
 
+    // Knob size for the condensed band's second row (label + knob fit ~70px).
+    static constexpr int bandKnobDiameter = 48;
+
     explicit TransportSectionComponent (AudioPluginAudioProcessor& p)
         : processor (p),
           timeDisplay ("", "00:00:00", 16.0f, "timeBox"),
           tempoDisplay ("BPM", "--.-", 14.0f, "tempoBox"),
           keyDisplay ("KEY", "--", 13.0f, "keyBox"),
-          startKnob (),
-          cueKnob ("CUE", smallKnobDiameter, 15.0f, "miniColourKnob", juce::Colour (0xff00c950)),
-          gainKnob ("GAIN", smallKnobDiameter, 15.0f, "miniColourKnob", juce::Colour (0xfffb2c36)),
-          pitchKnob ("PITCH", smallKnobDiameter, 15.0f, "miniColourKnob", juce::Colour (0xfff6339a))
+          cueKnob ("CUE", bandKnobDiameter, 13.0f, "miniColourKnob", juce::Colour (0xff00c950)),
+          gainKnob ("GAIN", bandKnobDiameter, 13.0f, "miniColourKnob", juce::Colour (0xfffb2c36)),
+          pitchKnob ("PITCH", bandKnobDiameter, 13.0f, "miniColourKnob", juce::Colour (0xfff6339a))
     {
         setBufferedToImage (false);
         startTimerHz (transportRefreshHz);
@@ -5014,32 +4948,37 @@ public:
         addAndMakeVisible (keyDisplay);
         keyDisplay.setTooltip ("Detected musical key + Camelot code. Click to correct it.");
         keyDisplay.setClickHandler ([this] { showKeyOverrideMenu(); });
-        addAndMakeVisible (startKnob);
-        addAndMakeVisible (cueKnob);
-        addAndMakeVisible (gainKnob);
-        addAndMakeVisible (pitchKnob);
+        // Host-sync toggle sits with the displays it relates to.
+        configureButton (syncButton, "SYNC TO DAW", textMuted);
+        syncButton.getProperties().set ("cueStyle", "utilitySync");
+        syncButton.setClickingTogglesState (true);
+        syncButton.setTooltip ("SYNC: locks playback speed to your DAW's host BPM automatically. Disable for free-running playback.");
+        addAndMakeVisible (syncButton);
 
+        // Per-chop voicing knobs — they belong in the CHOP CONTROLS panel.
         cueKnob.getSlider().setRange (0.0, 100.0, 0.1);
         cueKnob.getSlider().setValue (0.0, juce::dontSendNotification);
         cueKnob.getSlider().setNumDecimalPlacesToDisplay (1);
         cueKnob.getSlider().setTextValueSuffix (" %");
         cueKnob.captureCurrentValueAsDefault();
+        cueKnob.getSlider().setTooltip ("CUE: sets where playback starts inside this chop - 0% = chop start, 100% = chop end. Looping always returns to this point. Alt-click to reset.");
+        addAndMakeVisible (cueKnob);
 
         gainKnob.getSlider().setRange (-24.0, 12.0, 0.1);
         gainKnob.getSlider().setValue (0.0, juce::dontSendNotification);
         gainKnob.getSlider().setNumDecimalPlacesToDisplay (1);
         gainKnob.getSlider().setTextValueSuffix (" dB");
         gainKnob.captureCurrentValueAsDefault();
+        gainKnob.getSlider().setTooltip ("GAIN: volume for this chop only (-24 to +12 dB). Does not affect other chops. Alt-click to reset to 0 dB.");
+        addAndMakeVisible (gainKnob);
 
         pitchKnob.getSlider().setRange (-12.0, 12.0, 0.1);
         pitchKnob.getSlider().setValue (0.0, juce::dontSendNotification);
         pitchKnob.getSlider().setNumDecimalPlacesToDisplay (1);
         pitchKnob.getSlider().setTextValueSuffix (" st");
         pitchKnob.captureCurrentValueAsDefault();
-
-        cueKnob.getSlider().setTooltip ("CUE: sets where playback starts inside this chop - 0% = chop start, 100% = chop end. Looping always returns to this point. Alt-click to reset.");
-        gainKnob.getSlider().setTooltip ("GAIN: volume for this chop only (-24 to +12 dB). Does not affect other chops. Alt-click to reset to 0 dB.");
-        pitchKnob.getSlider().setTooltip ("PITCH (per-chop): pitch shift for this chop only, -12 to +12 semitones. Stacks on top of the global PITCH knob in the utility strip. Alt-click to reset.");
+        pitchKnob.getSlider().setTooltip ("PITCH (per-chop): pitch shift for this chop only, -12 to +12 semitones. Stacks on top of the global PITCH knob under the waveform. Alt-click to reset.");
+        addAndMakeVisible (pitchKnob);
 
         updateDisplays();
     }
@@ -5050,25 +4989,20 @@ public:
 
         fillGlassRounded (g, *this, topPanel, mediumCorner);
 
-        drawPanelHole (g, { topPanel.getX() + 13.0f, topPanel.getY() + 13.0f }, 6.0f);
-        drawPanelHole (g, { topPanel.getRight() - 13.0f, topPanel.getY() + 13.0f }, 6.0f);
-        drawPanelHole (g, { topPanel.getX() + 13.0f, topPanel.getBottom() - 13.0f }, 6.0f);
-        drawPanelHole (g, { topPanel.getRight() - 13.0f, topPanel.getBottom() - 13.0f }, 6.0f);
-
-        g.setColour (glassTextMuted.withAlpha (0.35f));
-        g.fillRect (216, (int) std::round (topPanel.getCentreY() - 24.0f), 1, 48);
+        drawPanelHole (g, { topPanel.getX() + 13.0f, topPanel.getCentreY() }, 6.0f);
+        drawPanelHole (g, { topPanel.getRight() - 13.0f, topPanel.getCentreY() }, 6.0f);
 
         auto bottomPanel = getBottomPanelBounds().toFloat();
 
         fillGlassRounded (g, *this, bottomPanel, mediumCorner);
 
-        drawPanelHole (g, { bottomPanel.getX() + 13.0f, bottomPanel.getY() + 13.0f }, 6.0f);
-        drawPanelHole (g, { bottomPanel.getRight() - 13.0f, bottomPanel.getY() + 13.0f }, 6.0f);
-        drawPanelHole (g, { bottomPanel.getX() + 13.0f, bottomPanel.getBottom() - 13.0f }, 6.0f);
-        drawPanelHole (g, { bottomPanel.getRight() - 13.0f, bottomPanel.getBottom() - 13.0f }, 6.0f);
+        drawPanelHole (g, { bottomPanel.getX() + 13.0f, bottomPanel.getCentreY() }, 6.0f);
+        drawPanelHole (g, { bottomPanel.getRight() - 13.0f, bottomPanel.getCentreY() }, 6.0f);
 
-        auto badgeBounds = juce::Rectangle<float> (bottomPanel.getX() + 20.0f,
-                                                   (topPanel.getBottom() + bottomPanel.getY()) * 0.5f - 9.0f,
+        // Keep the section badge in its own left-hand bay instead of
+        // straddling the panel seam above the knob tick rings.
+        auto badgeBounds = juce::Rectangle<float> (bottomPanel.getX() + 34.0f,
+                                                   bottomPanel.getCentreY() - 9.0f,
                                                    122.0f,
                                                    18.0f);
         fillGlassRounded (g, *this, badgeBounds, 6.0f);
@@ -5081,19 +5015,19 @@ public:
 
         g.setColour (glassTextMuted.withAlpha (0.85f));
         g.setFont (monoFont (8.5f).withExtraKerningFactor (0.06f));
-        g.drawText (getMidiMappingText(),
-                    juce::Rectangle<int> (getWidth() - 212, (int) bottomPanel.getY() + 94, 198, 13),
-                    juce::Justification::centred, false);
+        {
+            // Centre the mapping hint under the CHOP/BARS pair (mirrors the
+            // centerBlockX maths in resized()).
+            constexpr int centerBlockWidth = 140 + 12 + 120;
+            const int centerBlockX = (getWidth() - centerBlockWidth) / 2 - 60;
+            g.drawText (getMidiMappingText(),
+                        juce::Rectangle<int> (centerBlockX, getHeight() - 15, centerBlockWidth + 12, 13),
+                        juce::Justification::centred, false);
+        }
 
-        drawHelperText (g, "Load audio - tempo/key are detected automatically",
-                        juce::Rectangle<int> (16, (int) topPanel.getBottom() - 23, 250, 16), juce::Justification::centredLeft, 10.0f);
+        // Recessed CUERACK well around the warp edit cluster.
+        auto warpGroupBounds = warpClusterBounds().toFloat().expanded (6.0f, 4.0f);
 
-        // Draw an outline around the warp edit section:
-        const int buttonH = 48;
-        const int buttonY = (int) bottomPanel.getY() + (120 - buttonH) / 2; // Y + 36
-        auto warpGroupBounds = juce::Rectangle<float> ((float) getWidth() - 324.0f, (float) buttonY, 306.0f, (float) buttonH).expanded (6.0f, 4.0f);
-
-        // Recessed CUERACK well
         g.setColour (blackPanel.withAlpha (0.6f));
         g.fillRoundedRectangle (warpGroupBounds, 2.0f);
         g.setColour (borderMid);
@@ -5106,89 +5040,79 @@ public:
 
     void resized() override
     {
+        // ---- Row 1: load | transport | half-time | displays | sync ---------
         const auto topPanel = getTopPanelBounds();
         const int topCenterY = topPanel.getCentreY();
-        
-        const int sideMargin = 16;
+
+        // Keep clear of the corner rivets (drawn at x = 13 +- 6 in paint()).
+        const int sideMargin = 34;
         const int totalW = getWidth() - (sideMargin * 2);
 
-        // 5 Functional Blocks:
-        // 1. loadButton (140)
-        // 2. transportGroup (play 48 + gap 12 + pause 48 + gap 12 + stop 48 = 168)
-        // 3. halfSpeedButton (76)
-        // 4. startKnob (smallKnobDiameter = 54)
-        // 5. displaysGroup (time 160 + gap 12 + tempo 80 + gap 12 + key 80 = 344)
-        constexpr int loadW = 140;
-        constexpr int innerTransportGap = 12;
-        constexpr int transportGroupW = 48 + innerTransportGap + 48 + innerTransportGap + 48; // 168
-        constexpr int halfW = 76;
-        const int knobW = smallKnobDiameter; // 54
-        constexpr int innerDisplayGap = 12;
-        constexpr int displaysGroupW = 160 + innerDisplayGap + 80 + innerDisplayGap + 80; // 344
+        constexpr int loadW = 120;
+        constexpr int innerTransportGap = 8;
+        constexpr int transportGroupW = 48 * 3 + innerTransportGap * 2; // 160
+        constexpr int halfW = 64;
+        constexpr int innerDisplayGap = 8;
+        constexpr int displaysGroupW = 150 + innerDisplayGap + 76 + innerDisplayGap + 76; // 318
+        constexpr int syncW = 84;
 
-        const int sumBlockWidths = loadW + transportGroupW + halfW + knobW + displaysGroupW;
-        const float blockGap = juce::jmax (8.0f, (float) (totalW - sumBlockWidths) / 4.0f);
+        const int sumBlockWidths = loadW + transportGroupW + halfW + displaysGroupW + syncW;
+        const float blockGap = juce::jmax (10.0f, (float) (totalW - sumBlockWidths) / 4.0f);
 
         float currentX = (float) sideMargin;
 
-        // Block 1: Load Sample
         loadButton.setBounds (juce::roundToInt (currentX), topCenterY - 24, loadW, 48);
         currentX += (float) loadW + blockGap;
 
-        // Block 2: Transport Group (Play / Pause / Stop)
         playButton.setBounds (juce::roundToInt (currentX), topCenterY - 24, 48, 48);
         pauseButton.setBounds (juce::roundToInt (currentX + 48 + innerTransportGap), topCenterY - 24, 48, 48);
-        stopButton.setBounds (juce::roundToInt (currentX + 48 + innerTransportGap + 48 + innerTransportGap), topCenterY - 24, 48, 48);
+        stopButton.setBounds (juce::roundToInt (currentX + 2 * (48 + innerTransportGap)), topCenterY - 24, 48, 48);
         currentX += (float) transportGroupW + blockGap;
 
-        // Block 3: Half-Time Button
         halfSpeedButton.setBounds (juce::roundToInt (currentX), topCenterY - 24, halfW, 48);
         currentX += (float) halfW + blockGap;
 
-        // Block 4: GRID Start Knob
-        startKnob.setBounds (juce::roundToInt (currentX), topCenterY - 34, knobW, knobW + 19);
-        currentX += (float) knobW + blockGap;
+        timeDisplay.setBounds (juce::roundToInt (currentX), topCenterY - 24, 150, 48);
+        tempoDisplay.setBounds (juce::roundToInt (currentX + 150 + innerDisplayGap), topCenterY - 24, 76, 48);
+        keyDisplay.setBounds (juce::roundToInt (currentX + 150 + innerDisplayGap + 76 + innerDisplayGap), topCenterY - 24, 76, 48);
+        currentX += (float) displaysGroupW + blockGap;
 
-        // Block 5: LED Displays Group (Time / Tempo / Key)
-        timeDisplay.setBounds (juce::roundToInt (currentX), topCenterY - 24, 160, 48);
-        tempoDisplay.setBounds (juce::roundToInt (currentX + 160 + innerDisplayGap), topCenterY - 24, 80, 48);
-        keyDisplay.setBounds (juce::roundToInt (currentX + 160 + innerDisplayGap + 80 + innerDisplayGap), topCenterY - 24, 80, 48);
+        syncButton.setBounds (juce::roundToInt (currentX), topCenterY - 24, syncW, 48);
 
+        // ---- Row 2: chop knobs | chop tools | warp cluster | oct ----------
         auto bottomPanel = getBottomPanelBounds();
 
-        constexpr int centerBlockWidth = 148 + 12 + 140; // chopTransients (148) + gap (12) + bars (140)
-        const int centerBlockX = (getWidth() - centerBlockWidth) / 2;
+        const int knobH = bandKnobDiameter + 19;
+        const int knobY = bottomPanel.getY() + juce::jmax (0, (bottomPanel.getHeight() - knobH) / 2);
+        constexpr int knobGap = 22;
 
-        // CUE/GAIN/PITCH live in the left bay, bounded on the right by the center block.
-        constexpr int knobGap = 20;
-        const int clusterWidth = 3 * smallKnobDiameter + 2 * knobGap;
-        const int knobRowX = (centerBlockX - clusterWidth) / 2;
-        const int knobRowH = smallKnobDiameter + 20; // knob + label
-        const int knobRowY = bottomPanel.getY() + (bottomPanel.getHeight() - knobRowH) / 2;
+        constexpr int chopBadgeWidth = 122;
+        constexpr int badgeToKnobGap = 24;
+        int knobX = sideMargin + chopBadgeWidth + badgeToKnobGap;
+        cueKnob.setBounds (knobX, knobY, bandKnobDiameter, knobH);
+        knobX += bandKnobDiameter + knobGap;
+        gainKnob.setBounds (knobX, knobY, bandKnobDiameter, knobH);
+        knobX += bandKnobDiameter + knobGap;
+        pitchKnob.setBounds (knobX, knobY, bandKnobDiameter, knobH);
 
-        auto knobRow = juce::Rectangle<int> (knobRowX, knobRowY, clusterWidth, knobRowH);
-        cueKnob.setBounds (knobRow.removeFromLeft (smallKnobDiameter));
-        knobRow.removeFromLeft (knobGap);
-        gainKnob.setBounds (knobRow.removeFromLeft (smallKnobDiameter));
-        knobRow.removeFromLeft (knobGap);
-        pitchKnob.setBounds (knobRow.removeFromLeft (smallKnobDiameter));
-
-        const int buttonH = 48;
+        const int buttonH = 44;
         const int buttonY = bottomPanel.getY() + (bottomPanel.getHeight() - buttonH) / 2;
 
-        chopTransientsButton.setBounds (centerBlockX, buttonY, 148, buttonH);
-        barsButton.setBounds (centerBlockX + 160, buttonY, 140, buttonH);
+        constexpr int centerBlockWidth = 140 + 12 + 120; // chopTransients + gap + bars
+        const int centerBlockX = (getWidth() - centerBlockWidth) / 2 - 30;
+        chopTransientsButton.setBounds (centerBlockX, buttonY, 140, buttonH);
+        barsButton.setBounds (centerBlockX + 152, buttonY, 120, buttonH);
 
-        // Warp controls live in the right bay
-        warpButton.setBounds (getWidth() - 324, buttonY, 96, buttonH);
-        clearWarpButton.setBounds (getWidth() - 218, buttonY, 96, buttonH);
-        warpDivisionCombo.setBounds (getWidth() - 112, buttonY, 94, buttonH);
+        // Warp cluster, right-aligned, with the stacked octave buttons at the
+        // far edge (the MIDI mapping hint is painted beneath in paint()).
+        const auto warp = warpClusterBounds();
+        warpButton.setBounds (warp.getX(), warp.getY(), 88, buttonH);
+        clearWarpButton.setBounds (warp.getX() + 96, warp.getY(), 88, buttonH);
+        warpDivisionCombo.setBounds (warp.getX() + 192, warp.getY(), 84, buttonH);
 
-        // Octave shift buttons sit side by side, with the (dynamic) MIDI
-        // mapping hint to their right.
-        const int octRowY = bottomPanel.getY() + 91;
-        octDownButton.setBounds (getWidth() - 324, octRowY, 44, 18);
-        octUpButton.setBounds (getWidth() - 276, octRowY, 44, 18);
+        const int octX = getWidth() - sideMargin - 44;
+        octDownButton.setBounds (octX, buttonY, 44, 20);
+        octUpButton.setBounds (octX, buttonY + 24, 44, 20);
     }
 
     juce::TextButton& getLoadButton() noexcept { return loadButton; }
@@ -5196,10 +5120,10 @@ public:
     juce::TextButton& getPauseButton() noexcept { return pauseButton; }
     juce::TextButton& getStopButton() noexcept { return stopButton; }
     juce::TextButton& getBarsButton() noexcept { return barsButton; }
-    juce::Slider& getStartSlider() noexcept { return startKnob.getSlider(); }
     juce::Slider& getCueSlider() noexcept { return cueKnob.getSlider(); }
     juce::Slider& getGainSlider() noexcept { return gainKnob.getSlider(); }
     juce::Slider& getPitchSlider() noexcept { return pitchKnob.getSlider(); }
+    juce::TextButton& getSyncButton() noexcept { return syncButton; }
     void refreshDisplays() { updateDisplays(); }
 
     // Re-apply cached colours after a theme swap.
@@ -5208,7 +5132,6 @@ public:
         cueKnob.refreshColours();
         gainKnob.refreshColours();
         pitchKnob.refreshColours();
-        startKnob.refreshColours();
         repaint();
     }
     std::function<void (double)> onTempoEntered;
@@ -5235,6 +5158,45 @@ private:
         updateKeyDisplay();
         updateChopControls();
         updateOctaveControls();
+    }
+
+    // Mirrors the selected chop's cue/gain/pitch into the knobs and greys
+    // them out when nothing is selected.
+    void updateChopControls()
+    {
+        const auto chopState = processor.getChopState();
+        const auto* selectedChop = [&chopState] () -> const AudioPluginAudioProcessor::ChopDefinition*
+        {
+            if (chopState == nullptr || chopState->selectedChopId < 0)
+                return nullptr;
+
+            for (const auto& chop : chopState->chops)
+            {
+                if (chop.id == chopState->selectedChopId)
+                    return &chop;
+            }
+
+            return nullptr;
+        }();
+
+        const bool hasSelectedChop = selectedChop != nullptr;
+        cueKnob.getSlider().setEnabled (hasSelectedChop);
+        gainKnob.getSlider().setEnabled (hasSelectedChop);
+        pitchKnob.getSlider().setEnabled (hasSelectedChop);
+
+        if (! hasSelectedChop)
+        {
+            cueKnob.getSlider().setValue (0.0, juce::dontSendNotification);
+            gainKnob.getSlider().setValue (0.0, juce::dontSendNotification);
+            pitchKnob.getSlider().setValue (0.0, juce::dontSendNotification);
+            return;
+        }
+
+        const auto chopLength = juce::jmax (1, selectedChop->endSample - selectedChop->startSample - 1);
+        const auto cuePercent = (double) selectedChop->cueOffsetSamples / (double) chopLength * 100.0;
+        cueKnob.getSlider().setValue (cuePercent, juce::dontSendNotification);
+        gainKnob.getSlider().setValue ((double) selectedChop->gainDecibels, juce::dontSendNotification);
+        pitchKnob.getSlider().setValue ((double) selectedChop->pitchSemitones, juce::dontSendNotification);
     }
 
     void syncWarpAccentState()
@@ -5321,7 +5283,7 @@ private:
         else
             tooltip << "\nFeel: mostly steady";
 
-        tooltip << "\nUse the TEMPO trim knob (utility strip) to nudge the grid if chops feel slightly off-beat.";
+        tooltip << "\nUse the TEMPO trim knob (under the waveform) to nudge the grid if chops feel slightly off-beat.";
 
         tempoDisplay.setTooltip (tooltip);
     }
@@ -5446,43 +5408,6 @@ private:
         keyDisplay.setTooltip ("Detected key: " + displayText);
     }
 
-    void updateChopControls()
-    {
-        const auto chopState = processor.getChopState();
-        const auto* selectedChop = [&chopState] () -> const AudioPluginAudioProcessor::ChopDefinition*
-        {
-            if (chopState == nullptr || chopState->selectedChopId < 0)
-                return nullptr;
-
-            for (const auto& chop : chopState->chops)
-            {
-                if (chop.id == chopState->selectedChopId)
-                    return &chop;
-            }
-
-            return nullptr;
-        }();
-
-        const bool hasSelectedChop = selectedChop != nullptr;
-        cueKnob.getSlider().setEnabled (hasSelectedChop);
-        gainKnob.getSlider().setEnabled (hasSelectedChop);
-        pitchKnob.getSlider().setEnabled (hasSelectedChop);
-
-        if (! hasSelectedChop)
-        {
-            cueKnob.getSlider().setValue (0.0, juce::dontSendNotification);
-            gainKnob.getSlider().setValue (0.0, juce::dontSendNotification);
-            pitchKnob.getSlider().setValue (0.0, juce::dontSendNotification);
-            return;
-        }
-
-        const auto chopLength = juce::jmax (1, selectedChop->endSample - selectedChop->startSample - 1);
-        const auto cuePercent = (double) selectedChop->cueOffsetSamples / (double) chopLength * 100.0;
-        cueKnob.getSlider().setValue (cuePercent, juce::dontSendNotification);
-        gainKnob.getSlider().setValue ((double) selectedChop->gainDecibels, juce::dontSendNotification);
-        pitchKnob.getSlider().setValue ((double) selectedChop->pitchSemitones, juce::dontSendNotification);
-    }
-
     // Note name in the plugin's convention (MIDI 36 = C2, i.e. octave = note / 12 - 1).
     static juce::String midiNoteName (int noteNumber)
     {
@@ -5509,13 +5434,24 @@ private:
 
     juce::Rectangle<int> getTopPanelBounds() const
     {
-        return getLocalBounds().removeFromTop (102);
+        return getLocalBounds().removeFromTop (70);
     }
 
     juce::Rectangle<int> getBottomPanelBounds() const
     {
-        constexpr int bottomPanelY = 116;
+        constexpr int bottomPanelY = 74;
         return { 0, bottomPanelY, getWidth(), juce::jmax (0, getHeight() - bottomPanelY) };
+    }
+
+    // Warp cluster (WARP / CLEAR / division), right-aligned in row 2 with room
+    // for the stacked octave buttons at the edge. Shared by paint()/resized().
+    juce::Rectangle<int> warpClusterBounds() const
+    {
+        const auto bottomPanel = getBottomPanelBounds();
+        constexpr int clusterW = 88 + 8 + 88 + 8 + 84; // 276
+        constexpr int buttonH = 44;
+        const int y = bottomPanel.getY() + (bottomPanel.getHeight() - buttonH) / 2;
+        return { getWidth() - 34 - 44 - 16 - clusterW, y, clusterW, buttonH };
     }
 
     AudioPluginAudioProcessor& processor;
@@ -5540,42 +5476,39 @@ private:
     DisplayBox timeDisplay;
     DisplayBox tempoDisplay;
     DisplayBox keyDisplay;
-    StartKnobComponent startKnob;
     LabelledKnob cueKnob;
     LabelledKnob gainKnob;
     LabelledKnob pitchKnob;
+    SmoothAnimatedSwitchButton syncButton;
 };
 
-class UtilityStripComponent final : public juce::Component
+// Slim glass strip directly beneath the waveform. Left: the waveform view
+// controls (ZOOM / SCROLL) next to what they steer. Right: the sample-wide
+// controls (TEMPO trim / global PITCH). The per-chop CUE / GAIN / PITCH
+// knobs live in the transport's CHOP CONTROLS panel.
+class WaveformFooterComponent final : public juce::Component
 {
 public:
-    UtilityStripComponent()
-        : zoomKnob ("ZOOM", effectKnobDiameter, 15.0f),
-          scrollKnob ("SCROLL", effectKnobDiameter, 15.0f),
-          tempoKnob ("TEMPO", effectKnobDiameter, 15.0f),
-          pitchKnob ("PITCH", effectKnobDiameter, 15.0f)
+    static constexpr int footerKnobDiameter = 52;
+
+    WaveformFooterComponent()
+        : zoomKnob ("ZOOM", footerKnobDiameter, 13.0f, "miniColourKnob", juce::Colour (0xff38bdf8)),
+          scrollKnob ("SCROLL", footerKnobDiameter, 13.0f, "miniColourKnob", juce::Colour (0xff2dd4bf)),
+          tempoKnob ("TEMPO", footerKnobDiameter, 13.0f, "miniColourKnob", juce::Colour (0xfff59e0b)),
+          globalPitchKnob ("PITCH", footerKnobDiameter, 13.0f, "miniColourKnob", juce::Colour (0xfff6339a))
     {
         setBufferedToImage (false);
 
-        configureButton (syncButton, "SYNC TO DAW", textMuted);
-        syncButton.getProperties().set ("cueStyle", "utilitySync");
-        syncButton.setClickingTogglesState (true);
-        syncButton.setTooltip ("SYNC: locks playback speed to your DAW's host BPM automatically. Disable for free-running playback.");
-        addAndMakeVisible (syncButton);
-
-        zoomKnob.getSlider().getProperties().set ("cueStyle", "miniColourKnob");
         zoomKnob.getSlider().setValue (0.0, juce::dontSendNotification);
         zoomKnob.getSlider().setMouseDragSensitivity (preciseMiniKnobDragSensitivity);
         zoomKnob.getSlider().setTooltip ("ZOOM: zoom into the waveform for detail. Use SCROLL to pan when zoomed in. Alt-click to reset.");
         zoomKnob.captureCurrentValueAsDefault();
 
-        scrollKnob.getSlider().getProperties().set ("cueStyle", "miniColourKnob");
         scrollKnob.getSlider().setValue (0.0, juce::dontSendNotification);
         scrollKnob.getSlider().setMouseDragSensitivity (getScrollDragSensitivity (0.0f));
         scrollKnob.getSlider().setTooltip ("SCROLL: pan the waveform left/right when zoomed in. Has no effect at zero zoom. Alt-click to reset.");
         scrollKnob.captureCurrentValueAsDefault();
 
-        tempoKnob.getSlider().getProperties().set ("cueStyle", "miniColourKnob");
         tempoKnob.getSlider().setRange (-10.0, 10.0, 0.1);
         tempoKnob.getSlider().setValue (0.0, juce::dontSendNotification);
         tempoKnob.getSlider().setNumDecimalPlacesToDisplay (1);
@@ -5583,70 +5516,64 @@ public:
         tempoKnob.getSlider().setTooltip ("TEMPO trim: adds a fine BPM offset (-10 to +10 BPM) to shift where chop boundaries fall. Use when chops feel slightly early or late. Alt-click to reset to 0.");
         tempoKnob.captureCurrentValueAsDefault();
 
-        pitchKnob.getSlider().getProperties().set ("cueStyle", "miniColourKnob");
-        pitchKnob.getSlider().setRange (-12.0, 12.0, 0.1);
-        pitchKnob.getSlider().setValue (0.0, juce::dontSendNotification);
-        pitchKnob.getSlider().setNumDecimalPlacesToDisplay (1);
-        pitchKnob.getSlider().setTextValueSuffix (" st");
-        pitchKnob.getSlider().setTooltip ("PITCH (global): shifts pitch of every chop together, -12 to +12 semitones. The per-chop PITCH knob adds on top of this. Alt-click to reset to 0.");
-        pitchKnob.captureCurrentValueAsDefault();
+        globalPitchKnob.getSlider().setRange (-12.0, 12.0, 0.1);
+        globalPitchKnob.getSlider().setValue (0.0, juce::dontSendNotification);
+        globalPitchKnob.getSlider().setNumDecimalPlacesToDisplay (1);
+        globalPitchKnob.getSlider().setTextValueSuffix (" st");
+        globalPitchKnob.getSlider().setTooltip ("PITCH (global): shifts pitch of every chop together, -12 to +12 semitones. The per-chop PITCH knob (in CHOP CONTROLS) adds on top of this. Alt-click to reset to 0.");
+        globalPitchKnob.captureCurrentValueAsDefault();
 
-        // No cueAccent property: utility knobs wear the theme-following
-        // foundation cream/ink, like CUERACK's default controls.
-        for (auto* knob : { &zoomKnob, &scrollKnob, &tempoKnob, &pitchKnob })
+        for (auto* knob : { &zoomKnob, &scrollKnob, &tempoKnob, &globalPitchKnob })
             addAndMakeVisible (*knob);
     }
 
     // Re-apply cached colours after a theme swap.
     void refreshColours()
     {
-        for (auto* knob : { &zoomKnob, &scrollKnob, &tempoKnob, &pitchKnob })
+        for (auto* knob : { &zoomKnob, &scrollKnob, &tempoKnob, &globalPitchKnob })
             knob->refreshColours();
     }
 
     void paint (juce::Graphics& g) override
     {
         auto bounds = getLocalBounds().toFloat().reduced (0.5f);
+        fillGlassRounded (g, *this, bounds, mediumCorner);
 
-        fillGlassRounded (g, *this, bounds, largeCorner);
-
-        drawHelperText (g, "Follows DAW BPM",
-                        juce::Rectangle<int> (10, 107, getWidth() - 20, 20), juce::Justification::centred, 9.8f);
-        drawHelperText (g, "Waveform detail",
-                        juce::Rectangle<int> (10, 238, getWidth() - 20, 20), juce::Justification::centred, 9.8f);
-        drawHelperText (g, "Pan when zoomed",
-                        juce::Rectangle<int> (10, 361, getWidth() - 20, 20), juce::Justification::centred, 9.8f);
-        drawHelperText (g, "Nudge chop grid",
-                        juce::Rectangle<int> (10, 484, getWidth() - 20, 20), juce::Justification::centred, 9.8f);
-        drawHelperText (g, "All chops pitch",
-                        juce::Rectangle<int> (10, 607, getWidth() - 20, 20), juce::Justification::centred, 9.8f);
+        const auto centreY = bounds.getCentreY();
+        drawPanelHole (g, { bounds.getX() + 13.0f, centreY }, 6.0f);
+        drawPanelHole (g, { bounds.getRight() - 13.0f, centreY }, 6.0f);
     }
 
     void resized() override
     {
-        syncButton.setBounds (20, 44, 80, 56);
-        zoomKnob.setBounds (28, 154, effectKnobDiameter, 82);
-        scrollKnob.setBounds (28, 277, effectKnobDiameter, 82);
-        tempoKnob.setBounds (28, 400, effectKnobDiameter, 82);
-        pitchKnob.setBounds (28, 524, effectKnobDiameter, 82);
+        const int knobH = footerKnobDiameter + 19;
+        const int knobY = juce::jmax (0, (getHeight() - knobH) / 2);
+        constexpr int gap = 28;
+        constexpr int knobCount = 4;
+        constexpr int clusterWidth = knobCount * footerKnobDiameter + (knobCount - 1) * gap;
+
+        int x = (getWidth() - clusterWidth) / 2;
+        for (auto* knob : { &zoomKnob, &scrollKnob, &tempoKnob, &globalPitchKnob })
+        {
+            knob->setBounds (x, knobY, footerKnobDiameter, knobH);
+            x += footerKnobDiameter + gap;
+        }
     }
 
     juce::Slider& getZoomSlider() noexcept { return zoomKnob.getSlider(); }
     juce::Slider& getScrollSlider() noexcept { return scrollKnob.getSlider(); }
     juce::Slider& getTempoSlider() noexcept { return tempoKnob.getSlider(); }
-    juce::Slider& getPitchSlider() noexcept { return pitchKnob.getSlider(); }
-    juce::TextButton& getSyncButton() noexcept { return syncButton; }
+    juce::Slider& getGlobalPitchSlider() noexcept { return globalPitchKnob.getSlider(); }
     void updateScrollSensitivityForZoom (float zoomControlValue)
     {
         scrollKnob.getSlider().setMouseDragSensitivity (getScrollDragSensitivity (zoomControlValue));
     }
 
 private:
-    SmoothAnimatedSwitchButton syncButton;
     LabelledKnob zoomKnob;
     LabelledKnob scrollKnob;
     LabelledKnob tempoKnob;
-    LabelledKnob pitchKnob;
+    LabelledKnob globalPitchKnob;
 };
 
 // Slim glass strip beneath the waveform with three stem-mute toggles
@@ -5831,15 +5758,10 @@ public:
 
         fillGlassRounded (g, *this, bounds.reduced (0.5f), mediumCorner);
 
-        drawPanelHole (g, { 13.0f, 13.0f }, 6.0f);
-        drawPanelHole (g, { bounds.getRight() - 13.0f, 13.0f }, 6.0f);
-        drawPanelHole (g, { 13.0f, bounds.getBottom() - 13.0f }, 6.0f);
-        drawPanelHole (g, { bounds.getRight() - 13.0f, bounds.getBottom() - 13.0f }, 6.0f);
-
         // Panel title: Syne brand face in the CUERACK accent-title voice.
         g.setColour (themedTitleColour (accentOrange));
-        g.setFont (heavyFont (14.0f).withExtraKerningFactor (0.10f));
-        g.drawText ("STEMS", juce::Rectangle<int> (26, 13, 200, 24), juce::Justification::centredLeft);
+        g.setFont (heavyFont (12.0f).withExtraKerningFactor (0.10f));
+        g.drawText ("STEMS", juce::Rectangle<int> (14, 6, 150, 16), juce::Justification::centredLeft);
 
         if (separatingNow)
         {
@@ -5849,7 +5771,7 @@ public:
 
         g.setColour (statusColour);
         g.setFont (monoFont (8.5f).withExtraKerningFactor (0.06f));
-        g.drawText (statusText, juce::Rectangle<int> (27, 39, 210, 18), juce::Justification::centredLeft);
+        g.drawText (statusText, juce::Rectangle<int> (15, 24, 150, 14), juce::Justification::centredLeft);
     }
 
     // The "running" loading state: a smoothly-easing orange fill with a moving
@@ -5864,16 +5786,16 @@ public:
         // with no percentage.
         g.setFont (monoFont (8.5f).withExtraKerningFactor (0.06f));
         g.setColour (themedTitleColour (accentOrange));
-        g.drawText (loadingModel ? "PREPARING MODEL" : "SEPARATING",
-                    juce::Rectangle<int> (27, 37, 200, 15), juce::Justification::centredLeft);
+        g.drawText (loadingModel ? "PREPARING" : "SEPARATING",
+                    juce::Rectangle<int> (15, 23, 140, 13), juce::Justification::centredLeft);
         if (! loadingModel)
         {
             g.setColour (textPrimary);
-            g.drawText (juce::String (pct) + "%", juce::Rectangle<int> (27, 37, 210, 15), juce::Justification::centredRight);
+            g.drawText (juce::String (pct) + "%", juce::Rectangle<int> (15, 23, 140, 13), juce::Justification::centredRight);
         }
 
         // Recessed CUERACK slot.
-        const juce::Rectangle<float> track (27.0f, 56.0f, 210.0f, 5.0f);
+        const juce::Rectangle<float> track (15.0f, 42.0f, 140.0f, 5.0f);
         const float r = track.getHeight() * 0.5f;
         g.setColour (blackPanel);
         g.fillRoundedRectangle (track, r);
@@ -5923,17 +5845,20 @@ public:
 
     void resized() override
     {
-        constexpr int y = 11, h = 51, gap = 14;
-        constexpr int leftEdge = 255;
-        const int rightEdge = getWidth() - 24;
+        // Compact header-dock layout: title/status column on the left, three
+        // mute keys filling the rest.
+        constexpr int y = 6, gap = 8;
+        constexpr int leftEdge = 170;
+        const int h = getHeight() - 2 * y;
+        const int rightEdge = getWidth() - 12;
         const int w = (rightEdge - leftEdge - 2 * gap) / 3;
 
         bassBtn.setBounds   (leftEdge,                   y, w, h);
         drumsBtn.setBounds  (leftEdge + (w + gap),       y, w, h);
         vocalsBtn.setBounds (leftEdge + 2 * (w + gap),   y, w, h);
 
-        // Info column, centered vertically in the stems strip.
-        separateButton.setBounds (24, 18, 204, 38);
+        // SEPARATE replaces the status column while idle.
+        separateButton.setBounds (12, 22, 146, 28);
     }
 
 private:
@@ -6020,13 +5945,15 @@ private:
 AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAudioProcessor& p)
     : AudioProcessorEditor (&p), processorRef (p)
 {
+    uiSettingsFile = std::make_unique<juce::PropertiesFile> (cue::uiSettingsOptions());
+
     processorRef.sampleChangeBroadcaster.addChangeListener (this);
     processorRef.editChangeBroadcaster.addChangeListener (this);
 
     // Restore the saved UI theme BEFORE anything paints or caches colours —
     // the theme is a per-user preference (settings file), not plugin state.
-    cue::applyTheme (cue::uiSettings().getValue ("uiTheme") == "light" ? cue::Theme::light
-                                                                       : cue::Theme::dark);
+    cue::applyTheme (uiSettingsFile->getValue ("uiTheme") == "light" ? cue::Theme::light
+                                                                      : cue::Theme::dark);
 
     lookAndFeel = std::make_unique<cue::CueSamplerLookAndFeel>();
     setLookAndFeel (lookAndFeel.get());
@@ -6035,7 +5962,7 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     headerComponent = std::make_unique<cue::HeaderComponent> (processorRef);
     waveformDisplayComponent = std::make_unique<cue::WaveformDisplayComponent> (processorRef);
     transportSectionComponent = std::make_unique<cue::TransportSectionComponent> (processorRef);
-    utilityStripComponent = std::make_unique<cue::UtilityStripComponent>();
+    waveformFooterComponent = std::make_unique<cue::WaveformFooterComponent>();
     {
         // Mini CUE RACK: panels attach straight to the processor's APVTS;
         // live meters route through the FX engine. Theme the rack subtree
@@ -6082,7 +6009,7 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
 
         const auto trimBpm = (float) (requestedBpm - analysis->estimatedBpm);
         processorRef.setGridBpmTrim (trimBpm);
-        utilityStripComponent->getTempoSlider().setValue ((double) trimBpm, juce::dontSendNotification);
+        waveformFooterComponent->getTempoSlider().setValue ((double) trimBpm, juce::dontSendNotification);
         transportSectionComponent->refreshDisplays();
         waveformDisplayComponent->repaint();
     };
@@ -6092,26 +6019,24 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     };
     transportSectionComponent->getGainSlider().onValueChange = [this]
     {
-        const auto newValue = transportSectionComponent->getGainSlider().getValue();
-        processorRef.setSelectedChopGainDecibels ((float) newValue);
+        processorRef.setSelectedChopGainDecibels ((float) transportSectionComponent->getGainSlider().getValue());
     };
     transportSectionComponent->getPitchSlider().onValueChange = [this]
     {
-        const auto newValue = transportSectionComponent->getPitchSlider().getValue();
-        processorRef.setSelectedChopPitchSemitones ((float) newValue);
+        processorRef.setSelectedChopPitchSemitones ((float) transportSectionComponent->getPitchSlider().getValue());
     };
 
-    utilityStripComponent->getZoomSlider().onValueChange = [this]
+    waveformFooterComponent->getZoomSlider().onValueChange = [this]
     {
-        const auto zoomValue = (float) utilityStripComponent->getZoomSlider().getValue();
+        const auto zoomValue = (float) waveformFooterComponent->getZoomSlider().getValue();
         processorRef.setWaveformZoom (zoomValue);
-        utilityStripComponent->updateScrollSensitivityForZoom (zoomValue);
+        waveformFooterComponent->updateScrollSensitivityForZoom (zoomValue);
         waveformDisplayComponent->setZoom (zoomValue);
     };
 
-    utilityStripComponent->getScrollSlider().onValueChange = [this]
+    waveformFooterComponent->getScrollSlider().onValueChange = [this]
     {
-        const auto scrollValue = (float) utilityStripComponent->getScrollSlider().getValue();
+        const auto scrollValue = (float) waveformFooterComponent->getScrollSlider().getValue();
         processorRef.setWaveformScroll (scrollValue);
         waveformDisplayComponent->setScroll (scrollValue);
     };
@@ -6119,49 +6044,43 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     waveformDisplayComponent->onZoomChanged = [this] (float z)
     {
         processorRef.setWaveformZoom (z);
-        utilityStripComponent->updateScrollSensitivityForZoom (z);
-        utilityStripComponent->getZoomSlider().setValue ((double) z, juce::dontSendNotification);
+        waveformFooterComponent->updateScrollSensitivityForZoom (z);
+        waveformFooterComponent->getZoomSlider().setValue ((double) z, juce::dontSendNotification);
     };
 
     waveformDisplayComponent->onScrollChanged = [this] (float s)
     {
         processorRef.setWaveformScroll (s);
-        utilityStripComponent->getScrollSlider().setValue ((double) s, juce::dontSendNotification);
+        waveformFooterComponent->getScrollSlider().setValue ((double) s, juce::dontSendNotification);
     };
 
-    utilityStripComponent->getTempoSlider().onValueChange = [this]
+    waveformFooterComponent->getTempoSlider().onValueChange = [this]
     {
-        processorRef.setGridBpmTrim ((float) utilityStripComponent->getTempoSlider().getValue());
+        processorRef.setGridBpmTrim ((float) waveformFooterComponent->getTempoSlider().getValue());
     };
 
-    utilityStripComponent->getSyncButton().setToggleState (processorRef.getSyncToHost(), juce::dontSendNotification);
-    utilityStripComponent->getSyncButton().onClick = [this]
+    transportSectionComponent->getSyncButton().setToggleState (processorRef.getSyncToHost(), juce::dontSendNotification);
+    transportSectionComponent->getSyncButton().onClick = [this]
     {
-        processorRef.setSyncToHost (utilityStripComponent->getSyncButton().getToggleState());
+        processorRef.setSyncToHost (transportSectionComponent->getSyncButton().getToggleState());
     };
 
-    utilityStripComponent->getPitchSlider().onValueChange = [this]
+    waveformFooterComponent->getGlobalPitchSlider().onValueChange = [this]
     {
-        processorRef.setPitchSemitones ((float) utilityStripComponent->getPitchSlider().getValue());
+        processorRef.setPitchSemitones ((float) waveformFooterComponent->getGlobalPitchSlider().getValue());
     };
 
-    transportSectionComponent->getStartSlider().onValueChange = [this]
-    {
-        processorRef.setGridStartOffset ((float) (transportSectionComponent->getStartSlider().getValue() / 1000.0));
-    };
-    transportSectionComponent->getStartSlider().setValue ((double) processorRef.getGridStartOffset() * 1000.0,
-                                                          juce::dontSendNotification);
-    utilityStripComponent->getZoomSlider().setValue ((double) processorRef.getWaveformZoom(),
-                                                     juce::dontSendNotification);
-    utilityStripComponent->updateScrollSensitivityForZoom (processorRef.getWaveformZoom());
-    waveformDisplayComponent->setZoom (processorRef.getWaveformZoom());
-    utilityStripComponent->getScrollSlider().setValue ((double) processorRef.getWaveformScroll(),
+    waveformFooterComponent->getZoomSlider().setValue ((double) processorRef.getWaveformZoom(),
                                                        juce::dontSendNotification);
+    waveformFooterComponent->updateScrollSensitivityForZoom (processorRef.getWaveformZoom());
+    waveformDisplayComponent->setZoom (processorRef.getWaveformZoom());
+    waveformFooterComponent->getScrollSlider().setValue ((double) processorRef.getWaveformScroll(),
+                                                         juce::dontSendNotification);
     waveformDisplayComponent->setScroll (processorRef.getWaveformScroll());
-    utilityStripComponent->getTempoSlider().setValue ((double) processorRef.getGridBpmTrim(),
-                                                      juce::dontSendNotification);
-    utilityStripComponent->getPitchSlider().setValue ((double) processorRef.getPitchSemitones(),
-                                                      juce::dontSendNotification);
+    waveformFooterComponent->getTempoSlider().setValue ((double) processorRef.getGridBpmTrim(),
+                                                        juce::dontSendNotification);
+    waveformFooterComponent->getGlobalPitchSlider().setValue ((double) processorRef.getPitchSemitones(),
+                                                              juce::dontSendNotification);
     transportSectionComponent->getBarsButton().setButtonText (juce::String (processorRef.getChopBarsCount())
                                                               + (processorRef.getChopBarsCount() == 1 ? " BAR" : " BARS"));
 
@@ -6169,7 +6088,7 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
                                     waveformDisplayComponent.get(),
                                     transportSectionComponent.get(),
                                     stemRackComponent.get(),
-                                    utilityStripComponent.get() };
+                                    waveformFooterComponent.get() };
 
     for (auto* component : sections)
         contentComponent.addAndMakeVisible (*component);
@@ -6188,7 +6107,7 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     waveformDisplayComponent->setComponentEffect (&panelShadowEffect);
     transportSectionComponent->setComponentEffect (&panelShadowEffect);
     stemRackComponent->setComponentEffect (&panelShadowEffect);
-    utilityStripComponent->setComponentEffect (&panelShadowEffect);
+    waveformFooterComponent->setComponentEffect (&panelShadowEffect);
 
     helpOverlayComponent = std::make_unique<cue::HelpOverlayComponent>();
     contentComponent.addChildComponent (*helpOverlayComponent); // invisible by default
@@ -6268,6 +6187,8 @@ AudioPluginAudioProcessorEditor::~AudioPluginAudioProcessorEditor()
     processorRef.sampleChangeBroadcaster.removeChangeListener (this);
     processorRef.editChangeBroadcaster.removeChangeListener (this);
     setLookAndFeel (nullptr);
+    uiSettingsFile->saveIfNeeded();
+    uiSettingsFile.reset();
 }
 
 void AudioPluginAudioProcessorEditor::timerCallback()
@@ -6296,7 +6217,6 @@ void AudioPluginAudioProcessorEditor::timerCallback()
     // Poll separation progress/ready → button enablement + status line.
     if (stemRackComponent != nullptr)
         stemRackComponent->refresh();
-
 }
 
 void AudioPluginAudioProcessorEditor::showUpdateBannerIfNeeded()
@@ -6373,21 +6293,21 @@ void AudioPluginAudioProcessorEditor::changeListenerCallback (juce::ChangeBroadc
 
         if (source == &processor.sampleChangeBroadcaster)
         {
-            editor->utilityStripComponent->getZoomSlider().setValue ((double) processor.getWaveformZoom(),
-                                                                     juce::sendNotificationSync);
-            editor->utilityStripComponent->getScrollSlider().setValue ((double) processor.getWaveformScroll(),
+            editor->waveformFooterComponent->getZoomSlider().setValue ((double) processor.getWaveformZoom(),
                                                                        juce::sendNotificationSync);
+            editor->waveformFooterComponent->getScrollSlider().setValue ((double) processor.getWaveformScroll(),
+                                                                         juce::sendNotificationSync);
         }
 
-        // Always re-sync utility strip controls from the processor so the UI
+        // Always re-sync the global controls from the processor so the UI
         // stays correct after a host-initiated state restore (e.g. FL Studio
         // undo / auto-save recall).
-        editor->utilityStripComponent->getPitchSlider().setValue ((double) processor.getPitchSemitones(),
-                                                                  juce::dontSendNotification);
-        editor->utilityStripComponent->getTempoSlider().setValue ((double) processor.getGridBpmTrim(),
-                                                                  juce::dontSendNotification);
-        editor->utilityStripComponent->getSyncButton().setToggleState (processor.getSyncToHost(),
-                                                                       juce::dontSendNotification);
+        editor->waveformFooterComponent->getGlobalPitchSlider().setValue ((double) processor.getPitchSemitones(),
+                                                                          juce::dontSendNotification);
+        editor->waveformFooterComponent->getTempoSlider().setValue ((double) processor.getGridBpmTrim(),
+                                                                    juce::dontSendNotification);
+        editor->transportSectionComponent->getSyncButton().setToggleState (processor.getSyncToHost(),
+                                                                           juce::dontSendNotification);
 
         editor->transportSectionComponent->refreshDisplays();
 
@@ -6417,7 +6337,7 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
 
     // Chassis plate for the on-screen MIDI keyboard along the bottom strip.
     {
-        auto keyboardPanel = juce::Rectangle<float> (10.0f, 798.0f, fluidW - 20.0f, 74.0f);
+        auto keyboardPanel = juce::Rectangle<float> (10.0f, 658.0f, fluidW - 20.0f, 68.0f);
         juce::Path panelPath;
         panelPath.addRoundedRectangle (keyboardPanel, cue::mediumCorner);
         cue::fillGlassPath (g, panelPath, keyboardPanel);
@@ -6426,7 +6346,7 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
     // Section title: Syne brand face in the CUERACK accent-title voice.
     g.setColour (cue::themedTitleColour (accentOrange));
     g.setFont (cue::heavyFont (12.0f));
-    g.drawText ("CHOP STATION", juce::Rectangle<int> (10, 116, 150, 16), juce::Justification::centredLeft, false);
+    g.drawText ("CHOP STATION", juce::Rectangle<int> (10, 86, 150, 16), juce::Justification::centredLeft, false);
 }
 
 void AudioPluginAudioProcessorEditor::resized()
@@ -6449,30 +6369,34 @@ void AudioPluginAudioProcessorEditor::resized()
         fxRackStrip->setBounds (0, 0, fluidW, bandDesignH);
     }
 
-    headerComponent->setBounds (10, 32, fluidW - 20, 77);
+    headerComponent->setBounds (10, 16, fluidW - 20, 64);
 
-    // CUE orb flush beside the lockup, vertically centred on the CUE. +
-    // SAMPLER block (lockup centre sits at global y ≈ 69.5; the 92px orb
-    // spans 24..116, clear of the waveform panel at 133).
+    // CUE orb flush beside the lockup, vertically centred in the header band.
     if (cueOrbComponent != nullptr && headerComponent != nullptr)
-        cueOrbComponent->setBounds (10 + headerComponent->lockupRight() + 14, 15, 92, 92);
-    // Waveform condensed (411 → 330) to make room for the stem strip directly
-    // beneath it (8 px gaps match the existing rhythm). Transport unchanged.
-    // The waveform column stretches with the window; the utility strip
-    // stays a fixed-width rail anchored to the right content edge.
-    const int coreW = fluidW - 152;   // 10 | column | 12 | utility 120 | 10
+        cueOrbComponent->setBounds (10 + headerComponent->lockupRight() + 14, 12, 72, 72);
 
-    waveformDisplayComponent->setBounds (10, 133, coreW, 330);
-    stemRackComponent->setBounds (10, 471, coreW, 73);
-    transportSectionComponent->setBounds (10, 552, coreW, 236);
-    utilityStripComponent->setBounds (fluidW - 130, 133, 120, 655);
-    helpOverlayComponent->setBounds (10, 133, coreW, 655);
+    // Stem controls dock into the header band's free middle-right, clear of
+    // the header's own buttons (~300px of the right edge).
+    {
+        const int stemW = 440;
+        const int stemX = juce::jmax (10 + headerComponent->lockupRight() + 100,
+                                      fluidW - 316 - stemW);
+        stemRackComponent->setBounds (stemX, 18, stemW, 56);
+    }
 
+    // Full-width column: waveform, its footer (view + selected-chop knobs),
+    // then the condensed transport band. No side rail.
+    const int coreW = fluidW - 20;
+
+    waveformDisplayComponent->setBounds (10, 106, coreW, 316);
+    waveformFooterComponent->setBounds (10, 428, coreW, 72);
+    transportSectionComponent->setBounds (10, 506, coreW, 144);
+    helpOverlayComponent->setBounds (10, 106, coreW, 544);
 
     if (midiKeyboardComponent != nullptr)
     {
         midiKeyboardComponent->setKeyWidth ((float) (fluidW - 36) / 49.0f); // 49 white keys, C1..B7
-        midiKeyboardComponent->setBounds (18, 806, fluidW - 36, 58);
+        midiKeyboardComponent->setBounds (18, 664, fluidW - 36, 56);
     }
 
     // Update banner: centred strip near the top, drawn over the content. Sized
@@ -6498,8 +6422,8 @@ void AudioPluginAudioProcessorEditor::resized()
 void AudioPluginAudioProcessorEditor::toggleTheme()
 {
     cue::applyTheme (cue::isLight() ? cue::Theme::dark : cue::Theme::light);
-    cue::uiSettings().setValue ("uiTheme", cue::isLight() ? "light" : "dark");
-    cue::uiSettings().saveIfNeeded();
+    uiSettingsFile->setValue ("uiTheme", cue::isLight() ? "light" : "dark");
+    uiSettingsFile->saveIfNeeded();
     applyThemeToUi();
 }
 
@@ -6513,7 +6437,7 @@ void AudioPluginAudioProcessorEditor::applyThemeToUi()
     lookAndFeel->refreshColours();
     headerComponent->refreshColours();
     transportSectionComponent->refreshColours();
-    utilityStripComponent->refreshColours();
+    waveformFooterComponent->refreshColours();
 
     // The FX rack subtree runs CUERACK's own foundation palette; swap it in
     // lockstep, then re-skin its panels and toolbar.
@@ -6527,4 +6451,3 @@ void AudioPluginAudioProcessorEditor::applyThemeToUi()
     sendLookAndFeelChange();
     repaint();
 }
-

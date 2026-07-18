@@ -70,7 +70,7 @@ struct AudioPluginAudioProcessor::VoicePitchEngineSet
     int inputSampleRate = 0;
     int outputSampleRate = 0;
     int channelCount = 0;
-    std::array<std::unique_ptr<VoicePitchEngine>, 2> voices;
+    std::unique_ptr<VoicePitchEngine> engine;
 };
 
 AudioPluginAudioProcessor::VoiceState::VoiceState()  = default;
@@ -84,31 +84,6 @@ AudioPluginAudioProcessor::VoiceState::~VoiceState() = default;
 
 namespace
 {
-// Bit Crusher UI knobs run 0..100 (% intensity). The DSP works in real units
-// (bit depth + surviving sample-rate percentage), so map at the boundary.
-// Both knobs use a square-root curve so the perceptually-loud end of each
-// range is reachable in the upper half of the knob instead of being crammed
-// into the last 5 %:
-//   BITS  amount 0   → bits 16   (clean)
-//         amount 25  → bits 8.5  (clearly grainy)
-//         amount 50  → bits 5.4  (lo-fi)
-//         amount 100 → bits 1    (1-bit square)
-//   CRUSH amount 0   → crush 100 % (full sample rate)
-//         amount 25  → crush ~50 % (audibly aliased)
-//         amount 50  → crush ~30 % (heavy lo-fi)
-//         amount 100 → crush 1 %   (severe sample-rate reduction)
-inline float bitsAmountToDspBits (float amount) noexcept
-{
-    const auto a = juce::jlimit (0.0f, 100.0f, amount);
-    return 16.0f - 15.0f * std::sqrt (a * 0.01f);
-}
-
-inline float crushAmountToDspPercent (float amount) noexcept
-{
-    const auto a = juce::jlimit (0.0f, 100.0f, amount);
-    return 100.0f - 99.0f * std::sqrt (a * 0.01f);
-}
-
 constexpr double tempoAnalysisTargetRate = 200.0;
 constexpr double maximumTempoAnalysisSeconds = 120.0;
 constexpr int maximumLoadedChannels = 2;
@@ -151,6 +126,21 @@ constexpr double autoCuePreRollSeconds = 0.0005;
 constexpr float autoCueRelativePeakThreshold = 0.025f;
 constexpr float autoCueMinimumPeakThreshold = 8.0e-5f;
 constexpr char cueSamplerStateMagic[] = "CSB2";
+
+// Builds that predate removal of the optional data-sharing system may have
+// left small queued-event/settings files behind. Delete only those exact
+// legacy files during processor construction; the same directory also holds
+// the update-check cache and must otherwise remain untouched.
+void removeLegacyDataSharingFiles()
+{
+    const auto dataDir = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+                             .getChildFile ("CueSampler");
+
+    for (const auto* fileName : { "telemetry_events.jsonl",
+                                  "telemetry_events.uploading.jsonl",
+                                  "telemetry_settings.json" })
+        dataDir.getChildFile (fileName).deleteFile();
+}
 
 constexpr std::array<const char*, 12> metadataMajorCamelot
 {
@@ -532,6 +522,54 @@ double mapChopTimelineToSourceSample (const AudioPluginAudioProcessor::ChopDefin
 
     const auto alpha = (localSeconds - previousLocalSeconds) / span;
     return previousSourceSample + (endSourceSample - previousSourceSample) * alpha;
+}
+
+// Inverse of mapChopTimelineToSourceSample: source-buffer sample → warped
+// timeline sample. Allocation-free (safe on the audio thread), using the same
+// clamping as the forward map so the two stay consistent.
+double mapChopSourceSampleToTimeline (const AudioPluginAudioProcessor::ChopDefinition* chop,
+                                      double sourceSample,
+                                      double sampleRate) noexcept
+{
+    if (chop == nullptr || sampleRate <= 0.0 || chop->endSample <= chop->startSample)
+        return sourceSample;
+
+    if (chop->warpMarkers.empty())
+        return sourceSample;
+
+    const auto chopLocalDuration = (double) (chop->endSample - chop->startSample) / sampleRate;
+    const auto clampedSource = juce::jlimit ((double) chop->startSample,
+                                             (double) chop->endSample,
+                                             sourceSample);
+
+    double previousLocalSeconds = 0.0;
+    double previousSourceSample = (double) chop->startSample;
+
+    auto segmentToTimeline = [&] (double segEndLocal, double segEndSource) noexcept
+    {
+        const auto span = segEndSource - previousSourceSample;
+        const auto alpha = span <= 1.0e-9 ? 1.0
+                                          : (clampedSource - previousSourceSample) / span;
+        const auto localSeconds = previousLocalSeconds
+                                  + (segEndLocal - previousLocalSeconds) * juce::jlimit (0.0, 1.0, alpha);
+        return (double) chop->startSample + localSeconds * sampleRate;
+    };
+
+    for (const auto& marker : chop->warpMarkers)
+    {
+        const auto markerLocalSeconds = juce::jlimit (0.0, chopLocalDuration, marker.localTimeSeconds);
+        const auto markerSourceSample = juce::jlimit ((double) chop->startSample,
+                                                      (double) chop->endSample,
+                                                      (double) marker.sourceSample);
+
+        if (clampedSource <= markerSourceSample)
+            return segmentToTimeline (markerLocalSeconds, markerSourceSample);
+
+        previousLocalSeconds = markerLocalSeconds;
+        previousSourceSample = markerSourceSample;
+    }
+
+    return segmentToTimeline (chopLocalDuration, (double) chop->endSample);
 }
 
 struct AnalysisWindow
@@ -1842,33 +1880,13 @@ public:
         if (shouldExit())
             return finish();
 
-        // Data flywheel: when telemetry is enabled, compute the content
-        // fingerprint up front so the jar can group events by sample, and stamp
-        // the sample context. (The online key lookup that used to provide a
-        // "truth" label was removed — AcousticBrainz, which mapped fingerprints
-        // to keys, was shut down. Ground-truth key labels now come from the
-        // user's key override instead.)
-        const bool wantTelemetry = owner.editTelemetry.isEnabled();
-        if (wantTelemetry)
-        {
-            int fpDuration = 0;
-            const auto fingerprint = owner.audioFingerprinter.localFingerprint (buffer, sampleRate, fpDuration);
-            const auto durationSeconds = sampleRate > 0.0 ? (double) buffer.getNumSamples() / sampleRate : 0.0;
-            owner.editTelemetry.setSampleContext (fingerprint, durationSeconds, sampleRate, buffer.getNumChannels());
-        }
-
         // Prefer an embedded key tag in the file metadata when present.
         auto metadataResult = owner.tryReadKeyFromMetadata (sourceFile);
         const bool haveMetadataKey = metadataResult.valid;
 
-        // Always compute the local FFT guess (it's also what we publish when no
-        // metadata key exists, and what telemetry logs against any truth).
+        // Always compute the local FFT guess; it is used when no metadata key
+        // exists in the source file.
         auto localResult = owner.keyDetector.detect (buffer, sampleRate);
-
-        if (wantTelemetry)
-            owner.editTelemetry.recordKeyObservation (localResult.key, localResult.confidence,
-                                                      haveMetadataKey ? metadataResult.key : std::string(),
-                                                      std::string());
 
         publishResult (haveMetadataKey ? std::move (metadataResult) : std::move (localResult));
         return jobHasFinished;
@@ -2111,16 +2129,28 @@ private:
     std::uint64_t generation = 0;
 };
 
-class AudioPluginAudioProcessor::CachePollerTimer final : public juce::Timer
+class AudioPluginAudioProcessor::CachePollerThread final : public juce::Thread
 {
 public:
-    explicit CachePollerTimer (AudioPluginAudioProcessor& ownerIn) : owner (ownerIn) {}
-    ~CachePollerTimer() override { stopTimer(); }
+    explicit CachePollerThread (AudioPluginAudioProcessor& ownerIn)
+        : juce::Thread ("CuePreparedCachePoller"), owner (ownerIn) {}
 
-    void timerCallback() override
+    ~CachePollerThread() override
     {
-        owner.warmPreparedCacheTick();
+        signalThreadShouldExit();
+        notify();
+        stopThread (-1);
     }
+
+    void run() override
+    {
+        while (! threadShouldExit())
+        {
+            owner.warmPreparedCacheTick();
+            wait (50);
+        }
+    }
+
 private:
     AudioPluginAudioProcessor& owner;
 };
@@ -2138,6 +2168,8 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
 {
     std::atomic_store (&tempoEditState, std::make_shared<TempoEditState>());
     std::atomic_store (&chopState, std::make_shared<ChopState>());
+
+    removeLegacyDataSharingFiles();
 
     // Kick off the (throttled) software-update check. Loads any cached result
     // immediately and refreshes from GitHub Releases at most once per day.
@@ -2226,25 +2258,21 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
     }
 
 
-    cachePollerTimer = std::make_unique<CachePollerTimer> (*this);
-    cachePollerTimer->startTimerHz (20);
+    cachePollerThread = std::make_unique<CachePollerThread> (*this);
+    cachePollerThread->startThread (juce::Thread::Priority::low);
 }
 
 AudioPluginAudioProcessor::~AudioPluginAudioProcessor()
 {
-    if (juce::MessageManager::getInstanceWithoutCreating() != nullptr)
+    if (cachePollerThread != nullptr)
     {
-        cachePollerTimer.reset();
-    }
-    else if (auto* helper = cachePollerTimer.release())
-    {
-        // The JUCE TimerThread asserts if its last owner is destroyed after the
-        // MessageManager, so stop callbacks and leak only during process shutdown.
-        helper->stopTimer();
+        cachePollerThread->signalThreadShouldExit();
+        cachePollerThread->notify();
+        cachePollerThread->stopThread (-1);
+        cachePollerThread.reset();
     }
 
     cancelPendingUpdate();
-    editTelemetry.flush();
     keyDetectionGeneration.fetch_add (1, std::memory_order_acq_rel);
     prepareWarmGeneration.fetch_add (1, std::memory_order_acq_rel);
     stemGeneration.fetch_add (1, std::memory_order_acq_rel);
@@ -2388,16 +2416,13 @@ void AudioPluginAudioProcessor::prepareToPlay (double sampleRate, int samplesPer
     outputMeterLevel.store (0.0f, std::memory_order_release);
 
     const auto compChannels = juce::jmax (1, getTotalNumOutputChannels());
-    compressor.prepare (sampleRate, juce::jmax (1, samplesPerBlock), compChannels);
-    bitCrusher.prepare (sampleRate, juce::jmax (1, samplesPerBlock), compChannels);
 
     // CUE FX rack chain. The limiter's lookahead delay runs even when the
     // module is bypassed, so the reported latency stays constant.
     fxEngine.prepare (sampleRate, juce::jmax (1, samplesPerBlock), compChannels);
     setLatencySamples (fxEngine.getLatencySamples());
 
-    for (auto& v : voices)
-        v.reset();
+    voice.reset();
 
     // (Re)build the per-voice Bungee engines so they match the new host rate.
     // If a sample is already loaded, ensurePitchEnginesReady will use its
@@ -2410,12 +2435,9 @@ void AudioPluginAudioProcessor::prepareToPlay (double sampleRate, int samplesPer
 
 void AudioPluginAudioProcessor::releaseResources()
 {
-    for (auto& v : voices)
-        v.reset();
+    voice.reset();
 
     std::atomic_store (&pitchEngineSet, std::shared_ptr<const VoicePitchEngineSet> {});
-    compressor.reset();
-    bitCrusher.reset();
     outputMeterLevel.store (0.0f, std::memory_order_release);
 }
 
@@ -2442,7 +2464,6 @@ void AudioPluginAudioProcessor::ensurePitchEnginesReady (double sourceRate,
     nextSet->outputSampleRate = hostRateInt;
     nextSet->channelCount = channels;
 
-    for (auto& slot : nextSet->voices)
     {
         auto engine = std::make_unique<VoicePitchEngine>();
         engine->channelCount     = channels;
@@ -2469,7 +2490,7 @@ void AudioPluginAudioProcessor::ensurePitchEnginesReady (double sourceRate,
         engine->scratchInput .clear();
         engine->discardOutput.clear();
 
-        slot = std::move (engine);
+        nextSet->engine = std::move (engine);
     }
 
     std::atomic_store (&pitchEngineSet,
@@ -2548,7 +2569,7 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         else if (std::abs (timeStretchRatio.load (std::memory_order_acquire) - 1.0f) > 0.0005f)
         {
             timeStretchRatio.store (1.0f, std::memory_order_release);
-            voices[activeVoiceIdx].bungeeResetPending = true;
+            voice.bungeeResetPending = true;
         }
     }
 
@@ -2562,11 +2583,17 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     const auto currentHostRate = juce::jmax (1.0, hostSampleRate.load (std::memory_order_acquire));
     const auto enginesForBlock = std::atomic_load (&pitchEngineSet);
 
+    // Consume message-thread voice mutation requests (single consumer: here).
+    if (voiceResetRequest.exchange (false, std::memory_order_acq_rel))
+        voice.bungeeResetPending = true;
+    if (clearVoiceStopRequest.exchange (false, std::memory_order_acq_rel))
+        voice.playbackStopSample = -1.0;
+
     const auto pendingCommand = (TransportCommand) pendingTransportCommand.exchange ((int) TransportCommand::none,
                                                                                      std::memory_order_acq_rel);
     if (pendingCommand != TransportCommand::none)
     {
-        auto& v = voices[activeVoiceIdx];
+        auto& v = voice;
 
         if (pendingCommand == TransportCommand::pause)
         {
@@ -2575,17 +2602,13 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         }
         else if (pendingCommand == TransportCommand::stop)
         {
-            for (auto& voice : voices)
-                voice.reset();
-
+            v.reset();
             playbackActive.store (false, std::memory_order_release);
             playbackSamplePosition.store (0.0, std::memory_order_release);
         }
         else if (pendingCommand == TransportCommand::silence)
         {
-            for (auto& voice : voices)
-                voice.reset();
-
+            v.reset();
             playbackActive.store (false, std::memory_order_release);
         }
         else if (pendingCommand == TransportCommand::seek)
@@ -2624,7 +2647,6 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                  && sampleForBlock != nullptr
                  && sampleForBlock->buffer.getNumSamples() > 0)
         {
-            voices[1 - activeVoiceIdx].reset();
             v.playbackSamplePosition = pendingStartPosition.load (std::memory_order_acquire);
             v.playbackStopSample = pendingStartStopSample.load (std::memory_order_acquire);
             v.playbackLoopStartSample = pendingStartLoopSample.load (std::memory_order_acquire);
@@ -2642,11 +2664,36 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             playbackSamplePosition.store (v.playbackSamplePosition, std::memory_order_release);
         }
     }
-    
+
+    // Rebase or clear the host-sync anchor on request (posted by setSyncToHost).
+    // Done here — with this block's fresh ppq — rather than on the message
+    // thread, so the anchor pairs the true current position with the true
+    // current host time.
+    switch (pendingSyncAnchorCommand.exchange (0, std::memory_order_acq_rel))
+    {
+        case 1:
+            if (blockHasHostPpq && hostBpm.load (std::memory_order_acquire) > 0.0)
+            {
+                voice.playbackSyncStartPpq    = blockStartHostPpq;
+                voice.playbackSyncStartSample = voice.playbackSamplePosition;
+                voice.playbackSyncAnchorValid = true;
+            }
+            else
+            {
+                voice.playbackSyncAnchorValid = false;
+            }
+            break;
+        case 2:
+            voice.playbackSyncAnchorValid = false;
+            break;
+        default:
+            break;
+    }
+
     int samplesToProcess = buffer.getNumSamples();
     int currentOffset = 0;
-    
-    auto renderVoiceSegment = [&](VoiceState& v, int voiceIndex, int segmentOffset, int segmentSamples)
+
+    auto renderVoiceSegment = [&](VoiceState& v, int segmentOffset, int segmentSamples)
     {
         if (! v.playbackActive || sampleForBlock == nullptr)
             return;
@@ -2761,12 +2808,9 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
             // Decide which engine handles this chunk.
             VoicePitchEngine* pitchEngine = nullptr;
-            if (enginesForBlock != nullptr
-                && voiceIndex >= 0
-                && voiceIndex < (int) enginesForBlock->voices.size()
-                && enginesForBlock->generation != 0)
+            if (enginesForBlock != nullptr && enginesForBlock->generation != 0)
             {
-                pitchEngine = enginesForBlock->voices[(size_t) voiceIndex].get();
+                pitchEngine = enginesForBlock->engine.get();
                 if (v.observedPitchEngineGeneration != enginesForBlock->generation)
                 {
                     v.observedPitchEngineGeneration = enginesForBlock->generation;
@@ -3027,8 +3071,6 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                         // The warp buffer starts at chopStart and covers chopEnd-chopStart frames.
                         const double warpBufPos = v.playbackSamplePosition
                                                   - (double) activeChop->startSample;
-                        const int wbPos = juce::jlimit (0, juce::jmax (0, warpBufLength - 1),
-                                                        (int) std::floor (warpBufPos));
 
                         for (int ch = 0; ch < outputChannels; ++ch)
                         {
@@ -3038,7 +3080,6 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                             outData[segmentOffset + segmentWriteOffset + i] +=
                                 interpolateSampleLanczos (wbData, warpBufLength, warpBufPos, interpRadius)
                                 * totalGain;
-                            juce::ignoreUnused (wbPos);
                         }
                         v.playbackSamplePosition += warpedBufStep;
                         v.updateFade();
@@ -3128,18 +3169,15 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             break;
         }
 
-        renderVoiceSegment (voices[0], 0, currentOffset, segmentSamples);
-        renderVoiceSegment (voices[1], 1, currentOffset, segmentSamples);
+        renderVoiceSegment (voice, currentOffset, segmentSamples);
         currentOffset += segmentSamples;
     }
 
-    auto& activeVoice = voices[activeVoiceIdx];
-    playbackActive.store (activeVoice.playbackActive, std::memory_order_release);
-    playbackSamplePosition.store (activeVoice.playbackSamplePosition, std::memory_order_release);
+    playbackActive.store (voice.playbackActive, std::memory_order_release);
+    playbackSamplePosition.store (voice.playbackSamplePosition, std::memory_order_release);
 
     // CUE FX rack: CUERACK's master chain (EQ > COMP > CRUSH > AMP > mod trio
-    // > TAPE DELAY > REVERB > IMAGER > LIMITER). It replaces the legacy
-    // crusher + compressor pair — those modules now live inside the rack.
+    // > TAPE DELAY > REVERB > IMAGER > LIMITER).
     {
         const auto rackBpm = hostBpm.load (std::memory_order_acquire);
         fxEngine.process (buffer, rackBpm > 0.0 ? rackBpm : 120.0);
@@ -3152,8 +3190,12 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         for (int i = 0; i < buffer.getNumSamples(); ++i)
             blockPeak = juce::jmax (blockPeak, std::abs (channelData[i]));
     }
+    // Time-based meter release (~8/sec) so ballistics don't change with the
+    // host buffer size (the old fixed 0.045/block decayed 4x faster at 64
+    // samples than at 256).
+    const auto meterRelease = (float) (8.0 * (double) buffer.getNumSamples() / currentHostRate);
     const auto currentMeter = outputMeterLevel.load (std::memory_order_acquire);
-    const auto releasedMeter = juce::jmax (blockPeak, currentMeter - 0.045f);
+    const auto releasedMeter = juce::jmax (blockPeak, currentMeter - meterRelease);
     outputMeterLevel.store (juce::jlimit (0.0f, 1.0f, releasedMeter), std::memory_order_release);
 }
 
@@ -3170,7 +3212,7 @@ void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg,
         if (msg.getNoteNumber() == heldMidiNote.load())
         {
             heldMidiNote.store (-1, std::memory_order_release);
-            voices[activeVoiceIdx].startFade (0.0f, (double) midiVoiceReleaseSamples);
+            voice.startFade (0.0f, (double) midiVoiceReleaseSamples);
         }
         return;
     }
@@ -3182,31 +3224,32 @@ void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg,
     if (currentChopState == nullptr || chopIdx < 0 || chopIdx >= (int) currentChopState->chops.size()) return;
 
     const auto& chop = currentChopState->chops[(size_t) chopIdx];
-    
+
     // Sampling pads are monophonic/choked: a new chop stops the previous chop
     // immediately, so slices cannot overlap or sum into clipping.
-    activeVoiceIdx = 0;
-    voices[1].reset();
-    
-    auto& vs = voices[activeVoiceIdx];
+    auto& vs = voice;
     vs.reset();
     vs.playbackActive = true;
     vs.midiVelocity = msg.getVelocity() / 127.0f;
-    
+
     const auto currentSample = std::atomic_load (&loadedSample);
     const double sourceRate = currentSample != nullptr ? juce::jmax (1.0, currentSample->sampleRate) : 44100.0;
-    
+
     double startPos = (double) juce::jlimit (chop.startSample, chop.endSample, chop.startSample + chop.cueOffsetSamples);
-    if (! chop.warpMarkers.empty() && sourceRate > 0.0)
+    if (! chop.warpMarkers.empty())
     {
-        cuesampler::WarpMap tempMap;
-        tempMap.build (chop.startSample, chop.endSample, chop.warpMarkers, sourceRate);
-        const double cueLocalSeconds = tempMap.localTimeAtSourceSample (startPos);
-        startPos = chop.startSample + (cueLocalSeconds * sourceRate);
+        // Translate the source-domain cue point into the warped timeline.
+        // Allocation-free: WarpMap::build heap-allocates its node list, which
+        // must never happen here on the audio thread.
+        startPos = mapChopSourceSampleToTimeline (&chop, startPos, sourceRate);
     }
-    
+
     vs.playbackSamplePosition = startPos;
     vs.playbackStopSample = (double) chop.endSample;
+    // Sustain the chop from its cue point for exactly as long as this MIDI
+    // note remains held. The matching note-off starts the existing short
+    // de-click fade, which then deactivates the monophonic voice.
+    vs.playbackLoopStartSample = startPos;
     vs.playbackTriggeredByMidi = true;
     vs.fadeGain = 1.0f;
     vs.fadeTarget = 1.0f;
@@ -3892,10 +3935,6 @@ void AudioPluginAudioProcessor::loadAudioFile (const juce::File& file)
     chopAudioCache.clear();
     warpRenderGeneration.fetch_add (1, std::memory_order_acq_rel);
 
-    // Flush any pending telemetry for the previous sample and reset context;
-    // the new sample's fingerprint is set later by the key-detection job.
-    editTelemetry.clearSampleContext();
-
     if (auto sampleData = createLoadedSampleDataFromFile (file); sampleData != nullptr)
     {
         // Sample rate may have changed, so publish matching engines before
@@ -4299,32 +4338,6 @@ juce::File AudioPluginAudioProcessor::renderChopToTempWav (int chopId, bool appl
         framesToWrite = finalOutputFrames;
     }
 
-    if (framesToWrite > 0 && bitCrusherEnabledUi.load (std::memory_order_acquire))
-    {
-        outputBuffer.setSize (numChannels, framesToWrite, true, false, true);
-
-        cuesampler::BitCrusher exportBitCrusher;
-        exportBitCrusher.prepare (currentHostRate, framesToWrite, numChannels);
-        exportBitCrusher.setParametersImmediately (
-            true,
-            bitsAmountToDspBits     (bitCrusherBitsUi .load (std::memory_order_acquire)),
-            crushAmountToDspPercent (bitCrusherCrushUi.load (std::memory_order_acquire)));
-        exportBitCrusher.process (outputBuffer);
-    }
-
-    if (framesToWrite > 0 && compressorEnabledUi.load (std::memory_order_acquire))
-    {
-        outputBuffer.setSize (numChannels, framesToWrite, true, false, true);
-
-        cuesampler::SSLBusCompressor exportCompressor;
-        exportCompressor.prepare (currentHostRate, framesToWrite, numChannels);
-        exportCompressor.setParametersImmediately (
-            true,
-            compressorThresholdUiDb.load (std::memory_order_acquire),
-            compressorMakeupUiDb.load (std::memory_order_acquire));
-        exportCompressor.process (outputBuffer);
-    }
-
     const auto sampleName = sampleData->fileName.isNotEmpty() ? sampleData->fileName
                                                                : juce::String ("chop");
     auto tempDirectory = juce::File::getSpecialLocation (juce::File::tempDirectory);
@@ -4519,88 +4532,6 @@ float AudioPluginAudioProcessor::getOutputMeterLevel() const noexcept
     return outputMeterLevel.load (std::memory_order_acquire);
 }
 
-void AudioPluginAudioProcessor::setCompressorEnabled (bool shouldEnable) noexcept
-{
-    compressorEnabledUi.store (shouldEnable, std::memory_order_release);
-    compressor.setEnabled (shouldEnable);
-}
-
-void AudioPluginAudioProcessor::setCompressorThresholdDb (float dB) noexcept
-{
-    const auto clamped = juce::jlimit (-15.0f, 15.0f, dB);
-    compressorThresholdUiDb.store (clamped, std::memory_order_release);
-    compressor.setThresholdDb (clamped);
-}
-
-void AudioPluginAudioProcessor::setCompressorMakeupDb (float dB) noexcept
-{
-    const auto clamped = juce::jlimit (0.0f, 20.0f, dB);
-    compressorMakeupUiDb.store (clamped, std::memory_order_release);
-    compressor.setMakeupDb (clamped);
-}
-
-bool AudioPluginAudioProcessor::isCompressorEnabled() const noexcept
-{
-    return compressorEnabledUi.load (std::memory_order_acquire);
-}
-
-float AudioPluginAudioProcessor::getCompressorThresholdDb() const noexcept
-{
-    return compressorThresholdUiDb.load (std::memory_order_acquire);
-}
-
-float AudioPluginAudioProcessor::getCompressorMakeupDb() const noexcept
-{
-    return compressorMakeupUiDb.load (std::memory_order_acquire);
-}
-
-float AudioPluginAudioProcessor::getCompressorGainReductionDb() const noexcept
-{
-    return compressor.getCurrentGainReductionDb();
-}
-
-void AudioPluginAudioProcessor::setBitCrusherEnabled (bool shouldEnable) noexcept
-{
-    bitCrusherEnabledUi.store (shouldEnable, std::memory_order_release);
-    bitCrusher.setEnabled (shouldEnable);
-}
-
-void AudioPluginAudioProcessor::setBitCrusherBits (float amount) noexcept
-{
-    const auto clampedAmount = juce::jlimit (0.0f, 100.0f, amount);
-    bitCrusherBitsUi.store (clampedAmount, std::memory_order_release);
-    bitCrusher.setBits (bitsAmountToDspBits (clampedAmount));
-}
-
-void AudioPluginAudioProcessor::setBitCrusherCrush (float amount) noexcept
-{
-    const auto clampedAmount = juce::jlimit (0.0f, 100.0f, amount);
-    bitCrusherCrushUi.store (clampedAmount, std::memory_order_release);
-    bitCrusher.setCrush (crushAmountToDspPercent (clampedAmount));
-}
-
-bool AudioPluginAudioProcessor::isBitCrusherEnabled() const noexcept
-{
-    return bitCrusherEnabledUi.load (std::memory_order_acquire);
-}
-
-float AudioPluginAudioProcessor::getBitCrusherBits() const noexcept
-{
-    return bitCrusherBitsUi.load (std::memory_order_acquire);
-}
-
-float AudioPluginAudioProcessor::getBitCrusherCrush() const noexcept
-{
-    return bitCrusherCrushUi.load (std::memory_order_acquire);
-}
-
-void AudioPluginAudioProcessor::readBitCrusherScope (float* dest, int maxSamples) const noexcept
-{
-    const int n = juce::jmin (maxSamples, kBitCrusherScopeSize);
-    for (int i = 0; i < n; ++i)
-        dest[i] = bitCrusherScope[(size_t) i].load (std::memory_order_relaxed);
-}
-
 float AudioPluginAudioProcessor::getTimeStretchRatio() const noexcept
 {
     return timeStretchRatio.load (std::memory_order_acquire);
@@ -4614,8 +4545,7 @@ float AudioPluginAudioProcessor::getPitchSemitones() const noexcept
 void AudioPluginAudioProcessor::setSyncToHost (bool shouldSync) noexcept
 {
     syncToHost.store (shouldSync, std::memory_order_release);
-    auto& v = voices[activeVoiceIdx];
-    v.bungeeResetPending = true;
+    voiceResetRequest.store (true, std::memory_order_release);
 
     if (shouldSync)
     {
@@ -4626,21 +4556,14 @@ void AudioPluginAudioProcessor::setSyncToHost (bool shouldSync) noexcept
         else
             timeStretchRatio.store (1.0f, std::memory_order_release);
 
-        if (hostHasPpqPosition.load (std::memory_order_acquire) && currentHostBpm > 0.0)
-        {
-            v.playbackSyncStartPpq = hostPpqPosition.load (std::memory_order_acquire);
-            v.playbackSyncStartSample = v.playbackSamplePosition;
-            v.playbackSyncAnchorValid = true;
-        }
-        else
-        {
-            v.playbackSyncAnchorValid = false;
-        }
+        // Ask the audio thread to (re)base the sync anchor with its own fresh
+        // ppq/position pair — the message thread's snapshots are a block stale.
+        pendingSyncAnchorCommand.store (1, std::memory_order_release);
     }
     else
     {
         timeStretchRatio.store (1.0f, std::memory_order_release);
-        v.playbackSyncAnchorValid = false;
+        pendingSyncAnchorCommand.store (2, std::memory_order_release);
     }
 
     requestHostStateSync();
@@ -4649,7 +4572,7 @@ void AudioPluginAudioProcessor::setSyncToHost (bool shouldSync) noexcept
 void AudioPluginAudioProcessor::setHalfTimeEnabled (bool shouldEnable) noexcept
 {
     halfTimeEnabled.store (shouldEnable, std::memory_order_release);
-    voices[activeVoiceIdx].bungeeResetPending = true;
+    voiceResetRequest.store (true, std::memory_order_release);
     requestHostStateSync();
 }
 
@@ -4708,12 +4631,6 @@ void AudioPluginAudioProcessor::setGridBpmTrim (float trimBpm)
         if (syncToHost.load (std::memory_order_acquire))
             updateHostSyncStretchRatio (*analysis, hostBpm.load (std::memory_order_acquire));
 
-        // Data flywheel: the user is correcting the detected tempo. Capture
-        // the algorithm's guess vs. the settled value (coalesced internally).
-        editTelemetry.recordBpmCorrection (analysis->estimatedBpm,
-                                           analysis->estimatedBpm + (double) trimBpm,
-                                           analysis->confidence,
-                                           analysis->likelyDrifting);
         notifyEditStateChanged();
     }
     touchTempoUiRevision();
@@ -4978,21 +4895,14 @@ void AudioPluginAudioProcessor::setUserKeyOverride (int rootIndex, bool isMajor)
 {
     auto newResult = KeyDetector::makeResult (rootIndex, isMajor);
 
-    KeyDetector::Result previous;
     {
         const std::lock_guard<std::mutex> lock (keyResultMutex);
-        previous = detectedKeyResult;
         detectedKeyResult = newResult;
     }
 
     // Cancel any in-flight detection so it can't overwrite the user's choice.
     keyDetectionGeneration.fetch_add (1, std::memory_order_acq_rel);
     keyDetectionInProgress.store (false, std::memory_order_release);
-
-    // Flywheel: the detector's key (previous) vs. the user's choice (truth).
-    editTelemetry.recordKeyCorrection (previous.valid ? previous.key : std::string(),
-                                       previous.confidence,
-                                       newResult.key);
 
     // Refresh the UI readout.
     tempoUiRevision.fetch_add (1, std::memory_order_acq_rel);
@@ -5420,7 +5330,10 @@ void AudioPluginAudioProcessor::updateHostSyncStretchRatio (const TempoAnalysisD
         return;
 
     timeStretchRatio.store (desiredRatio, std::memory_order_release);
-    voices[activeVoiceIdx].bungeeResetPending = true;
+    // Callable from both the audio thread (processBlock's sync update, before
+    // the request is consumed) and the message thread (setSyncToHost) — the
+    // flag is consumed at the top of processBlock either way.
+    voiceResetRequest.store (true, std::memory_order_release);
 }
 
 void AudioPluginAudioProcessor::setChopBarsCount (int bars)
@@ -6095,7 +6008,7 @@ void AudioPluginAudioProcessor::clearSelectedChop()
     auto nextState = std::make_shared<ChopState> (*currentState);
     nextState->selectedChopId = -1;
     std::atomic_store (&chopState, nextState);
-    voices[activeVoiceIdx].playbackStopSample = -1.0;
+    clearVoiceStopRequest.store (true, std::memory_order_release);
     touchTempoUiRevision();
     notifyEditStateChanged();
 }
@@ -6119,7 +6032,7 @@ void AudioPluginAudioProcessor::removeSelectedChop()
                             nextState->chops.end());
     nextState->selectedChopId = -1;
     std::atomic_store (&chopState, nextState);
-    voices[activeVoiceIdx].playbackStopSample = -1.0;
+    clearVoiceStopRequest.store (true, std::memory_order_release);
     chopAudioCache.evict (removedChopId);
     touchTempoUiRevision();
     notifyEditStateChanged();

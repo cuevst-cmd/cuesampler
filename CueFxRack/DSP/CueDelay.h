@@ -12,6 +12,10 @@ namespace cue::dsp
     // soft tape saturation in the feedback loop, a low-cut against mud
     // build-up, and the one-pole "tone" low-pass. Delay-time changes are
     // slewed like a motor speeding up/down, giving the classic pitch bend.
+    //
+    // Pro details: 3rd-order Lagrange fractional reads (linear interpolation
+    // dulls the top end and adds modulation grit under wow/flutter), and
+    // feedback / tone / mix are all smoothed so knob rides never zipper.
     // ========================================================================
     class CueDelay
     {
@@ -24,6 +28,12 @@ namespace cue::dsp
             line.prepare (spec);
             delaySmooth.reset (sr, 0.08);
             delaySmooth.setCurrentAndTargetValue ((float) (0.35 * sr));
+            fbSmooth.reset (sr, 0.02);
+            fbSmooth.setCurrentAndTargetValue (0.35f);
+            toneSmooth.reset (sr, 0.02);
+            toneSmooth.setCurrentAndTargetValue (0.5f);
+            mixSmooth.reset (sr, 0.02);
+            mixSmooth.setCurrentAndTargetValue (0.25f);
             reset();
         }
 
@@ -49,12 +59,12 @@ namespace cue::dsp
             ms = juce::jlimit (1.0f, 4000.0f, ms);
             delaySmooth.setTargetValue ((float) (ms * 0.001 * sr));
 
-            fb       = juce::jlimit (0.0f, 1.05f, feedback01 * 1.08f);   // >1 possible: tape self-oscillation (loop tanh keeps it bounded)
-            kTone    = 1.0f - std::exp (-juce::MathConstants<float>::twoPi
-                                        * juce::jlimit (100.0f, 18000.0f, toneHz) / (float) sr);
+            fbSmooth.setTargetValue (juce::jlimit (0.0f, 1.05f, feedback01 * 1.08f));   // >1 possible: tape self-oscillation (loop tanh keeps it bounded)
+            toneSmooth.setTargetValue (1.0f - std::exp (-juce::MathConstants<float>::twoPi
+                                        * juce::jlimit (100.0f, 18000.0f, toneHz) / (float) sr));
             kHeadHp  = 1.0f - std::exp (-juce::MathConstants<float>::twoPi * 70.0f / (float) sr);
             pingPong = pingPong_;
-            mix      = juce::jlimit (0.0f, 1.0f, mix01);
+            mixSmooth.setTargetValue (juce::jlimit (0.0f, 1.0f, mix01));
         }
 
         void process (juce::AudioBuffer<float>& buffer)
@@ -78,7 +88,13 @@ namespace cue::dsp
 
                 const auto wobble = 1.0f + 0.0016f * std::sin (wowPhase)
                                          + 0.0004f * std::sin (flutterPhase + 0.8f * std::sin (wowPhase * 2.0f));
-                const auto d = juce::jmax (1.0f, delaySmooth.getNextValue() * wobble);
+                // Lagrange3rd reads 4 points around the tap; keep the head at
+                // least 2 samples behind the write position.
+                const auto d = juce::jmax (2.0f, delaySmooth.getNextValue() * wobble);
+
+                const auto fb  = fbSmooth.getNextValue();
+                kTone          = toneSmooth.getNextValue();
+                const auto mix = mixSmooth.getNextValue();
 
                 const auto inL = l[i];
                 const auto inR = r != nullptr ? r[i] : inL;
@@ -122,10 +138,10 @@ namespace cue::dsp
             return std::tanh (lp * 1.15f) * 0.92f;     // tape squash, keeps fb stable
         }
 
-        juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> line { 48000 * 5 };
-        juce::SmoothedValue<float> delaySmooth;
+        juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Lagrange3rd> line { 48000 * 5 };
+        juce::SmoothedValue<float> delaySmooth, fbSmooth, toneSmooth, mixSmooth;
         double sr = 44100.0;
-        float fb = 0.35f, kTone = 0.5f, mix = 0.25f;
+        float kTone = 0.5f;
         float toneLp[2] { 0.0f, 0.0f };
         float headBumpHp[2] { 0.0f, 0.0f };
         float kHeadHp = 0.01f;

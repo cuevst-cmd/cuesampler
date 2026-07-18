@@ -51,9 +51,9 @@ Where applicable law grants you a mandatory statutory right to a refund or withd
 
 ## 6. Data Collection and Privacy
 
-The Software includes an optional data-sharing feature that is **turned OFF by default**. No usage data is collected from or transmitted by the Software unless you affirmatively enable this feature using the in-plugin toggle, and you may disable it again at any time. When enabled, the Software collects and transmits limited, anonymous technical data (such as a random installation identifier, a one-way hash of loaded audio, and tempo/key detection results and corrections) solely to improve the Software's detection accuracy. The Software does not collect or transmit your actual audio recordings.
+The Software does not include usage telemetry or an in-plugin data-sharing feature. It does not collect, store, or transmit loaded audio, file names, audio fingerprints, BPM or key detection results or corrections, usage events, or installation identifiers.
 
-Your use of the Software, and any data collected through it, is governed by our Privacy Policy, available at https://cuesampler.com/privacy, which is incorporated into this Agreement by reference. By using the Software, you acknowledge the data practices described in the Privacy Policy.
+The Software may make an unauthenticated HTTPS request to GitHub Releases to check whether a newer version is available. This request contains no installation identifier or usage telemetry, although ordinary network metadata such as an IP address and User-Agent may be processed by GitHub. Purchases, downloads, newsletters, and use of our website are governed by our Privacy Policy, available at https://cuesampler.com/privacy.
 
 ## 7. Ownership
 

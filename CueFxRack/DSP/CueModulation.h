@@ -78,6 +78,8 @@ namespace cue::dsp
             sr = spec.sampleRate;
             line.setMaximumDelayInSamples ((int) std::ceil (sr * 0.05));
             line.prepare (spec);
+            mixSmooth.reset (sr, 0.02);
+            mixSmooth.setCurrentAndTargetValue (0.5f);
             reset();
         }
 
@@ -92,7 +94,7 @@ namespace cue::dsp
             rate   = juce::jlimit (0.05f, 3.0f, rateHz);
             depth  = juce::jlimit (0.0f, 1.0f, depth01);
             spread = juce::jlimit (0.0f, 1.0f, spread01);
-            mix    = juce::jlimit (0.0f, 1.0f, mix01);
+            mixSmooth.setTargetValue (juce::jlimit (0.0f, 1.0f, mix01));
         }
 
         void process (juce::AudioBuffer<float>& buffer)
@@ -109,6 +111,8 @@ namespace cue::dsp
                 phase += inc;
                 if (phase > juce::MathConstants<float>::twoPi)
                     phase -= juce::MathConstants<float>::twoPi;
+
+                const auto mix = mixSmooth.getNextValue();
 
                 for (int ch = 0; ch < nCh; ++ch)
                 {
@@ -133,7 +137,8 @@ namespace cue::dsp
 
     private:
         juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> line { 4800 };
+        juce::SmoothedValue<float> mixSmooth;
         double sr = 44100.0;
-        float rate = 0.4f, depth = 0.5f, spread = 0.7f, mix = 0.5f, phase = 0.0f;
+        float rate = 0.4f, depth = 0.5f, spread = 0.7f, phase = 0.0f;
     };
 }

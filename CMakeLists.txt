@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.22)
 # `project()` command. `project()` sets up some helpful variables that describe source/binary
 # directories, and the current project version. This is a standard CMake command.
 
-project(CueSampler VERSION 1.0.4)
+project(CueSampler VERSION 1.0.5)
 include(FetchContent)
 
 # Copy the built plugin into the OS plugin directory after each build. On by
@@ -25,14 +25,8 @@ endif()
 
 set(BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(FFT_LIB kissfft CACHE STRING "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
-set(KISSFFT_SOURCE_DIR "${CMAKE_BINARY_DIR}/_deps/chromaprint-src/src/3rdparty/kissfft" CACHE PATH "" FORCE)
-FetchContent_Declare(chromaprint
-    GIT_REPOSITORY https://github.com/acoustid/chromaprint.git
-    GIT_TAG v1.5.1)
-FetchContent_MakeAvailable(chromaprint)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -181,8 +175,6 @@ juce_add_plugin(CueSampler
 
 target_sources(CueSampler
     PRIVATE
-        AudioFingerprinter.cpp
-        EditTelemetry.cpp
         UpdateChecker.cpp
         KeyDetector.cpp
         PluginEditor.cpp
@@ -195,9 +187,7 @@ target_sources(CueSampler
         CueFxRack/UI/ModulePanel.cpp
         CueFxRack/UI/RackToolbar.cpp
         WarpMap.cpp
-        ChopAudioCache.cpp
-        SSLBusCompressor.cpp
-        BitCrusher.cpp)
+        ChopAudioCache.cpp)
 
 # `target_compile_definitions` adds some preprocessor definitions to our target. In a Projucer
 # project, these might be passed in the 'Preprocessor Definitions' field. JUCE modules also make use
@@ -215,15 +205,6 @@ target_compile_definitions(CueSampler
         # Running version for the in-app update checker (compared against the
         # newest GitHub Release). Single source of truth: project(... VERSION).
         CUE_VERSION_STRING="${PROJECT_VERSION}")
-
-# chromaprint.h declares its API as __declspec(dllimport) on Windows unless
-# CHROMAPRINT_NODLL is defined. We link chromaprint as a STATIC library, so
-# without this the linker looks for __imp_chromaprint_* (DLL-import symbols)
-# that the static .lib doesn't contain → LNK2019. Define it on Windows only;
-# the non-Windows header path uses visibility attributes and is unaffected.
-if(WIN32)
-    target_compile_definitions(CueSampler PRIVATE CHROMAPRINT_NODLL)
-endif()
 
 # If your target needs extra binary assets, you can add them here. The first argument is the name of
 # a new static library target that will include all the binary resources. There is an optional
@@ -250,10 +231,8 @@ target_link_libraries(CueSampler
     PRIVATE
         CueSamplerBinaryAssets
         juce::juce_audio_utils
-        juce::juce_cryptography
         juce::juce_dsp
         juce::juce_opengl
-        chromaprint
         bungee_library
         "${ORT_LINK_LIB}"
     PUBLIC
@@ -266,7 +245,6 @@ target_include_directories(CueSampler
         "${CMAKE_CURRENT_SOURCE_DIR}/CueFxRack"
         "${bungee_SOURCE_DIR}"
         "${bungee_SOURCE_DIR}/submodules/eigen"
-        "${chromaprint_SOURCE_DIR}/src"
         "${ORT_INCLUDE_DIR}")
 
 # ── Self-contained macOS/Windows bundles (libonnxruntime + ONNX models) ───────
@@ -393,8 +371,7 @@ elseif(WIN32)
 endif() # APPLE / WIN32 — platform-specific bundling
 
 # ── Optional offline StemSeparator test ───────────────────────────────────────
-# OFF by default (mirrors tools/test_warp_map.cpp, which is unwired from the main
-# target). Builds a small console app that runs StemSeparator on a WAV. Needs the
+# OFF by default. Builds a small console app that runs StemSeparator on a WAV. Needs the
 # htdemucs model present to actually pass; without it StemSeparator reports
 # not-ready and the test exits cleanly with a skip notice.
 #   cmake -S . -B build -DCUE_BUILD_STEM_TEST=ON
@@ -438,4 +415,3 @@ if(WIN32 AND MSVC)
         endif()
     endforeach()
 endif()
-

@@ -26,7 +26,7 @@ cd "$(dirname "$0")"
 # --- Version: single source of truth is project(CUESAMPLER VERSION x.y.z) -----
 VERSION="${1:-}"
 if [ -z "$VERSION" ]; then
-  VERSION="$(sed -nE 's/^[[:space:]]*project\(CUESAMPLER[[:space:]]+VERSION[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt | head -1)"
+  VERSION="$(sed -nE 's/^[[:space:]]*project\((CueSampler|CUESAMPLER)[[:space:]]+VERSION[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+).*/\2/p' CMakeLists.txt | head -1)"
 fi
 [ -n "$VERSION" ] || { echo "ERROR: could not read version from CMakeLists.txt — pass it explicitly: ./release-mac.sh 1.0.1"; exit 1; }
 

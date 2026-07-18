@@ -16,6 +16,10 @@ namespace cue::dsp
         {
             iron.prepare (spec);
             dryBuffer.setSize ((int) spec.numChannels, (int) spec.maximumBlockSize);   // no audio-thread allocs
+            driveSmooth.reset (spec.sampleRate, 0.02);
+            driveSmooth.setCurrentAndTargetValue (1.0f);
+            mixSmooth.reset (spec.sampleRate, 0.02);
+            mixSmooth.setCurrentAndTargetValue (1.0f);
             reset();
         }
 
@@ -30,9 +34,9 @@ namespace cue::dsp
         {
             bits       = juce::jlimit (1.0f, 16.0f, bits_);
             rateDivide = juce::jmax (1, rateDivide_);
-            driveGain  = juce::Decibels::decibelsToGain (juce::jlimit (0.0f, 24.0f, driveDb));
+            driveSmooth.setTargetValue (juce::Decibels::decibelsToGain (juce::jlimit (0.0f, 24.0f, driveDb)));
             iron.setAmount (juce::jlimit (0.0f, 1.0f, 0.15f + driveDb / 24.0f * 0.65f));
-            mix        = juce::jlimit (0.0f, 1.0f, mix01);
+            mixSmooth.setTargetValue (juce::jlimit (0.0f, 1.0f, mix01));
         }
 
         void process (juce::AudioBuffer<float>& buffer)
@@ -42,8 +46,16 @@ namespace cue::dsp
 
             dryBuffer.makeCopyOf (buffer, true);
 
-            // drive into the iron
-            buffer.applyGain (0, n, driveGain);
+            // drive into the iron (ramped so DRIVE rides don't zipper)
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                auto* d = buffer.getWritePointer (ch);
+                auto dr = driveSmooth;                 // identical ramp per channel
+                for (int i = 0; i < n; ++i)
+                    d[i] *= dr.getNextValue();
+                if (ch == nCh - 1)
+                    driveSmooth = dr;                  // keep the real state advanced
+            }
             iron.process (buffer);
 
             const auto steps = std::pow (2.0f, bits - 1.0f);
@@ -73,15 +85,22 @@ namespace cue::dsp
             {
                 auto* wet = buffer.getWritePointer (ch);
                 auto* dry = dryBuffer.getReadPointer (ch);
+                auto mx = mixSmooth;                   // identical ramp per channel
                 for (int i = 0; i < n; ++i)
-                    wet[i] = dry[i] * (1.0f - mix) + wet[i] * mix;
+                {
+                    const auto m = mx.getNextValue();
+                    wet[i] = dry[i] * (1.0f - m) + wet[i] * m;
+                }
+                if (ch == nCh - 1)
+                    mixSmooth = mx;                    // keep the real state advanced
             }
         }
 
     private:
         IronStage iron;
         juce::AudioBuffer<float> dryBuffer;
-        float bits = 16.0f, driveGain = 1.0f, mix = 1.0f;
+        juce::SmoothedValue<float> driveSmooth, mixSmooth;
+        float bits = 16.0f;
         int rateDivide = 1;
         int holdCount[2] { 0, 0 };
         float holdSample[2] { 0.0f, 0.0f };

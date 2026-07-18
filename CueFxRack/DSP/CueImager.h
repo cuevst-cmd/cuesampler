@@ -22,6 +22,11 @@ namespace cue::dsp
             curXover = -1.0f;
         }
 
+        void reset()
+        {
+            sideHP.reset();
+        }
+
         void setParams (float width01to2, bool bassMono_, float xoverHz)
         {
             widthSmooth.setTargetValue (juce::jlimit (0.0f, 2.0f, width01to2));
