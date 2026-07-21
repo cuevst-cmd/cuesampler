@@ -3951,7 +3951,7 @@ void AudioPluginAudioProcessor::loadAudioFile (const juce::File& file)
         clearEditUndoHistory(); // a fresh sample starts with no edit history
         loadedFileName = sampleData->fileName;
         sampleSampleRate = sampleData->sampleRate;
-        waveformZoom.store (0.20f, std::memory_order_release);
+        waveformZoom.store (0.07f, std::memory_order_release);
         waveformScroll.store (0.0f, std::memory_order_release);
         playbackActive.store (false, std::memory_order_release);
         playbackSamplePosition.store ((double) sampleData->leadingContentStartSample, std::memory_order_release);
@@ -5983,6 +5983,27 @@ int AudioPluginAudioProcessor::chopAtTransients (TransientSensitivity sensitivit
     touchTempoUiRevision();
     notifyEditStateChanged();
     return (int) newChopState->chops.size();
+}
+
+void AudioPluginAudioProcessor::selectChopById (int chopId)
+{
+    const auto currentState = std::atomic_load (&chopState);
+    if (currentState == nullptr || currentState->selectedChopId == chopId)
+        return;
+
+    const auto chopExists = std::any_of (currentState->chops.begin(), currentState->chops.end(),
+                                         [chopId] (const ChopDefinition& chop)
+                                         {
+                                             return chop.id == chopId;
+                                         });
+    if (! chopExists)
+        return;
+
+    auto nextState = std::make_shared<ChopState> (*currentState);
+    nextState->selectedChopId = chopId;
+    std::atomic_store (&chopState, nextState);
+    touchTempoUiRevision();
+    notifyEditStateChanged();
 }
 
 void AudioPluginAudioProcessor::selectChopAtSample (double samplePosition)

@@ -26,8 +26,10 @@ namespace cue
         ~RackToolbar() override;   // defined in the .cpp (chip types complete there)
 
         std::function<void (const juce::String&)> onRestorePanel;
+        std::function<void()> onMinimizeRequested;
 
         void setUnusedPanels (const std::vector<ModuleEntry>& entries);
+        void setMinimized (bool shouldBeMinimized);
 
         void paint (juce::Graphics&) override;
         void resized() override;
@@ -46,6 +48,7 @@ namespace cue
         class ModuleChip;
 
         juce::OwnedArray<ModuleChip> moduleChips;
+        juce::TextButton minimizeButton;
 
         float phase = 0.0f;
 

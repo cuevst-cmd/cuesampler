@@ -55,6 +55,15 @@ R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="20 -700 4123 760"><path f
 RackToolbar::RackToolbar()
 {
     startTimerHz (24);
+    addAndMakeVisible (minimizeButton);
+    minimizeButton.setButtonText ("MINIMIZE");
+    minimizeButton.setTooltip ("Hide the FX rack panels.");
+    minimizeButton.onClick = [this]
+    {
+        if (onMinimizeRequested != nullptr)
+            onMinimizeRequested();
+    };
+
     const juce::String svg (cueWordmarkSvg);
     cueWordmark = juce::Drawable::createFromImageData (svg.toRawUTF8(),
                                                        (size_t) svg.getNumBytesAsUTF8());
@@ -82,6 +91,13 @@ void RackToolbar::setUnusedPanels (const std::vector<ModuleEntry>& entries)
     repaint();
 }
 
+void RackToolbar::setMinimized (bool shouldBeMinimized)
+{
+    minimizeButton.setButtonText (shouldBeMinimized ? "SHOW FX" : "MINIMIZE");
+    minimizeButton.setTooltip (shouldBeMinimized ? "Show the FX rack panels."
+                                                 : "Hide the FX rack panels.");
+}
+
 void RackToolbar::resized()
 {
     auto r = getLocalBounds().reduced (8, 5);
@@ -95,6 +111,8 @@ void RackToolbar::resized()
     }
     const int rightReserved = juce::roundToInt (lockupW) + 20;
     r.removeFromRight (rightReserved);
+    minimizeButton.setBounds (r.removeFromRight (88));
+    r.removeFromRight (8);
 
     for (auto* chip : moduleChips)
     {

@@ -44,6 +44,8 @@ public:
 private:
     float getUiScale() const noexcept;
     int getUiFluidWidth() const noexcept;   // design-space width the layout fills
+    void setFxRackMinimized (bool shouldBeMinimized);
+    void updateFxRackResizeLimits();
 
     // Reveals the "new version available" banner from the update checker's
     // result. Idempotent: only builds/shows the banner once per session.
@@ -56,6 +58,8 @@ private:
 
     AudioPluginAudioProcessor& processorRef;
     std::unique_ptr<juce::PropertiesFile> uiSettingsFile;
+    bool fxRackMinimized = false;
+    int expandedEditorHeight = 0;
 
     juce::Component contentComponent;
 

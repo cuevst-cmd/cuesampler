@@ -309,6 +309,9 @@ public:
     enum class TransientSensitivity : int { Light = 0, Medium = 1, Fine = 2 };
     int chopAtTransients (TransientSensitivity sensitivity);
 
+    // Select a chop by its stable id. Used by the editor to turn a MIDI-triggered
+    // chop into the active (green-highlighted) selection on the message thread.
+    void selectChopById (int chopId);
     void selectChopAtSample (double samplePosition);
     void clearSelectedChop();
     void removeSelectedChop();

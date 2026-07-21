@@ -164,6 +164,7 @@ struct FxRackStrip::Impl
 
         owner.addAndMakeVisible (toolbar);
         toolbar.onRestorePanel = [this] (const juce::String& id) { restorePanel (id); };
+        toolbar.onMinimizeRequested = [this] { setMinimized (! minimized); };
         syncToolbar();
 
         // Live meters, wired the same way the rack's editor does.
@@ -562,9 +563,23 @@ struct FxRackStrip::Impl
 
     bool isEmpty() const { return order.isEmpty(); }
 
+    void setMinimized (bool shouldBeMinimized)
+    {
+        if (minimized == shouldBeMinimized)
+            return;
+
+        minimized = shouldBeMinimized;
+        viewport.setVisible (! minimized);
+        toolbar.setMinimized (minimized);
+        resized();
+
+        if (owner.onMinimizedChanged != nullptr)
+            owner.onMinimizedChanged (minimized);
+    }
+
     void paint (juce::Graphics& g)
     {
-        if (isEmpty())
+        if (! minimized && isEmpty())
         {
             auto area = viewport.getBounds();
             g.setColour (colours::creamDim.withAlpha (0.4f));
@@ -580,6 +595,12 @@ struct FxRackStrip::Impl
         animator.cancelAllAnimations (false);
         auto r = owner.getLocalBounds();
         toolbar.setBounds (r.removeFromTop (kToolbarH));
+        if (minimized)
+        {
+            viewport.setBounds ({});
+            return;
+        }
+
         r.removeFromTop (kGap);
         viewport.setBounds (r);
         rebuildTargets();
@@ -625,6 +646,7 @@ struct FxRackStrip::Impl
     std::vector<RackItem> items;
     juce::StringArray order, hidden;
     std::map<juce::String, juce::Rectangle<int>> targets;
+    bool minimized = false;
 
     ModulePanel* draggedPanel = nullptr;
     juce::ComponentAnimator animator;
@@ -641,6 +663,8 @@ FxRackStrip::~FxRackStrip() = default;
 void FxRackStrip::paint (juce::Graphics& g)   { impl->paint (g); }
 void FxRackStrip::resized()                 { impl->resized(); }
 void FxRackStrip::refreshColours()          { impl->refreshColours(); }
+void FxRackStrip::setMinimized (bool minimized) { impl->setMinimized (minimized); }
+bool FxRackStrip::isMinimized() const noexcept  { return impl->minimized; }
 
 void FxRackStrip::applyRackTheme (bool light, bool warpActive, bool halftimeActive)
 {

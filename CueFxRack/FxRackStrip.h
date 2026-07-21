@@ -35,6 +35,11 @@ namespace cue
         void paint (juce::Graphics&) override;
         void resized() override;
 
+        static constexpr int minimizedHeight = 46;
+        std::function<void (bool)> onMinimizedChanged;
+        void setMinimized (bool shouldBeMinimized);
+        bool isMinimized() const noexcept;
+
         // Bridge to CUERACK's theme system (cue::colours foundation used by
         // the rack subtree), then re-skin the panels/toolbar.
         static void applyRackTheme (bool light, bool warpActive = false, bool halftimeActive = false);
