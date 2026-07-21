@@ -16,12 +16,12 @@ namespace
 // One continuous chassis: content spans the full design width inside a
 // slim 10px margin (the CUERACK kMargin), no side rails.
 constexpr int editorWidth = 1266;
-constexpr int editorHeight = 734; // the CORE design space (chassis + keyboard);
+constexpr int editorHeight = 660; // the CORE design space (chassis + keyboard);
                                   // the FX rack band below lays out in real
                                   // window pixels and re-flows CUERACK-style.
                                   // (Was 884 — the old right utility rail is
                                   // dissolved, stems dock into the header, and
-                                  // the transport is one condensed band.)
+                                  // the controls are condensed into two rows.)
 
 // Minimum height reserved for the FX rack band under the scaled core:
 // one row of panels at the rack's minimum usable height (240) + toolbar.
@@ -5193,29 +5193,19 @@ public:
 
     void resized() override
     {
-        // ---- Row 1: chop controls directly beneath the global knobs --------
+        // ---- Row 1: chop/grid tools | centred global knobs | warp tools ----
+        // The global knobs are owned by WaveformFooterComponent and overlay
+        // the middle of this panel; this component fills the clear side bays.
         const auto chopPanel = getChopPanelBounds();
 
         // Keep clear of the corner rivets (drawn at x = 13 +- 6 in paint()).
         const int sideMargin = 34;
 
-        const int knobH = bandKnobDiameter + 19;
-        const int knobY = chopPanel.getY() + juce::jmax (0, (chopPanel.getHeight() - knobH) / 2);
-        constexpr int knobGap = 22;
-        constexpr int knobClusterWidth = bandKnobDiameter * 3 + knobGap * 2;
-
-        int knobX = (getWidth() - knobClusterWidth) / 2;
-        cueKnob.setBounds (knobX, knobY, bandKnobDiameter, knobH);
-        knobX += bandKnobDiameter + knobGap;
-        gainKnob.setBounds (knobX, knobY, bandKnobDiameter, knobH);
-        knobX += bandKnobDiameter + knobGap;
-        pitchKnob.setBounds (knobX, knobY, bandKnobDiameter, knobH);
-
         const int buttonH = 44;
         const int buttonY = chopPanel.getY() + (chopPanel.getHeight() - buttonH) / 2;
 
         // Chop-generation tools occupy the left bay, leaving the centred
-        // per-chop knobs aligned beneath the centred global-knob cluster.
+        // global-knob bank unobstructed.
         constexpr int chopBadgeWidth = 122;
         constexpr int badgeToToolsGap = 24;
         const int centerBlockX = sideMargin + chopBadgeWidth + badgeToToolsGap;
@@ -5232,41 +5222,53 @@ public:
         octDownButton.setBounds (octX, buttonY, 44, 20);
         octUpButton.setBounds (octX, buttonY + 24, 44, 20);
 
-        // ---- Row 2: load | transport | half-time + sync | displays ---------
+        // ---- Row 2: playback | centred chop knobs | modes + readouts -------
         const auto transportPanel = getTransportPanelBounds();
         const int transportCenterY = transportPanel.getCentreY();
-        const int totalW = getWidth() - (sideMargin * 2);
+
+        const int knobH = bandKnobDiameter + 19;
+        const int knobY = transportPanel.getY()
+                        + juce::jmax (0, (transportPanel.getHeight() - knobH) / 2);
+        constexpr int knobGap = 22;
+        constexpr int knobClusterWidth = bandKnobDiameter * 3 + knobGap * 2;
+
+        int knobX = (getWidth() - knobClusterWidth) / 2;
+        cueKnob.setBounds (knobX, knobY, bandKnobDiameter, knobH);
+        knobX += bandKnobDiameter + knobGap;
+        gainKnob.setBounds (knobX, knobY, bandKnobDiameter, knobH);
+        knobX += bandKnobDiameter + knobGap;
+        pitchKnob.setBounds (knobX, knobY, bandKnobDiameter, knobH);
 
         constexpr int loadW = 120;
         constexpr int innerTransportGap = 8;
-        constexpr int transportGroupW = 48 * 3 + innerTransportGap * 2; // 160
-        constexpr int halfW = 64;
-        constexpr int syncW = 84;
+        constexpr int halfW = 56;
+        constexpr int syncW = 76;
         constexpr int modeGroupW = halfW + innerTransportGap + syncW; // half-time + sync pair
         constexpr int innerDisplayGap = 8;
         constexpr int displaysGroupW = 150 + innerDisplayGap + 76 + innerDisplayGap + 76; // 318
 
-        const int sumBlockWidths = loadW + transportGroupW + modeGroupW + displaysGroupW;
-        const float blockGap = juce::jmax (10.0f, (float) (totalW - sumBlockWidths) / 3.0f);
+        // Playback bank is a compact left-hand block, like transport controls
+        // on dedicated hardware rather than unrelated buttons spread edge-to-edge.
+        constexpr int bankGap = 24;
+        const int loadX = sideMargin;
+        const int transportX = loadX + loadW + bankGap;
+        loadButton.setBounds (loadX, transportCenterY - 24, loadW, 48);
+        playButton.setBounds (transportX, transportCenterY - 24, 48, 48);
+        pauseButton.setBounds (transportX + 48 + innerTransportGap, transportCenterY - 24, 48, 48);
+        stopButton.setBounds (transportX + 2 * (48 + innerTransportGap), transportCenterY - 24, 48, 48);
 
-        float currentX = (float) sideMargin;
+        // Readouts anchor to the right edge; HALF TIME / SYNC form the mode
+        // bank immediately before them, keeping the centre clear for chop knobs.
+        const int displaysX = getWidth() - sideMargin - displaysGroupW;
+        constexpr int modeToDisplayGap = 16;
+        const int modeX = displaysX - modeToDisplayGap - modeGroupW;
+        halfSpeedButton.setBounds (modeX, transportCenterY - 24, halfW, 48);
+        syncButton.setBounds (modeX + halfW + innerTransportGap, transportCenterY - 24, syncW, 48);
 
-        loadButton.setBounds (juce::roundToInt (currentX), transportCenterY - 24, loadW, 48);
-        currentX += (float) loadW + blockGap;
-
-        playButton.setBounds (juce::roundToInt (currentX), transportCenterY - 24, 48, 48);
-        pauseButton.setBounds (juce::roundToInt (currentX + 48 + innerTransportGap), transportCenterY - 24, 48, 48);
-        stopButton.setBounds (juce::roundToInt (currentX + 2 * (48 + innerTransportGap)), transportCenterY - 24, 48, 48);
-        currentX += (float) transportGroupW + blockGap;
-
-        // Playback-mode pair: HALF TIME with SYNC TO DAW right beside it.
-        halfSpeedButton.setBounds (juce::roundToInt (currentX), transportCenterY - 24, halfW, 48);
-        syncButton.setBounds (juce::roundToInt (currentX + halfW + innerTransportGap), transportCenterY - 24, syncW, 48);
-        currentX += (float) modeGroupW + blockGap;
-
-        timeDisplay.setBounds (juce::roundToInt (currentX), transportCenterY - 24, 150, 48);
-        tempoDisplay.setBounds (juce::roundToInt (currentX + 150 + innerDisplayGap), transportCenterY - 24, 76, 48);
-        keyDisplay.setBounds (juce::roundToInt (currentX + 150 + innerDisplayGap + 76 + innerDisplayGap), transportCenterY - 24, 76, 48);
+        timeDisplay.setBounds (displaysX, transportCenterY - 24, 150, 48);
+        tempoDisplay.setBounds (displaysX + 150 + innerDisplayGap, transportCenterY - 24, 76, 48);
+        keyDisplay.setBounds (displaysX + 150 + innerDisplayGap + 76 + innerDisplayGap,
+                              transportCenterY - 24, 76, 48);
     }
 
     juce::TextButton& getLoadButton() noexcept { return loadButton; }
@@ -5588,12 +5590,12 @@ private:
 
     juce::Rectangle<int> getChopPanelBounds() const
     {
-        return getLocalBounds().removeFromTop (70);
+        return getLocalBounds().removeFromTop (72);
     }
 
     juce::Rectangle<int> getTransportPanelBounds() const
     {
-        constexpr int bottomPanelY = 74;
+        constexpr int bottomPanelY = 76;
         return { 0, bottomPanelY, getWidth(), juce::jmax (0, getHeight() - bottomPanelY) };
     }
 
@@ -5636,9 +5638,9 @@ private:
     SmoothAnimatedSwitchButton syncButton;
 };
 
-// Slim glass strip directly beneath the waveform. Its centred row holds the
-// four global waveform/sample controls (ZOOM / SCROLL / TEMPO / PITCH). The
-// centred per-chop CUE / GAIN / PITCH row sits directly beneath it.
+// Transparent control layer over the upper row of the two-row hardware deck.
+// It owns the centred global knobs while TransportSectionComponent owns and
+// paints the shared panel plus the button banks in the clear side bays.
 class WaveformFooterComponent final : public juce::Component
 {
 public:
@@ -5651,6 +5653,7 @@ public:
           globalPitchKnob ("PITCH", footerKnobDiameter, 13.0f, "miniColourKnob", lightCueOrange)
     {
         setBufferedToImage (false);
+        setInterceptsMouseClicks (false, true);
 
         zoomKnob.getSlider().setValue (0.0, juce::dontSendNotification);
         zoomKnob.getSlider().setMouseDragSensitivity (preciseMiniKnobDragSensitivity);
@@ -5685,16 +5688,6 @@ public:
     {
         for (auto* knob : { &zoomKnob, &scrollKnob, &tempoKnob, &globalPitchKnob })
             knob->refreshColours();
-    }
-
-    void paint (juce::Graphics& g) override
-    {
-        auto bounds = getLocalBounds().toFloat().reduced (0.5f);
-        fillGlassRounded (g, *this, bounds, mediumCorner);
-
-        const auto centreY = bounds.getCentreY();
-        drawPanelHole (g, { bounds.getX() + 13.0f, centreY }, 6.0f);
-        drawPanelHole (g, { bounds.getRight() - 13.0f, centreY }, 6.0f);
     }
 
     void resized() override
@@ -6268,7 +6261,6 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     waveformDisplayComponent->setComponentEffect (&panelShadowEffect);
     transportSectionComponent->setComponentEffect (&panelShadowEffect);
     stemRackComponent->setComponentEffect (&panelShadowEffect);
-    waveformFooterComponent->setComponentEffect (&panelShadowEffect);
 
     helpOverlayComponent = std::make_unique<cue::HelpOverlayComponent>();
     contentComponent.addChildComponent (*helpOverlayComponent); // invisible by default
@@ -6542,7 +6534,7 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
 
     // Chassis plate for the on-screen MIDI keyboard along the bottom strip.
     {
-        auto keyboardPanel = juce::Rectangle<float> (10.0f, 658.0f, fluidW - 20.0f, 68.0f);
+        auto keyboardPanel = juce::Rectangle<float> (10.0f, 584.0f, fluidW - 20.0f, 68.0f);
         juce::Path panelPath;
         panelPath.addRoundedRectangle (keyboardPanel, cue::mediumCorner);
         cue::fillGlassPath (g, panelPath, keyboardPanel);
@@ -6604,19 +6596,20 @@ void AudioPluginAudioProcessorEditor::resized()
         stemRackComponent->setBounds (stemX, headerControlY, stemW, 56);
     }
 
-    // Full-width column: waveform, global-control footer, per-chop controls,
-    // then transport. No side rail.
+    // Full-width column: waveform, one two-row hardware control deck, keyboard.
+    // The global-knob layer overlays the deck's upper row without painting a
+    // third panel; its blank areas pass mouse events through to the tool buttons.
     const int coreW = fluidW - 20;
 
     waveformDisplayComponent->setBounds (10, 106, coreW, 316);
+    transportSectionComponent->setBounds (10, 428, coreW, 148);
     waveformFooterComponent->setBounds (10, 428, coreW, 72);
-    transportSectionComponent->setBounds (10, 506, coreW, 144);
-    helpOverlayComponent->setBounds (10, 106, coreW, 544);
+    helpOverlayComponent->setBounds (10, 106, coreW, 470);
 
     if (midiKeyboardComponent != nullptr)
     {
         midiKeyboardComponent->setKeyWidth ((float) (fluidW - 36) / 49.0f); // 49 white keys, C1..B7
-        midiKeyboardComponent->setBounds (18, 664, fluidW - 36, 56);
+        midiKeyboardComponent->setBounds (18, 590, fluidW - 36, 56);
     }
 
     // Update banner: centred strip near the top, drawn over the content. Sized
