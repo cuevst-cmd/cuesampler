@@ -1,0 +1,909 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="CUE. — Audio tools and plugins for music production. Storefront of @cuesampler.">
+<title>CUE. Storefront</title>
+
+<!-- Fonts -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Anton&family=Space+Mono:wght@400;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+
+<style>
+  /* ============ design tokens ============ */
+  :root {
+    --bg: #ece8dd;
+    --bg-soft: #e2ddcf;
+    --text: #171310;
+    --dim: #6e6759;
+    --line: #171310;
+    --accent: #d9431e;
+    --band-bg: #171310;
+    --band-text: #ece8dd;
+    --font-display: 'Anton', sans-serif;
+    --font-mono: 'Space Mono', monospace;
+    --font-body: 'Inter', sans-serif;
+    color-scheme: light;
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #14110d;
+    --bg-soft: #1c1812;
+    --text: #ece8dd;
+    --dim: #948c7a;
+    --line: #857d6a;
+    --accent: #ff5a2e;
+    --band-bg: #ece8dd;
+    --band-text: #14110d;
+    color-scheme: dark;
+  }
+
+  /* ============ base ============ */
+  *, *::before, *::after { box-sizing: border-box; }
+  html { scroll-behavior: smooth; overflow-x: hidden; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 15px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overflow-x: hidden;
+  }
+
+  .mono { font-family: var(--font-mono); }
+  a { color: var(--text); text-decoration: none; }
+
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  ::selection { background: var(--accent); color: var(--bg); }
+
+  .skip {
+    position: absolute; left: -9999px; top: 0; z-index: 1000;
+    background: var(--accent); color: #fff; padding: 12px 20px;
+    font-weight: 700;
+  }
+  .skip:focus { left: 0; }
+
+  .wrap { max-width: 1160px; margin: 0 auto; padding: 0 20px; }
+
+  /* ============ header ============ */
+  header.site {
+    position: sticky; top: 0; z-index: 100;
+    background: var(--bg);
+    border-bottom: 1px solid var(--line);
+  }
+
+  .bar {
+    display: flex; align-items: center; justify-content: space-between;
+    height: 58px;
+  }
+
+  .wordmark {
+    font-family: var(--font-display);
+    font-size: 21px;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--text);
+    line-height: 1;
+  }
+  .wordmark:hover { color: var(--accent); }
+
+  .bar nav { display: flex; align-items: center; gap: 22px; }
+
+  .navlink {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+  .navlink:hover { color: var(--text); text-decoration: underline; text-underline-offset: 4px; text-decoration-color: var(--accent); }
+
+  #theme-toggle {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 32px; height: 32px;
+    background: transparent; color: var(--text);
+    border: 1px solid var(--line); border-radius: 0; cursor: pointer;
+    padding: 0;
+  }
+  #theme-toggle:hover { background: var(--text); color: var(--bg); }
+  #theme-toggle svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  #theme-toggle .sun { display: none; }
+  :root[data-theme="dark"] #theme-toggle .sun { display: block; }
+  :root[data-theme="dark"] #theme-toggle .moon { display: none; }
+
+  /* ============ catalog head ============ */
+  section { padding: 0 0 90px; }
+
+  .sec-head {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 20px;
+    padding: 34px 0 22px;
+  }
+
+  h1.all {
+    margin: 0;
+    font-family: var(--font-display);
+    font-weight: 400;
+    font-size: clamp(68px, 13vw, 140px);
+    line-height: 0.86;
+    letter-spacing: 0.005em;
+    text-transform: uppercase;
+  }
+
+  h1.all .count {
+    font-family: var(--font-mono);
+    font-size: clamp(14px, 2vw, 19px);
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    vertical-align: top;
+    margin-left: 10px;
+    color: var(--text);
+  }
+
+  .sec-caption {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--dim);
+    text-align: right;
+    line-height: 1.8;
+    padding-bottom: 10px;
+    white-space: nowrap;
+  }
+
+  /* ============ boxed grid ============ */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+  }
+
+  .grid > * { background: var(--bg); }
+
+  .card {
+    display: flex;
+    flex-direction: column;
+    color: var(--text);
+    min-width: 0;
+  }
+
+  .thumb {
+    aspect-ratio: 1 / 1;
+    background: var(--bg-soft);
+    position: relative;
+    overflow: hidden;
+    border-bottom: 1px solid var(--line);
+  }
+  .thumb img {
+    width: 100%; height: 100%; object-fit: cover; display: block;
+    transition: transform 0.3s ease;
+  }
+  @media (prefers-reduced-motion: reduce) { .thumb img { transition: none; } }
+  .card:hover .thumb img { transform: scale(1.035); }
+  .card:hover .p-name { color: var(--accent); }
+
+  .tag {
+    position: absolute;
+    right: 10px; bottom: 10px;
+    background: var(--accent);
+    color: #f5f1e6;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    padding: 6px 9px;
+    line-height: 1;
+  }
+
+  /* flat fallback thumb when no image */
+  .fallback {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px;
+    background: var(--bg-soft);
+    color: var(--text);
+    text-align: center;
+    padding: 20px;
+  }
+  .fallback .initials {
+    font-family: var(--font-display);
+    font-size: 64px;
+    line-height: 1;
+    text-transform: uppercase;
+  }
+  .fallback .type-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+
+  .card-body {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px 16px 18px;
+    flex: 1;
+  }
+
+  .p-name {
+    margin: 0;
+    font-family: var(--font-display);
+    font-weight: 400;
+    font-size: 17px;
+    line-height: 1.15;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+  }
+
+  .card-meta {
+    margin-top: auto;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .badge {
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+
+  .price {
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 14px;
+    white-space: nowrap;
+  }
+  .original-price {
+    font-weight: 400;
+    text-decoration: line-through;
+    color: var(--dim);
+    font-size: 0.82em;
+    margin-right: 7px;
+  }
+  .sale-price { color: var(--accent); }
+
+  /* hatched filler cells to complete the row */
+  .filler {
+    position: relative;
+    min-height: 100px;
+  }
+  .filler::after {
+    content: '';
+    position: absolute; inset: 0;
+    background: repeating-linear-gradient(45deg, transparent 0 9px, var(--line) 9px 10px);
+    opacity: 0.14;
+  }
+
+  .empty {
+    grid-column: 1 / -1;
+    margin: 0;
+    padding: 56px 24px;
+    text-align: center;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+
+  /* ============ legal pages ============ */
+  section.legal { display: none; }
+
+  .legal-body {
+    border-top: 1px solid var(--line);
+    padding-top: 30px;
+    max-width: 760px;
+    font-size: 14.5px;
+    line-height: 1.75;
+  }
+  .legal-body h3 {
+    font-family: var(--font-display);
+    font-weight: 400;
+    font-size: 19px;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    margin: 34px 0 10px;
+  }
+  .legal-body p { margin: 0 0 14px; }
+  .legal-body ul { margin: 0 0 14px; padding-left: 20px; }
+  .legal-body li { margin-bottom: 8px; }
+  .legal-body a { text-decoration: underline; text-underline-offset: 3px; }
+  .legal-body a:hover { color: var(--accent); }
+  .legal-body .fine { color: var(--dim); font-style: italic; }
+
+  /* ============ posts / updates ============ */
+  #posts .sec-head { padding-top: 0; }
+  h2.updates {
+    margin: 0;
+    font-family: var(--font-display);
+    font-weight: 400;
+    font-size: clamp(34px, 5vw, 54px);
+    line-height: 0.95;
+    text-transform: uppercase;
+    letter-spacing: 0.01em;
+  }
+  h2.updates .count {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 700;
+    vertical-align: top;
+    margin-left: 8px;
+  }
+
+  .posts-list {
+    border-top: 1px solid var(--line);
+  }
+  .post-item {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 20px;
+    padding: 16px 2px;
+    border-bottom: 1px solid var(--line);
+    color: var(--text);
+  }
+  .post-item:hover .post-title { color: var(--accent); }
+  .post-title {
+    font-family: var(--font-body);
+    font-weight: 600;
+    font-size: 15px;
+    letter-spacing: 0.01em;
+  }
+  .post-date {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--dim);
+    white-space: nowrap;
+  }
+
+  /* ============ footer ============ */
+  footer.site {
+    background: var(--band-bg);
+    color: var(--band-text);
+    overflow: hidden;
+  }
+
+  .microrow {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px 24px;
+    padding: 26px 0 6px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+  }
+  .microrow a { color: inherit; }
+  .microrow a:hover { color: var(--accent); }
+  .microrow .foot-note { opacity: 0.72; }
+
+  .giant {
+    font-family: var(--font-display);
+    font-weight: 400;
+    font-size: clamp(130px, 29vw, 450px);
+    line-height: 0.82;
+    text-align: center;
+    text-transform: uppercase;
+    letter-spacing: 0.01em;
+    transform: scale(1.32, 1.5) skewX(-6deg);
+    transform-origin: 50% 100%;
+    margin: 0.48em 0 -0.13em;
+    user-select: none;
+    pointer-events: none;
+    white-space: nowrap;
+  }
+
+  /* ============ responsive ============ */
+  @media (max-width: 640px) {
+    .sec-caption { display: none; }
+    .legal-nav { display: none; }
+    .bar { height: 52px; }
+    .card-body { padding: 13px 13px 15px; }
+  }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to main content</a>
+
+<header class="site">
+  <div class="wrap bar">
+    <a class="wordmark" href="#" data-gumroad-field="name">CUE.</a>
+    <nav aria-label="Store navigation">
+      <a class="navlink" href="#">Store</a>
+      <a class="navlink legal-nav" href="#eula">EULA</a>
+      <a class="navlink legal-nav" href="#privacy">Privacy</a>
+      <a class="navlink" href="https://www.instagram.com/cuesampler" target="_blank" rel="noopener">Instagram</a>
+      <button id="theme-toggle" type="button" aria-label="Toggle theme">
+        <svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41m14.14-14.14l-1.41 1.41"/></svg>
+        <svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+      </button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+  <div id="store-view">
+  <section id="products" aria-labelledby="products-h">
+    <div class="wrap">
+      <div class="sec-head">
+        <h1 class="all" id="products-h">Plugins<span class="count" id="product-count">(0)</span></h1>
+        <p class="sec-caption">@cuesampler<br>Audio plugins</p>
+      </div>
+      <div class="grid" id="product-grid">
+        <!-- Rendered dynamically -->
+      </div>
+    </div>
+  </section>
+
+  <section id="posts" aria-labelledby="posts-h" style="display:none;">
+    <div class="wrap">
+      <div class="sec-head">
+        <h2 class="updates" id="posts-h">Updates<span class="count" id="post-count"></span></h2>
+      </div>
+      <div class="posts-list" id="post-list">
+        <!-- Rendered dynamically -->
+      </div>
+    </div>
+  </section>
+  </div><!-- /store-view -->
+
+  <section id="eula" class="legal" aria-labelledby="eula-h">
+    <div class="wrap">
+      <div class="sec-head">
+        <h1 class="all" id="eula-h">EULA</h1>
+        <p class="sec-caption">CUE Sampler<br>Last updated: May 31, 2026</p>
+      </div>
+      <div class="legal-body">
+        <p><strong>CUE SAMPLER — End User License Agreement (EULA)</strong></p>
+        <p>This End User License Agreement ("Agreement") is a legal agreement between you ("you," "your," or "Licensee") and Jerry Volpe, doing business as CUE Software ("we," "us," "our," or "Licensor"), for the CUE SAMPLER software plugin, including any associated files, documentation, and updates we choose to provide (collectively, the "Software").</p>
+        <p>By downloading, installing, purchasing, or using the Software, you agree to be bound by this Agreement. If you do not agree, do not download, install, or use the Software.</p>
+        <h3>1. License Grant</h3>
+        <p>Subject to your compliance with this Agreement and payment of the applicable fee, we grant you a non-exclusive, non-transferable, revocable license to install and use the Software for your own personal or commercial music-production purposes.</p>
+        <p>You may install and use the Software on computers that you own or control.</p>
+        <h3>2. Restrictions</h3>
+        <p>You may not:</p>
+        <ul>
+          <li>Sell, rent, lease, sublicense, distribute, or otherwise transfer the Software or your license to any third party;</li>
+          <li>Share, publish, or distribute your license key, download link, or account credentials;</li>
+          <li>Copy the Software except for a single reasonable backup copy;</li>
+          <li>Reverse engineer, decompile, disassemble, or attempt to derive the source code of the Software, except to the extent this restriction is prohibited by applicable law;</li>
+          <li>Modify, adapt, translate, or create derivative works based on the Software;</li>
+          <li>Remove, alter, or obscure any proprietary notices, labels, or marks on the Software;</li>
+          <li>Use the Software in any unlawful manner or in violation of any applicable law or regulation.</li>
+        </ul>
+        <h3>3. Beta Software</h3>
+        <p>You acknowledge that the Software is provided as a BETA release. This means:</p>
+        <ul>
+          <li>The Software is still in development and may contain errors, bugs, defects, or other issues;</li>
+          <li>The Software may behave unexpectedly, crash, fail to function, or cause your host application (DAW) to crash;</li>
+          <li>The Software may change, be discontinued, or become unavailable at any time without notice;</li>
+          <li>You use the Software at your own risk and are solely responsible for backing up your projects, audio, and data before use.</li>
+        </ul>
+        <p>We make no promise that any particular feature will be added, completed, maintained, or supported.</p>
+        <h3>4. Updates</h3>
+        <p>We may, at our sole discretion, release updates, bug fixes, or new versions of the Software. We are under no obligation to provide any updates, upgrades, support, or maintenance. Any updates we do provide are governed by this Agreement unless accompanied by a separate license. Your purchase does not entitle you to lifetime updates or any guaranteed future versions.</p>
+        <h3>5. Payment and No Refunds</h3>
+        <p>The Software is a paid digital product delivered electronically.</p>
+        <p>ALL SALES ARE FINAL. NO REFUNDS WILL BE PROVIDED. Because the Software is a digital good delivered immediately upon purchase, you are not entitled to a refund, exchange, or credit for any reason, including but not limited to dissatisfaction, lack of use, incompatibility with your system, or defects associated with the beta nature of the Software.</p>
+        <p>Where applicable law grants you a mandatory statutory right to a refund or withdrawal that cannot be waived, that right is not affected by this section. By purchasing and downloading the Software, where permitted, you expressly request immediate delivery and acknowledge that this may end any statutory right of withdrawal.</p>
+        <h3>6. Data Collection and Privacy</h3>
+        <p>The Software includes an optional data-sharing feature that is turned OFF by default. No usage data is collected from or transmitted by the Software unless you affirmatively enable this feature using the in-plugin toggle, and you may disable it again at any time. When enabled, the Software collects and transmits limited, anonymous technical data (such as a random installation identifier, a one-way hash of loaded audio, and tempo/key detection results and corrections) solely to improve the Software's detection accuracy. The Software does not collect or transmit your actual audio recordings.</p>
+        <p>Your use of the Software, and any data collected through it, is governed by our <a href="#privacy">Privacy Policy</a>, which is incorporated into this Agreement by reference. By using the Software, you acknowledge the data practices described in the Privacy Policy.</p>
+        <h3>7. Ownership</h3>
+        <p>The Software is licensed, not sold. We and our licensors retain all right, title, and interest in and to the Software, including all intellectual property rights. This Agreement does not grant you any rights to our trademarks, logos, or service marks.</p>
+        <h3>8. No Warranty</h3>
+        <p>THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE," WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, WE DISCLAIM ALL WARRANTIES, INCLUDING BUT NOT LIMITED TO THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. WE DO NOT WARRANT THAT THE SOFTWARE WILL BE UNINTERRUPTED, ERROR-FREE, SECURE, OR FREE OF HARMFUL COMPONENTS, OR THAT DEFECTS WILL BE CORRECTED.</p>
+        <h3>9. Limitation of Liability</h3>
+        <p>TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL WE BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES, OR FOR ANY LOSS OF PROFITS, DATA, AUDIO, PROJECTS, GOODWILL, OR OTHER INTANGIBLE LOSSES, ARISING OUT OF OR RELATING TO YOUR USE OF OR INABILITY TO USE THE SOFTWARE, EVEN IF WE HAVE BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.</p>
+        <p>IN ANY CASE, OUR TOTAL CUMULATIVE LIABILITY ARISING OUT OF OR RELATING TO THIS AGREEMENT OR THE SOFTWARE SHALL NOT EXCEED THE AMOUNT YOU ACTUALLY PAID FOR THE SOFTWARE.</p>
+        <p>Some jurisdictions do not allow the exclusion or limitation of certain warranties or liabilities, so some of the above may not apply to you.</p>
+        <h3>10. Termination</h3>
+        <p>This Agreement is effective until terminated. Your rights under this Agreement will terminate automatically and without notice if you fail to comply with any of its terms. Upon termination, you must cease all use of the Software and delete all copies in your possession. Sections 6 through 12 survive termination.</p>
+        <h3>11. Governing Law</h3>
+        <p>This Agreement shall be governed by and construed in accordance with the laws of the State of New York, United States, without regard to its conflict-of-law principles. You agree that any dispute arising under this Agreement shall be subject to the exclusive jurisdiction of the state and federal courts located in New York.</p>
+        <h3>12. Entire Agreement</h3>
+        <p>This Agreement constitutes the entire agreement between you and us regarding the Software and supersedes all prior or contemporaneous understandings. If any provision of this Agreement is held to be unenforceable, the remaining provisions will remain in full force and effect.</p>
+        <h3>13. Contact</h3>
+        <p>Questions about this Agreement may be sent to:</p>
+        <p>CUE Software<br>Email: <a href="mailto:cue@cuesampler.com">cue@cuesampler.com</a><br>Website: <a href="https://cuesampler.com" target="_blank" rel="noopener">cuesampler.com</a></p>
+        <p class="fine">By installing or using CUE SAMPLER, you acknowledge that you have read, understood, and agree to be bound by this Agreement.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="privacy" class="legal" aria-labelledby="privacy-h">
+    <div class="wrap">
+      <div class="sec-head">
+        <h1 class="all" id="privacy-h">Privacy</h1>
+        <p class="sec-caption">Privacy Policy<br>Last updated: May 31, 2026</p>
+      </div>
+      <div class="legal-body">
+        <p>This Privacy Policy describes how CUE ("we," "us," or "our") collects, uses, and discloses your personal information when you visit <a href="https://cuesampler.gumroad.com" target="_blank" rel="noopener">cuesampler.gumroad.com</a> (the "Site"), subscribe to our newsletter, or purchase and use the CUE Sampler VST plugin (the "Software").</p>
+        <h3>1. Information We Collect</h3>
+        <p>We collect information directly from you when you interact with our Site, purchase our Software, and—only if you choose to enable optional data sharing—when you use the Software.</p>
+        <ul>
+          <li><strong>Identifiers &amp; Contact Information:</strong> Name, email address, billing address, and phone number.</li>
+          <li><strong>Payment &amp; Financial Data:</strong> When you purchase the CUE Sampler VST plugin, your payment details (such as credit card numbers or account info) are processed. Note: We do not store or process your full financial details on our servers. All payments are securely handled by our third-party payment processors.</li>
+          <li><strong>Device &amp; Usage Data (Website):</strong> IP address, browser type, operating system, and information about how you interact with our website (collected via cookies and tracking technologies).</li>
+          <li><strong>In-Software Usage Data (Optional):</strong> The Software includes an optional data-sharing feature that is turned OFF by default and is described in Section 2 below.</li>
+        </ul>
+        <h3>2. In-Software (Plugin) Data Collection — Optional, Off by Default</h3>
+        <p>The CUE Sampler plugin includes an optional data-sharing feature ("Data Sharing") that is turned OFF by default. No usage data is collected from or transmitted by the plugin unless you affirmatively enable Data Sharing using the in-plugin toggle. You can turn it off again at any time, which stops all further collection and transmission.</p>
+        <p>What is collected when (and only when) you enable Data Sharing:</p>
+        <ul>
+          <li>A randomly generated installation identifier (a one-time random ID stored locally that does not contain your name, email, or any account information);</li>
+          <li>A one-way hash (an irreversible fingerprint) of audio samples you load into the plugin — we cannot reconstruct, listen to, or recover your audio from this value, and we do not collect or transmit your actual audio;</li>
+          <li>Technical characteristics of loaded samples: duration, sample rate, and number of channels;</li>
+          <li>Tempo (BPM) detection results and any manual corrections you make to them;</li>
+          <li>Musical key detection results and any manual corrections you make to them;</li>
+          <li>Timestamps for the above events.</li>
+        </ul>
+        <p><strong>Why we collect it:</strong> solely to measure and improve the accuracy of the plugin's automatic BPM and key detection. This data is technical and product-improvement oriented; it is not used for advertising and is not sold.</p>
+        <p><strong>Where it goes:</strong> when enabled, these events are sent securely to our data-collection endpoint hosted on Google's infrastructure (Google Apps Script / Google Workspace), which acts as a service provider/processor on our behalf. We do not share this data with advertisers or other third parties.</p>
+        <p><strong>Your control:</strong> Data Sharing is opt-in. Because the data is keyed to a random installation identifier rather than your identity, in most cases we are unable to link it back to you personally. If you have enabled Data Sharing and wish to request deletion of data associated with your installation identifier, contact us at <a href="mailto:cue@cuesampler.com">cue@cuesampler.com</a> and provide your installation identifier (viewable in the plugin), and we will delete the associated records where we are able to identify them.</p>
+        <h3>3. How We Use Your Information</h3>
+        <p>We use the information we collect for the following business purposes:</p>
+        <ul>
+          <li><strong>To Fulfill Software Deliveries &amp; Payments:</strong> Processing your transaction, delivering the CUE Sampler VST download links, managing software license keys, and sending order receipts.</li>
+          <li><strong>To Communicate With You:</strong> Sending email updates regarding software updates, bug fixes, future plugin expansions, brand newsletters, and responding to customer support requests.</li>
+          <li><strong>To Improve the Site and Product:</strong> Analyzing website traffic trends for optimization, and—where you have enabled Data Sharing—analyzing anonymous detection data to improve the accuracy of the Software's BPM and key detection.</li>
+          <li><strong>Security &amp; Fraud Prevention:</strong> Verifying transactions, protecting against unauthorized digital distribution, and complying with legal obligations.</li>
+        </ul>
+        <h3>4. How Your Information is Shared</h3>
+        <p>We do not sell, rent, or lease your personal information to third parties. We only share your data with trusted third-party service providers essential to running our business, including:</p>
+        <ul>
+          <li><strong>Payment Processors:</strong> To securely authorize, validate, and complete your digital plugin purchase.</li>
+          <li><strong>Email Marketing &amp; Delivery Providers:</strong> To manage our subscriber list and deliver transactional and marketing emails.</li>
+          <li><strong>Web Hosting &amp; Analytics Providers:</strong> To maintain our website infrastructure and monitor site performance.</li>
+          <li><strong>Product Analytics Provider (Google):</strong> If you enable the optional in-Software Data Sharing feature, the anonymous usage data described in Section 2 is processed and stored using Google's infrastructure (Google Apps Script / Google Workspace) on our behalf.</li>
+        </ul>
+        <p>We may also disclose your information if required to do so by law, to enforce our terms of sale, or to protect the rights, property, or safety of CUE and its users.</p>
+        <h3>5. Cookies and Tracking Technologies</h3>
+        <p>We use cookies to enhance your browsing experience, remember your checkout preferences, and analyze our traffic. You can choose to disable cookies through your individual browser settings; however, doing so may limit your ability to seamlessly complete purchases on our Site.</p>
+        <h3>6. Your Rights and Choices</h3>
+        <p>Depending on where you reside, you may have specific rights regarding your personal data under regional privacy laws (such as the GDPR or CCPA/CPRA), including:</p>
+        <ul>
+          <li><strong>The Right to Access:</strong> You can request a copy of the personal data we hold about you.</li>
+          <li><strong>The Right to Correction:</strong> You can request that we update or fix inaccurate information.</li>
+          <li><strong>The Right to Deletion:</strong> You can request that we erase your personal information from our databases. For data collected through the optional in-Software Data Sharing feature, see Section 2 for how to request deletion using your installation identifier.</li>
+          <li><strong>Opting Out of Marketing:</strong> You can opt out of our promotional email list at any time by clicking the "Unsubscribe" link at the bottom of any email we send.</li>
+          <li><strong>Opting Out of In-Software Data Sharing:</strong> The Software's Data Sharing feature is off by default; you may enable or disable it at any time using the in-plugin toggle.</li>
+        </ul>
+        <p>To exercise any of these rights, please contact us using the information below.</p>
+        <h3>7. Data Security</h3>
+        <p>We implement industry-standard technical and organizational security measures, including SSL encryption during checkout, to protect your personal data. Because the Software is delivered digitally, we also prioritize secure digital delivery methods. Please note that no method of transmission over the internet is 100% secure, and we cannot guarantee absolute security.</p>
+        <h3>8. Children's Privacy</h3>
+        <p>The Site and Software are not directed to children under the age of 13 (or the equivalent minimum age in your jurisdiction), and we do not knowingly collect personal information from children. If you believe a child has provided us with personal information, please contact us and we will take steps to delete it.</p>
+        <h3>9. Updates to This Policy</h3>
+        <p>We may update this Privacy Policy from time to time to reflect changes in our practices or for legal and regulatory reasons. We will notify you of any changes by updating the "Last Updated" date at the top of this page.</p>
+        <h3>10. Contact Us</h3>
+        <p>If you have any questions or concerns about this Privacy Policy or how your data is handled, please contact us at:</p>
+        <p>Email: <a href="mailto:cue@cuesampler.com">cue@cuesampler.com</a><br>Website: <a href="https://cuesampler.gumroad.com" target="_blank" rel="noopener">cuesampler.gumroad.com</a></p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <div class="microrow">
+      <span class="foot-note">© <span id="year">2026</span> @cuesampler</span>
+      <a href="#eula">EULA</a>
+      <a href="#privacy">Privacy</a>
+      <a href="https://www.instagram.com/cuesampler" target="_blank" rel="noopener">Instagram</a>
+      <span class="foot-note">Powered by Gumroad</span>
+    </div>
+  </div>
+  <div class="giant" aria-hidden="true">CUE.</div>
+</footer>
+
+<noscript>
+  <div class="wrap" style="padding: 48px 0; text-align: center;">
+    <p style="font-size: 14px; font-family: 'Space Mono', monospace; text-transform: uppercase; letter-spacing: 0.1em;">Please enable JavaScript to view the product catalog.</p>
+  </div>
+</noscript>
+
+<!-- Live catalog data placeholder injected by Gumroad server-side -->
+<script id="gumroad-data" type="application/json">{"products":[],"posts":[],"pages":[]}</script>
+
+<script>
+(function() {
+  "use strict";
+
+  /* ---------- theme toggler ---------- */
+  var root = document.documentElement;
+  var toggleBtn = document.getElementById("theme-toggle");
+  if (toggleBtn) {
+    toggleBtn.addEventListener("click", function() {
+      var currentTheme = root.getAttribute("data-theme") || "light";
+      var nextTheme = currentTheme === "light" ? "dark" : "light";
+      root.setAttribute("data-theme", nextTheme);
+      toggleBtn.setAttribute("aria-label", "Switch to " + (nextTheme === "light" ? "dark" : "light") + " theme");
+    });
+  }
+
+  /* ---------- load gumroad data ---------- */
+  var data = { products: [], posts: [], pages: [] };
+  try {
+    var rawData = document.getElementById("gumroad-data");
+    if (rawData) {
+      var parsed = JSON.parse(rawData.textContent || "{}");
+      if (parsed && typeof parsed === "object") {
+        if (Array.isArray(parsed.products)) data.products = parsed.products;
+        if (Array.isArray(parsed.posts)) data.posts = parsed.posts;
+        if (Array.isArray(parsed.pages)) data.pages = parsed.pages;
+      }
+    }
+  } catch(e) {
+    console.error("Failed to parse Gumroad data:", e);
+  }
+
+  /* ---------- data helpers ---------- */
+  function formatPrice(p) {
+    if (p == null || p === "") return "";
+    if (typeof p === "number" && isFinite(p)) {
+      if (p === 0) return "Free";
+      var d = p / 100;
+      return "$" + (d % 1 === 0 ? d.toFixed(0) : d.toFixed(2));
+    }
+    var s = String(p).trim();
+    return (s === "$0" || s === "0") ? "Free" : s;
+  }
+
+  function prettyType(t) {
+    if (!t) return "Product";
+    return String(t).replace(/[_-]+/g, " ").trim();
+  }
+
+  function createFallbackCard(name, type) {
+    var div = document.createElement("div");
+    div.className = "fallback";
+    div.setAttribute("aria-hidden", "true");
+
+    var initials = document.createElement("span");
+    initials.className = "initials";
+    var words = String(name || "?").trim().split(/\s+/);
+    initials.textContent = ((words[0] || "?").charAt(0) + (words[1] ? words[1].charAt(0) : "")).toUpperCase();
+    div.appendChild(initials);
+
+    var label = document.createElement("span");
+    label.className = "type-label";
+    label.textContent = prettyType(type);
+    div.appendChild(label);
+
+    return div;
+  }
+
+  /* ---------- render products ---------- */
+  var grid = document.getElementById("product-grid");
+  var pcount = document.getElementById("product-count");
+  var products = data.products;
+
+  function productRank(p) {
+    var n = String(p.name || "").toUpperCase();
+    if (n.indexOf("CUE SAMPLER") !== -1 || n.indexOf("CUESAMPLER") !== -1) return 0;
+    if (n.indexOf("CUERACK") !== -1 || n.indexOf("CUE RACK") !== -1) return 1;
+    return 2;
+  }
+  products.sort(function(a, b) { return productRank(a) - productRank(b); });
+
+  function isFreeProduct(p) {
+    return p.price === 0 || p.price === "0" || p.price === "$0" || p.price === "Free";
+  }
+
+  function renderProducts() {
+    if (!grid) return;
+    grid.innerHTML = "";
+
+    if (products.length === 0) {
+      var emptyEl = document.createElement("p");
+      emptyEl.className = "empty";
+      emptyEl.textContent = "New products coming soon";
+      grid.appendChild(emptyEl);
+      return;
+    }
+
+    products.forEach(function(p) {
+      var card = document.createElement("a");
+      card.className = "card";
+      card.href = p.url || "#";
+
+      // Thumbnail image or flat fallback
+      var thumb = document.createElement("div");
+      thumb.className = "thumb";
+      if (p.thumbnail_url) {
+        var img = document.createElement("img");
+        img.alt = "";
+        img.loading = "lazy";
+        img.decoding = "async";
+        img.src = p.thumbnail_url;
+        img.addEventListener("error", function() {
+          img.remove();
+          thumb.appendChild(createFallbackCard(p.name, p.native_type));
+        });
+        thumb.appendChild(img);
+      } else {
+        thumb.appendChild(createFallbackCard(p.name, p.native_type));
+      }
+
+      var tag = document.createElement("span");
+      tag.className = "tag";
+      tag.textContent = isFreeProduct(p) ? "GET ↗" : "BUY ↗";
+      thumb.appendChild(tag);
+
+      card.appendChild(thumb);
+
+      // Body
+      var body = document.createElement("div");
+      body.className = "card-body";
+
+      var h3 = document.createElement("h3");
+      h3.className = "p-name";
+      h3.textContent = p.name || "Untitled";
+      body.appendChild(h3);
+
+      var meta = document.createElement("div");
+      meta.className = "card-meta";
+
+      var badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = prettyType(p.native_type);
+      meta.appendChild(badge);
+
+      var price = document.createElement("span");
+      price.className = "price";
+
+      var isCueSampler = p.name && p.name.toUpperCase().indexOf("CUE SAMPLER") !== -1;
+      var hasOriginalPrice = p.price === "$29.99" || p.price === "29.99" || p.price === 2999;
+
+      if (isCueSampler && (hasOriginalPrice || p.price === "$14.99" || p.price === "14.99" || p.price === 1499)) {
+        var origSpan = document.createElement("span");
+        origSpan.className = "original-price";
+        origSpan.textContent = "$29.99";
+        price.appendChild(origSpan);
+
+        var saleSpan = document.createElement("span");
+        saleSpan.className = "sale-price";
+        saleSpan.textContent = "$14.99";
+        price.appendChild(saleSpan);
+      } else {
+        price.textContent = formatPrice(p.price);
+      }
+      meta.appendChild(price);
+
+      body.appendChild(meta);
+      card.appendChild(body);
+      grid.appendChild(card);
+    });
+
+    padGrid();
+
+    if (pcount) {
+      pcount.textContent = "(" + products.length + ")";
+    }
+  }
+
+  /* Hatched filler cells so the boxed grid always completes its last row */
+  function padGrid() {
+    if (!grid) return;
+    var oldFillers = grid.querySelectorAll(".filler");
+    for (var i = 0; i < oldFillers.length; i++) oldFillers[i].remove();
+    if (products.length === 0) return;
+
+    var cols = 1;
+    try {
+      var tpl = window.getComputedStyle(grid).getPropertyValue("grid-template-columns");
+      if (tpl) cols = tpl.trim().split(/\s+/).length;
+    } catch(e) {}
+
+    if (cols < 2) return;
+    var remainder = products.length % cols;
+    if (remainder === 0) return;
+
+    for (var j = 0; j < cols - remainder; j++) {
+      var cell = document.createElement("div");
+      cell.className = "filler";
+      cell.setAttribute("aria-hidden", "true");
+      grid.appendChild(cell);
+    }
+  }
+
+  var resizeTimer = null;
+  window.addEventListener("resize", function() {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(padGrid, 150);
+  });
+
+  renderProducts();
+
+  /* ---------- render posts/updates ---------- */
+  var postsSection = document.getElementById("posts");
+  var postList = document.getElementById("post-list");
+  var postCount = document.getElementById("post-count");
+
+  var posts = data.posts || [];
+  if (postsSection && postList && posts.length > 0) {
+    postsSection.style.display = "block";
+
+    var dtFormat;
+    try {
+      dtFormat = new Intl.DateTimeFormat("en-US", { year: "numeric", month: "short", day: "numeric" });
+    } catch(e) {
+      dtFormat = null;
+    }
+
+    posts.forEach(function(post) {
+      var item = document.createElement("a");
+      item.className = "post-item";
+      item.href = post.url || "#";
+
+      var title = document.createElement("span");
+      title.className = "post-title";
+      title.textContent = post.name || "Untitled Update";
+      item.appendChild(title);
+
+      var date = document.createElement("span");
+      date.className = "post-date";
+      if (post.published_at) {
+        var d = new Date(post.published_at);
+        date.textContent = (dtFormat && !isNaN(d)) ? dtFormat.format(d) : String(post.published_at).slice(0, 10);
+      } else {
+        date.textContent = "Recent";
+      }
+      item.appendChild(date);
+
+      postList.appendChild(item);
+    });
+
+    if (postCount) {
+      postCount.textContent = "(" + posts.length + ")";
+    }
+  }
+
+  /* ---------- tab router (store / eula / privacy) ---------- */
+  var storeView = document.getElementById("store-view");
+  var legalPages = { eula: document.getElementById("eula"), privacy: document.getElementById("privacy") };
+
+  function applyRoute() {
+    var h = String(location.hash || "").replace("#", "");
+    var isLegal = legalPages.hasOwnProperty(h) && legalPages[h];
+    if (storeView) storeView.style.display = isLegal ? "none" : "";
+    for (var key in legalPages) {
+      if (legalPages[key]) legalPages[key].style.display = (key === h) ? "block" : "none";
+    }
+    if (isLegal) window.scrollTo(0, 0);
+  }
+
+  window.addEventListener("hashchange", applyRoute);
+  applyRoute();
+
+  /* ---------- copyright year ---------- */
+  var yr = document.getElementById("year");
+  if (yr) yr.textContent = String(new Date().getFullYear());
+})();
+</script>
+</body>
+</html>
