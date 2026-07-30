@@ -16,7 +16,6 @@ class VisualizerOrb;
 class WaveformDisplayComponent;
 class TransportSectionComponent;
 class WaveformFooterComponent;
-class FxRackStrip;
 class StemRackComponent;
 class StartKnobComponent;
 class UpdateBannerComponent;
@@ -44,8 +43,6 @@ public:
 private:
     float getUiScale() const noexcept;
     int getUiFluidWidth() const noexcept;   // design-space width the layout fills
-    void setFxRackMinimized (bool shouldBeMinimized);
-    void updateFxRackResizeLimits();
 
     // Reveals the "new version available" banner from the update checker's
     // result. Idempotent: only builds/shows the banner once per session.
@@ -58,8 +55,6 @@ private:
 
     AudioPluginAudioProcessor& processorRef;
     std::unique_ptr<juce::PropertiesFile> uiSettingsFile;
-    bool fxRackMinimized = false;
-    int expandedEditorHeight = 0;
 
     juce::Component contentComponent;
 
@@ -68,7 +63,6 @@ private:
     std::unique_ptr<cue::WaveformDisplayComponent> waveformDisplayComponent;
     std::unique_ptr<cue::TransportSectionComponent> transportSectionComponent;
     std::unique_ptr<cue::WaveformFooterComponent> waveformFooterComponent;
-    std::unique_ptr<cue::FxRackStrip> fxRackStrip;
     std::unique_ptr<cue::StemRackComponent> stemRackComponent;
 
     std::unique_ptr<cue::HelpOverlayComponent> helpOverlayComponent;

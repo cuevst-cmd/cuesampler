@@ -1,7 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "VisualizerOrb.h"
-#include "CueFxRack/FxRackStrip.h"
 
 #include <BinaryData.h>
 
@@ -16,18 +15,7 @@ namespace
 // One continuous chassis: content spans the full design width inside a
 // slim 10px margin (the CUERACK kMargin), no side rails.
 constexpr int editorWidth = 1266;
-constexpr int editorHeight = 660; // the CORE design space (chassis + keyboard);
-                                  // the FX rack band below lays out in real
-                                  // window pixels and re-flows CUERACK-style.
-                                  // (Was 884 — the old right utility rail is
-                                  // dissolved, stems dock into the header, and
-                                  // the controls are condensed into two rows.)
-
-// Minimum height reserved for the FX rack band under the scaled core:
-// one row of panels at the rack's minimum usable height (240) + toolbar.
-constexpr int fxRackMinBand = 290;
-constexpr int fxRackMarginX = 10;
-constexpr int fxRackGapY    = 4;
+constexpr int editorHeight = 660; // chassis + keyboard
 constexpr float minEditorScale = 0.85f;
 constexpr float maxEditorScale = 1.5f;
 constexpr float defaultWaveformVerticalScale = 0.75f;
@@ -697,6 +685,22 @@ private:
     int   animHz = 60;
 };
 } // namespace
+
+static void showSampleLoadError (AudioPluginAudioProcessor::SampleLoadResult result,
+                                 juce::Component* associatedComponent)
+{
+    if (result != AudioPluginAudioProcessor::SampleLoadResult::fileTooLong)
+        return;
+
+    juce::AlertWindow::showMessageBoxAsync (
+        juce::AlertWindow::WarningIcon,
+        "Sample Too Long",
+        "CUE SAMPLER supports audio files up to "
+            + juce::String (AudioPluginAudioProcessor::maximumLoadedSampleMinutes)
+            + " minutes. This file is longer and was not loaded.",
+        "OK",
+        associatedComponent);
+}
 
 // --- Tactile keycaps ---------------------------------------------------------
 // Flat CUERACK button plates shared by all push buttons: warm charcoal fill,
@@ -2110,7 +2114,7 @@ public:
     {
         isDragOver = false;
         if (! files.isEmpty())
-            processor.loadAudioFile (juce::File (files[0]));
+            showSampleLoadError (processor.loadAudioFile (juce::File (files[0])), this);
     }
 
     void mouseMove (const juce::MouseEvent& event) override
@@ -6094,7 +6098,6 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     : AudioProcessorEditor (&p), processorRef (p)
 {
     uiSettingsFile = std::make_unique<juce::PropertiesFile> (cue::uiSettingsOptions());
-    fxRackMinimized = uiSettingsFile->getBoolValue ("fxRackMinimized", false);
 
     processorRef.sampleChangeBroadcaster.addChangeListener (this);
     processorRef.editChangeBroadcaster.addChangeListener (this);
@@ -6112,25 +6115,6 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     waveformDisplayComponent = std::make_unique<cue::WaveformDisplayComponent> (processorRef);
     transportSectionComponent = std::make_unique<cue::TransportSectionComponent> (processorRef);
     waveformFooterComponent = std::make_unique<cue::WaveformFooterComponent>();
-    {
-        // Mini CUE RACK: panels attach straight to the processor's APVTS;
-        // live meters route through the FX engine. Theme the rack subtree
-        // to match the sampler before any panel paints.
-        cue::FxRackStrip::applyRackTheme (cue::isLight());
-
-        cue::FxRackMeterHooks hooks;
-        hooks.compGainReductionDb = [this] { return processorRef.getFxCompGainReductionDb(); };
-        hooks.limiterNumBands     = [this] { return processorRef.getFxLimiterNumBands(); };
-        hooks.limiterBandGRDb     = [this] (int band) { return processorRef.getFxLimiterBandGRDb (band); };
-        hooks.imagerMidSide       = [this] { return processorRef.getFxImagerMidSide(); };
-        fxRackStrip = std::make_unique<cue::FxRackStrip> (processorRef.apvts, hooks);
-        fxRackStrip->setMinimized (fxRackMinimized);
-        fxRackStrip->onMinimizedChanged = [this] (bool minimized)
-        {
-            setFxRackMinimized (minimized);
-        };
-        addAndMakeVisible (*fxRackStrip);   // editor-level: lays out in window pixels
-    }
     stemRackComponent = std::make_unique<cue::StemRackComponent> (processorRef);
 
     // Measure the real display refresh rate from the vblank so animations run
@@ -6250,10 +6234,9 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     midiKeyboardComponent = std::make_unique<cue::GlassKeyboard> (processorRef.keyboardState);
     contentComponent.addAndMakeVisible (*midiKeyboardComponent);
 
-    // The CUE orb — CUERACK's GL-raymarched orb — sits beside the header's
-    // wordmark as an editor-level sibling (its GL layer composites above the
-    // buffered header, which stays static).
-    cueOrbComponent = std::make_unique<cue::VisualizerOrb> (processorRef.apvts);
+    // The audio-reactive CUE orb sits beside the header wordmark as an
+    // editor-level sibling above the buffered header.
+    cueOrbComponent = std::make_unique<cue::VisualizerOrb>();
     cueOrbComponent->setBackgroundColour (cue::shellDark);
     contentComponent.addAndMakeVisible (*cueOrbComponent);
 
@@ -6318,13 +6301,13 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     addChildComponent (*updateBannerComponent); // invisible by default
 
     setOpaque (true);
-    // CUERACK-style smart resize: free-form (no aspect lock) — drag any edge
-    // or corner; the whole chassis re-scales and the FX rack re-flows.
-    updateFxRackResizeLimits();
+    // Free-form resize with one uniform chassis scale.
+    setResizeLimits (juce::roundToInt ((float) cue::editorWidth * cue::minEditorScale),
+                     juce::roundToInt ((float) cue::editorHeight * cue::minEditorScale),
+                     3400,
+                     juce::roundToInt ((float) cue::editorHeight * cue::maxEditorScale));
     setResizable (true, true);
-    setSize (cue::editorWidth,
-             cue::editorHeight + (fxRackMinimized ? cue::FxRackStrip::minimizedHeight
-                                                   : cue::fxRackMinBand));
+    setSize (cue::editorWidth, cue::editorHeight);
     transportSectionComponent->refreshDisplays();
     startTimerHz (30);
 
@@ -6354,13 +6337,9 @@ void AudioPluginAudioProcessorEditor::timerCallback()
     if (! cue::shouldRunRealtimeUi (*this))
         return;
 
-    // Feed the CUE orb: output level with the same sqrt mapping CUERACK
-    // uses, plus the states that shape and colour it.
+    // Feed the CUE orb from the sampler output and transport state.
     if (cueOrbComponent != nullptr)
     {
-        // Output level with the rack's sqrt mapping; the FX fingerprint
-        // arrives via the orb's own APVTS listeners. Transport HALF TIME
-        // drives the ice palette.
         const auto peak = juce::jlimit (0.0f, 1.0f, processorRef.getOutputMeterLevel());
         cueOrbComponent->setLevel (std::sqrt (peak));
         cueOrbComponent->setHalfTimeActive (processorRef.getHalfTimeEnabled());
@@ -6388,60 +6367,11 @@ void AudioPluginAudioProcessorEditor::showUpdateBannerIfNeeded()
 
 float AudioPluginAudioProcessorEditor::getUiScale() const noexcept
 {
-    // Fully free-form resize, CUERACK-style, with one uniform zoom:
-    //  - HEIGHT sets the zoom (clamped so the design width always fits);
-    //    extra height beyond the core flows into the FX rack band.
-    //  - WIDTH beyond the zoomed design width STRETCHES the content in
-    //    design units (see getUiFluidWidth): the waveform column, keyboard,
-    //    and rack row all widen, so every drag direction does real work.
+    // Use one uniform zoom while allowing extra width to expand the waveform
+    // and keyboard in design space.
     const auto widthScale  = (float) getWidth() / (float) cue::editorWidth;
-    const auto rackHeight = fxRackMinimized ? cue::FxRackStrip::minimizedHeight
-                                            : cue::fxRackMinBand;
-    const auto heightScale = (float) getHeight() / (float) (cue::editorHeight + rackHeight);
+    const auto heightScale = (float) getHeight() / (float) cue::editorHeight;
     return juce::jlimit (cue::minEditorScale, cue::maxEditorScale, juce::jmin (widthScale, heightScale));
-}
-
-void AudioPluginAudioProcessorEditor::updateFxRackResizeLimits()
-{
-    const auto minimumDesignHeight = cue::editorHeight
-                                   + (fxRackMinimized ? cue::FxRackStrip::minimizedHeight
-                                                      : cue::fxRackMinBand);
-    const auto maximumDesignHeight = fxRackMinimized ? minimumDesignHeight
-                                                     : cue::editorHeight + 900;
-    setResizeLimits (juce::roundToInt ((float) cue::editorWidth * cue::minEditorScale),
-                     juce::roundToInt ((float) minimumDesignHeight * cue::minEditorScale),
-                     3400,
-                     juce::roundToInt ((float) maximumDesignHeight * cue::maxEditorScale));
-}
-
-void AudioPluginAudioProcessorEditor::setFxRackMinimized (bool shouldBeMinimized)
-{
-    if (fxRackMinimized == shouldBeMinimized)
-        return;
-
-    const auto previousRackHeight = fxRackMinimized ? cue::FxRackStrip::minimizedHeight
-                                                     : cue::fxRackMinBand;
-    const auto previousHeightScale = (float) getHeight()
-                                   / (float) (cue::editorHeight + previousRackHeight);
-    const auto currentScale = juce::jlimit (cue::minEditorScale, cue::maxEditorScale,
-                                            juce::jmin ((float) getWidth() / (float) cue::editorWidth,
-                                                        previousHeightScale));
-
-    if (shouldBeMinimized)
-        expandedEditorHeight = getHeight();
-
-    fxRackMinimized = shouldBeMinimized;
-    uiSettingsFile->setValue ("fxRackMinimized", fxRackMinimized);
-    updateFxRackResizeLimits();
-
-    const auto newRackHeight = fxRackMinimized ? cue::FxRackStrip::minimizedHeight
-                                                : cue::fxRackMinBand;
-    const auto scaledDefaultHeight = juce::roundToInt (
-        (float) (cue::editorHeight + newRackHeight) * currentScale);
-    const auto targetHeight = ! fxRackMinimized && expandedEditorHeight > 0
-                            ? expandedEditorHeight
-                            : scaledDefaultHeight;
-    setSize (getWidth(), targetHeight);
 }
 
 int AudioPluginAudioProcessorEditor::getUiFluidWidth() const noexcept
@@ -6464,7 +6394,7 @@ void AudioPluginAudioProcessorEditor::loadSampleFromFile()
     {
         auto file = fc.getResult();
         if (file.existsAsFile())
-            processorRef.loadAudioFile (file);
+            cue::showSampleLoadError (processorRef.loadAudioFile (file), this);
     });
 }
 
@@ -6561,21 +6491,6 @@ void AudioPluginAudioProcessorEditor::resized()
     contentComponent.setTransform (juce::AffineTransform::scale (scale));
     contentComponent.setBounds (0, 0, fluidW, cue::editorHeight);
 
-    // The FX rack band shares the exact same transform as the core, sitting
-    // flush beneath it: one surface, one zoom. All leftover window height
-    // (in design units) flows into the band, which re-flows CUERACK-style —
-    // taller window = taller panels, tall enough = the rack's two-row split.
-    if (fxRackStrip != nullptr)
-    {
-        const auto bandDesignH = fxRackMinimized
-            ? cue::FxRackStrip::minimizedHeight
-            : juce::jmax (cue::fxRackMinBand,
-                          juce::roundToInt ((float) getHeight() / scale) - cue::editorHeight);
-        fxRackStrip->setTransform (juce::AffineTransform::scale (scale)
-                                       .translated (0.0f, (float) cue::editorHeight * scale));
-        fxRackStrip->setBounds (0, 0, fluidW, bandDesignH);
-    }
-
     headerComponent->setBounds (10, 16, fluidW - 20, 64);
 
     // Treat the header as three non-overlapping zones: brand/orb/version,
@@ -6651,12 +6566,6 @@ void AudioPluginAudioProcessorEditor::applyThemeToUi()
     headerComponent->refreshColours();
     transportSectionComponent->refreshColours();
     waveformFooterComponent->refreshColours();
-
-    // The FX rack subtree runs CUERACK's own foundation palette; swap it in
-    // lockstep, then re-skin its panels and toolbar.
-    cue::FxRackStrip::applyRackTheme (cue::isLight(), cue::isWarpModeActive, cue::isHalfTimeActive);
-    if (fxRackStrip != nullptr)
-        fxRackStrip->refreshColours();
 
     if (cueOrbComponent != nullptr)
         cueOrbComponent->setBackgroundColour (cue::shellDark);

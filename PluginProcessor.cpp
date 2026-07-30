@@ -87,7 +87,6 @@ namespace
 constexpr double tempoAnalysisTargetRate = 200.0;
 constexpr double maximumTempoAnalysisSeconds = 120.0;
 constexpr int maximumLoadedChannels = 2;
-constexpr int maximumLoadedSampleFrames = 44100 * 60 * 10;
 constexpr size_t maximumEmbeddedSampleBytes = 128ull * 1024ull * 1024ull;
 constexpr int maximumRestoredSequenceItems = 4096;
 constexpr int maximumRestoredChops = 256;
@@ -276,6 +275,16 @@ double getTempoPreferenceWeight (double bpm) noexcept
     return juce::jmap (bpm, preferredTempoHigh, maximumTempoBpm, 1.0, 0.86);
 }
 
+bool isReaderTooLong (const juce::AudioFormatReader& reader) noexcept
+{
+    if (! std::isfinite (reader.sampleRate) || reader.sampleRate <= 0.0 || reader.lengthInSamples <= 0)
+        return false;
+
+    constexpr double maximumDurationSeconds =
+        static_cast<double> (AudioPluginAudioProcessor::maximumLoadedSampleMinutes) * 60.0;
+    return static_cast<double> (reader.lengthInSamples) > reader.sampleRate * maximumDurationSeconds;
+}
+
 bool isSupportedReaderShape (const juce::AudioFormatReader& reader) noexcept
 {
     return std::isfinite (reader.sampleRate)
@@ -284,7 +293,7 @@ bool isSupportedReaderShape (const juce::AudioFormatReader& reader) noexcept
         && reader.numChannels > 0
         && reader.numChannels <= (unsigned int) maximumLoadedChannels
         && reader.lengthInSamples > 0
-        && reader.lengthInSamples <= (juce::int64) maximumLoadedSampleFrames;
+        && ! isReaderTooLong (reader);
 }
 
 std::shared_ptr<AudioPluginAudioProcessor::LoadedSampleData>
@@ -2412,15 +2421,10 @@ void AudioPluginAudioProcessor::changeProgramName (int index, const juce::String
 //==============================================================================
 void AudioPluginAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    juce::ignoreUnused (samplesPerBlock);
     hostSampleRate.store (sampleRate, std::memory_order_release);
     outputMeterLevel.store (0.0f, std::memory_order_release);
-
-    const auto compChannels = juce::jmax (1, getTotalNumOutputChannels());
-
-    // CUE FX rack chain. The limiter's lookahead delay runs even when the
-    // module is bypassed, so the reported latency stays constant.
-    fxEngine.prepare (sampleRate, juce::jmax (1, samplesPerBlock), compChannels);
-    setLatencySamples (fxEngine.getLatencySamples());
+    setLatencySamples (0);
 
     voice.reset();
 
@@ -3176,13 +3180,6 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     playbackActive.store (voice.playbackActive, std::memory_order_release);
     playbackSamplePosition.store (voice.playbackSamplePosition, std::memory_order_release);
 
-    // CUE FX rack: CUERACK's master chain (EQ > COMP > CRUSH > AMP > mod trio
-    // > TAPE DELAY > REVERB > IMAGER > LIMITER).
-    {
-        const auto rackBpm = hostBpm.load (std::memory_order_acquire);
-        fxEngine.process (buffer, rackBpm > 0.0 ? rackBpm : 120.0);
-    }
-
     float blockPeak = 0.0f;
     for (int ch = 0; ch < totalNumOutputChannels; ++ch)
     {
@@ -3370,10 +3367,6 @@ void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData
         state.addChild (chopStateTree, -1, nullptr);
     }
 
-    // CUE FX rack: parameters + rack arrangement nest inside the session
-    // state as the APVTS tree ("PARAMS").
-    state.addChild (apvts.copyState(), -1, nullptr);
-
     juce::MemoryOutputStream output (destData, false);
     output.write (cueSamplerStateMagic, 4);
     state.writeToStream (output);
@@ -3405,11 +3398,6 @@ void AudioPluginAudioProcessor::setStateInformation (const void* data, int sizeI
 
     if (! state.isValid() || ! state.hasType ("CueSamplerState"))
         return;
-
-    // CUE FX rack: restore the nested APVTS tree (parameters + rack
-    // arrangement) first — it applies even when no sample state follows.
-    if (const auto fxState = state.getChildWithName (apvts.state.getType()); fxState.isValid())
-        apvts.replaceState (fxState.createCopy());
 
     const auto restoreState = parseDeferredRestoreState (state);
     if (! restoreState.hasExplicitSampleState)
@@ -3803,14 +3791,25 @@ juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 }
 
 std::shared_ptr<AudioPluginAudioProcessor::LoadedSampleData>
-AudioPluginAudioProcessor::createLoadedSampleDataFromFile (const juce::File& file)
+AudioPluginAudioProcessor::createLoadedSampleDataFromFile (const juce::File& file,
+                                                           SampleLoadResult* loadResult)
 {
+    if (loadResult != nullptr)
+        *loadResult = SampleLoadResult::failed;
+
     juce::AudioFormatManager localFormatManager;
     localFormatManager.registerBasicFormats();
 
     auto reader = std::unique_ptr<juce::AudioFormatReader> (localFormatManager.createReaderFor (file));
     if (reader == nullptr)
         return {};
+
+    if (isReaderTooLong (*reader))
+    {
+        if (loadResult != nullptr)
+            *loadResult = SampleLoadResult::fileTooLong;
+        return {};
+    }
 
     auto sampleData = readValidatedSampleData (*reader);
     if (sampleData == nullptr)
@@ -3822,6 +3821,9 @@ AudioPluginAudioProcessor::createLoadedSampleDataFromFile (const juce::File& fil
     sampleData->leadingContentStartSample = findLeadingContentStartSample (*sampleData, 0,
                                                                            sampleData->buffer.getNumSamples());
     serializeSampleToStateData (*sampleData, sampleData->serializedStateData);
+
+    if (loadResult != nullptr)
+        *loadResult = SampleLoadResult::loaded;
     return sampleData;
 }
 
@@ -3925,8 +3927,14 @@ AudioPluginAudioProcessor::createLoadedSampleDataFromStateData (const juce::Memo
     return sampleData;
 }
 
-void AudioPluginAudioProcessor::loadAudioFile (const juce::File& file)
+AudioPluginAudioProcessor::SampleLoadResult
+AudioPluginAudioProcessor::loadAudioFile (const juce::File& file)
 {
+    auto loadResult = SampleLoadResult::failed;
+    auto sampleData = createLoadedSampleDataFromFile (file, &loadResult);
+    if (sampleData == nullptr)
+        return loadResult;
+
     restoreGeneration.fetch_add (1, std::memory_order_acq_rel);
     restoreThreadPool.removeAllJobs (false, 0);
 
@@ -3935,7 +3943,6 @@ void AudioPluginAudioProcessor::loadAudioFile (const juce::File& file)
     chopAudioCache.clear();
     warpRenderGeneration.fetch_add (1, std::memory_order_acq_rel);
 
-    if (auto sampleData = createLoadedSampleDataFromFile (file); sampleData != nullptr)
     {
         // Sample rate may have changed, so publish matching engines before
         // exposing the new sample to the audio thread.
@@ -3984,6 +3991,8 @@ void AudioPluginAudioProcessor::loadAudioFile (const juce::File& file)
         sampleChangeBroadcaster.sendChangeMessage();
         requestHostStateSync();
     }
+
+    return SampleLoadResult::loaded;
 }
 
 std::shared_ptr<const AudioPluginAudioProcessor::LoadedSampleData> AudioPluginAudioProcessor::getLoadedSample() const

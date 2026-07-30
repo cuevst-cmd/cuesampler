@@ -9,7 +9,6 @@
 #include "KeyDetector.h"
 #include "ChopAudioCache.h"
 #include "WarpMap.h"
-#include "CueFxRack/FxEngine.h"
 
 #include <atomic>
 #include <memory>
@@ -31,6 +30,15 @@ public:
         int leadingContentStartSample = 0;
         juce::MemoryBlock serializedStateData;
     };
+
+    enum class SampleLoadResult
+    {
+        loaded,
+        fileTooLong,
+        failed
+    };
+
+    static constexpr int maximumLoadedSampleMinutes = 15;
 
     // Result of HTDemucs-FT separation for the current sample. Holds the three
     // stems we mute against plus a pointer to the PRISTINE source sample they
@@ -123,7 +131,7 @@ public:
 
     //==============================================================================
     // Sample loading
-    void loadAudioFile (const juce::File& file);
+    SampleLoadResult loadAudioFile (const juce::File& file);
     std::shared_ptr<const LoadedSampleData> getLoadedSample() const;
 
     void startPlayback() noexcept;
@@ -167,17 +175,6 @@ public:
     // chops are then rebuilt against this new grid.
     void  resizeChopBoundary (int chopId, int newStartSample, int newEndSample);
     void  setChopBounds (int chopId, int newStartSample, int newEndSample);
-
-    //==============================================================================
-    // CUE FX rack — CUERACK's master chain, ported (see CueFxRack/FxEngine.h).
-    // Parameters live in an APVTS whose state nests inside the sampler's
-    // session state; the editor's rack strip attaches its panels directly.
-    juce::AudioProcessorValueTreeState apvts { *this, nullptr, "PARAMS", cue::createParameterLayout() };
-
-    float getFxCompGainReductionDb() const        { return fxEngine.getCompGainReductionDb(); }
-    int   getFxLimiterNumBands() const            { return fxEngine.getLimiterNumBands(); }
-    float getFxLimiterBandGRDb (int band) const   { return fxEngine.getLimiterBandGRDb (band); }
-    juce::Point<float> getFxImagerMidSide() const { return { fxEngine.getMidLevel(), fxEngine.getSideLevel() }; }
 
     bool isPlaying() const noexcept;
     double getPlaybackSamplePosition() const noexcept;
@@ -599,9 +596,6 @@ private:
     std::atomic<float> waveformZoom { 0.25f };
     std::atomic<float> waveformScroll { 0.0f };
 
-    // CUERACK master chain (post sample/stem mix).
-    cue::FxEngine fxEngine { apvts };
-
     // (Re)build the per-voice Bungee stretcher/stream pair so it matches the
     // currently known source sample rate, host sample rate, and channel
     // count. No-op when nothing has changed. Always called from the message
@@ -638,7 +632,9 @@ private:
     bool serializeSampleToStateData (const LoadedSampleData& sampleData, juce::MemoryBlock& stateData) const;
     std::shared_ptr<LoadedSampleData> createLoadedSampleDataFromStateData (const juce::MemoryBlock& stateData,
                                                                            const juce::String& fileName);
-    std::shared_ptr<LoadedSampleData> createLoadedSampleDataFromFile (const juce::File& file);
+    std::shared_ptr<LoadedSampleData> createLoadedSampleDataFromFile (
+        const juce::File& file,
+        SampleLoadResult* loadResult = nullptr);
     KeyDetector::Result tryReadKeyFromMetadata (const juce::File& file);
     bool computeGridTimingMetrics (const TempoAnalysisData& analysis,
                                    double& beatPeriodSeconds,

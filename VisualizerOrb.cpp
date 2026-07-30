@@ -1,5 +1,4 @@
 #include "VisualizerOrb.h"
-#include "CueFxRack/Parameters.h"
 
 namespace cue
 {
@@ -267,13 +266,10 @@ static const char* kFragmentShader = R"(
 )";
 
 //==============================================================================
-VisualizerOrb::VisualizerOrb (juce::AudioProcessorValueTreeState& state)
-    : apvts (state)
+VisualizerOrb::VisualizerOrb()
 {
     setInterceptsMouseClicks (false, false);
     setOpaque (true);
-
-    cacheParameterPointers();
 
     lastFrameMs = juce::Time::getMillisecondCounterHiRes();
 
@@ -329,9 +325,6 @@ VisualizerOrb::~VisualizerOrb()
         observedTopLevel->removeComponentListener (this);
 
     context.detach();
-
-    for (const auto& id : listenedIDs)
-        apvts.removeParameterListener (id, this);
 }
 
 void VisualizerOrb::setLevel (float newLevel)
@@ -352,59 +345,6 @@ void VisualizerOrb::setHalfTimeActive (bool active)
 void VisualizerOrb::setBackgroundColour (juce::Colour backdrop)
 {
     bgArgb.store (backdrop.getARGB());
-}
-
-//==============================================================================
-void VisualizerOrb::cacheParameterPointers()
-{
-    static const char* ids[] = {
-        pid::eqOn, pid::eqB1Freq, pid::eqB1Gain, pid::eqB2Freq, pid::eqB2Gain,
-        pid::eqB3Freq, pid::eqB3Gain, pid::eqB4Freq, pid::eqB4Gain,
-        pid::eqLfShelf, pid::eqHfShelf,
-        pid::compOn, pid::compThresh, pid::compRatio, pid::compAttack, pid::compRelease,
-        pid::compKnee, pid::compThrust, pid::compType, pid::compMakeup, pid::compMix,
-        pid::limOn, pid::limGain, pid::limCeiling, pid::limRelease,
-        pid::revOn, pid::revSize, pid::revDecay, pid::revDamp, pid::revPredelay,
-        pid::revWidth, pid::revMix,
-        pid::dlyOn, pid::dlyTime, pid::dlySync, pid::dlyDiv, pid::dlyFeedback,
-        pid::dlyTone, pid::dlyPingPong, pid::dlyMix,
-        pid::crushOn, pid::crushBits, pid::crushRate, pid::crushDrive, pid::crushMix,
-        pid::imgOn, pid::imgWidth, pid::imgBassMono, pid::imgXover,
-        pid::htOn, pid::htMix,
-        pid::masterIn, pid::masterOut };
-
-    for (auto* id : ids)
-    {
-        if (auto* raw = apvts.getRawParameterValue (id))
-        {
-            params[id] = raw;
-            apvts.addParameterListener (id, this);
-            listenedIDs.add (id);
-        }
-    }
-}
-
-float VisualizerOrb::raw (const char* paramID) const
-{
-    const auto it = params.find (paramID);
-    return it != params.end() ? it->second->load() : 0.0f;
-}
-
-int VisualizerOrb::moduleIndexForParam (const juce::String& id)
-{
-    if (id.startsWith ("eq_"))     return 0;
-    if (id.startsWith ("comp_"))   return 1;
-    if (id.startsWith ("lim_"))    return 2;
-    if (id.startsWith ("rev_"))    return 3;
-    if (id.startsWith ("dly_"))    return 4;
-    if (id.startsWith ("crush_"))  return 5;
-    if (id.startsWith ("img_"))    return 6;
-    return 7;                                    // master
-}
-
-void VisualizerOrb::parameterChanged (const juce::String& parameterID, float)
-{
-    editCount[moduleIndexForParam (parameterID)].fetch_add (1);   // RT-safe
 }
 
 //==============================================================================
@@ -505,64 +445,21 @@ void VisualizerOrb::renderOpenGL()
         ripStrength[m]     = rippleStrength[m];
     }
 
-    // --- fingerprint: normalize every parameter --------------------------
-    auto n01 = [] (float v, float lo, float hi) { return juce::jlimit (0.0f, 1.0f, (v - lo) / (hi - lo)); };
-
-    const auto eq1 = raw (pid::eqB1Gain) / 12.0f, eq2 = raw (pid::eqB2Gain) / 12.0f;
-    const auto eq3 = raw (pid::eqB3Gain) / 12.0f, eq4 = raw (pid::eqB4Gain) / 12.0f;
-    const auto ef1 = raw (pid::eqB1Freq) / 6.0f,  ef2 = raw (pid::eqB2Freq) / 6.0f;
-    const auto ef3 = raw (pid::eqB3Freq) / 6.0f,  ef4 = raw (pid::eqB4Freq) / 6.0f;
-
-    const auto compSquash = 0.5f * n01 (raw (pid::compRatio), 0.0f, 5.0f)
-                          + 0.5f * n01 (-raw (pid::compThresh), -10.0f, 40.0f);
-    const auto compAtk    = raw (pid::compAttack) / 6.0f;
-    const auto thrust     = raw (pid::compThrust) / 2.0f;
-    const auto oldMode    = raw (pid::compType);
-
-    const auto limDrive   = n01 (raw (pid::limGain), 0.0f, 24.0f);
-    const auto limCeil    = juce::jlimit (0.0f, 1.0f, 0.45f * limDrive + 0.75f * n01 (-raw (pid::limCeiling), 0.0f, 20.0f));
-    const auto limRel     = n01 (raw (pid::limRelease), 1.0f, 1000.0f);
-
-    // ---- personality: the patch shapes the orb's temperament ------------
-    const auto onEq    = raw (pid::eqOn);
-    const auto onComp  = raw (pid::compOn);
-    const auto onDly   = raw (pid::dlyOn);
-    const auto onCrush = raw (pid::crushOn);
-
-    // spectral tilt: bass boosts make it heavy and slow, treble makes it quick
-    const auto eqTilt    = onEq * 0.5f * ((eq3 + eq4) - (eq1 + eq2));
-    const auto heaviness = juce::jlimit (-1.0f, 1.0f, -eqTilt);
-    const auto bitsAmt   = (16.0f - raw (pid::crushBits)) / 15.0f;
-    const auto crushAmt  = onCrush * raw (pid::crushMix) * 0.01f * (0.3f + 0.7f * bitsAmt);
-    const auto agitation = juce::jlimit (0.0f, 1.5f,
-                               0.6f * juce::jmax (0.0f, eqTilt) + 0.7f * crushAmt + 0.3f * level);
-    const auto tension   = juce::jlimit (0.0f, 1.0f, onComp * compSquash);   // comp disciplines it
-
-    // clocks pace themselves to temperament
+    // With the rack removed, the orb's temperament is driven only by the
+    // sampler output level.
+    constexpr auto heaviness = 0.0f;
+    const auto agitation = 0.3f * level;
     animTime += dt * (1.0f + 0.6f * level) * (1.0f + 0.30f * agitation)
-                   * (1.0f - 0.25f * juce::jmax (0.0f, heaviness));
+                   * (1.0f - 0.25f * heaviness);
     spin     += dt * 0.35f * (1.0f + 0.55f * agitation)
-                   * (1.0f - 0.40f * juce::jmax (0.0f, heaviness));
+                   * (1.0f - 0.40f * heaviness);
 
     // orb stays locked to centre; motion is expressed in rotation/deformation
     const auto cx = 0.0f, cy = 0.0f;
-    juce::ignoreUnused (tension);
-
-    // delay ghosts circle the stationary orb; time sets the period
-    const auto dlyAmt   = onDly * raw (pid::dlyMix) * 0.01f * (0.3f + 0.7f * raw (pid::dlyFeedback) / 95.0f);
-    const auto orbitSec = juce::jlimit (0.25f, 3.0f, raw (pid::dlyTime) * 0.001f * 2.0f);
-    orbitPhase += dt * juce::MathConstants<float>::twoPi / orbitSec;
-
-    const auto ghostAX = 0.34f * std::cos (orbitPhase);
-    const auto ghostAY = 0.24f * std::sin (orbitPhase);
-    const auto ghostBX = 0.46f * std::cos (orbitPhase + juce::MathConstants<float>::pi);
-    const auto ghostBY = 0.30f * std::sin (orbitPhase + juce::MathConstants<float>::pi);
-    const auto ghostAlpha = dlyAmt * 0.85f;
-
-    const auto orbRadius = 0.60f * (0.78f + 0.44f * n01 (raw (pid::masterIn), -24.0f, 24.0f));
+    constexpr auto orbRadius = 0.60f;
 
     // HALFTIME freezes the orb's colour to ice blue (smoothly)
-    const auto paletteTarget = (raw (pid::htOn) > 0.5f || externalHalfTime.load() > 0.5f) ? 1.0f : 0.0f;
+    const auto paletteTarget = externalHalfTime.load() > 0.5f ? 1.0f : 0.0f;
     paletteBlend += (paletteTarget - paletteBlend) * juce::jmin (1.0f, 5.0f * dt);
 
     shader->use();
@@ -585,27 +482,22 @@ void VisualizerOrb::renderOpenGL()
     set1 ("uRadius", orbRadius);
     set4 ("uCenter", cx, cy, 0.0f, 0.0f);
     set4 ("uLife", heaviness, agitation, 0.0f, 0.0f);
-    set4 ("uGhostA", ghostAX, ghostAY, 0.10f, ghostAlpha);
-    set4 ("uGhostB", ghostBX, ghostBY, 0.20f, ghostAlpha * 0.7f);
+    set4 ("uGhostA", 0.0f, 0.0f, 0.0f, 0.0f);
+    set4 ("uGhostB", 0.0f, 0.0f, 0.0f, 0.0f);
     set1 ("uPalette", paletteBlend);
     set4 ("uBg", backdrop.getFloatRed(), backdrop.getFloatGreen(), backdrop.getFloatBlue(), 1.0f);
 
-    set4 ("uEQ",  eq1, eq2, eq3, eq4);
-    set4 ("uEQF", ef1, ef2, ef3, ef4);
-    set4 ("uComp", compSquash, compAtk, thrust, oldMode);
-    set4 ("uLim",  limDrive, limCeil, limRel, 0.0f);
-    set4 ("uVerb", raw (pid::revMix) / 100.0f, raw (pid::revSize) / 100.0f,
-                   n01 (raw (pid::revDecay), 0.1f, 15.0f), raw (pid::revDamp) / 100.0f);
-    set4 ("uDly",  raw (pid::dlyMix) / 100.0f, n01 (raw (pid::dlyTime), 1.0f, 2000.0f),
-                   raw (pid::dlyFeedback) / 95.0f, raw (pid::dlyPingPong));
-    set4 ("uCrush", (16.0f - raw (pid::crushBits)) / 15.0f, n01 (raw (pid::crushRate), 1.0f, 50.0f),
-                    raw (pid::crushMix) / 100.0f, 0.0f);
-    set4 ("uImg",  raw (pid::imgWidth) / 100.0f, n01 (raw (pid::imgXover), 60.0f, 500.0f),
-                   raw (pid::imgBassMono), 0.0f);
-    set4 ("uMaster", n01 (raw (pid::masterIn), -24.0f, 24.0f),
-                     n01 (raw (pid::masterOut), -24.0f, 24.0f), 0.0f, 0.0f);
-    set4 ("uOn1", raw (pid::eqOn), raw (pid::compOn), raw (pid::limOn), raw (pid::revOn));
-    set4 ("uOn2", raw (pid::dlyOn), raw (pid::crushOn), raw (pid::imgOn), 1.0f);
+    set4 ("uEQ", 0.0f, 0.0f, 0.0f, 0.0f);
+    set4 ("uEQF", 0.12f, 0.36f, 0.64f, 0.90f);
+    set4 ("uComp", 0.0f, 0.0f, 0.0f, 0.0f);
+    set4 ("uLim", 0.0f, 0.0f, 0.0f, 0.0f);
+    set4 ("uVerb", 0.0f, 0.0f, 0.0f, 0.0f);
+    set4 ("uDly", 0.0f, 0.0f, 0.0f, 0.0f);
+    set4 ("uCrush", 0.0f, 0.0f, 0.0f, 0.0f);
+    set4 ("uImg", 1.0f, 0.0f, 0.0f, 0.0f);
+    set4 ("uMaster", 0.5f, 0.5f, 0.0f, 0.0f);
+    set4 ("uOn1", 0.0f, 0.0f, 0.0f, 0.0f);
+    set4 ("uOn2", 0.0f, 0.0f, 0.0f, 0.0f);
 
     if (auto loc = glGetUniformLocation (shader->getProgramID(), "uRip"); loc >= 0)
         glUniform4fv (loc, numModules, ripData);

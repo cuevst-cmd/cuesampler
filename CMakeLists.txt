@@ -182,10 +182,6 @@ target_sources(CueSampler
         BeatThisAnalyzer.cpp
         StemSeparator.cpp
         VisualizerOrb.cpp
-        CueFxRack/FxRackStrip.cpp
-        CueFxRack/UI/CueLookAndFeel.cpp
-        CueFxRack/UI/ModulePanel.cpp
-        CueFxRack/UI/RackToolbar.cpp
         WarpMap.cpp
         ChopAudioCache.cpp)
 
@@ -199,7 +195,7 @@ target_sources(CueSampler
 target_compile_definitions(CueSampler
     PUBLIC
         # JUCE_WEB_BROWSER and JUCE_USE_CURL would be on by default, but you might not need them.
-        JUCE_WEB_BROWSER=0  # If you remove this, add `NEEDS_WEB_BROWSER TRUE` to the `juce_add_plugin` call
+        JUCE_WEB_BROWSER=0
         JUCE_USE_CURL=0     # If you remove this, add `NEEDS_CURL TRUE` to the `juce_add_plugin` call
         JUCE_VST3_CAN_REPLACE_VST2=0
         # Running version for the in-app update checker (compared against the
@@ -242,7 +238,6 @@ target_link_libraries(CueSampler
 
 target_include_directories(CueSampler
     PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/CueFxRack"
         "${bungee_SOURCE_DIR}"
         "${bungee_SOURCE_DIR}/submodules/eigen"
         "${ORT_INCLUDE_DIR}")
