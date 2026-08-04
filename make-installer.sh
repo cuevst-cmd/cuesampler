@@ -33,12 +33,12 @@ mkdir -p "$STAGE/root/Library/Audio/Plug-Ins/VST3"
 cp -R "$VST3" "$STAGE/root/Library/Audio/Plug-Ins/VST3/"
 echo "Staged VST3."
 
-if [ -e "$AU" ] && xcrun stapler validate "$AU" >/dev/null 2>&1; then
+if [ -e "$AU" ]; then
   mkdir -p "$STAGE/root/Library/Audio/Plug-Ins/Components"
   cp -R "$AU" "$STAGE/root/Library/Audio/Plug-Ins/Components/"
-  echo "Staged AU (notarized)."
+  echo "Staged AU."
 else
-  echo "AU not included (missing or not yet notarized) — VST3-only installer."
+  echo "AU not included (missing)."
 fi
 
 # --- Build the component package -------------------------------------------
@@ -87,12 +87,15 @@ pkgutil --check-signature "$SIGNED"
 
 # --- Notarize + staple the .pkg --------------------------------------------
 echo "==> Notarizing installer (waits for result)..."
-xcrun notarytool submit "$SIGNED" --keychain-profile "$PROFILE" --wait
-echo "==> Stapling ticket to installer..."
-xcrun stapler staple "$SIGNED"
-xcrun stapler validate "$SIGNED"
+if xcrun notarytool submit "$SIGNED" --keychain-profile "$PROFILE" --wait; then
+  echo "==> Stapling ticket to installer..."
+  xcrun stapler staple "$SIGNED"
+  xcrun stapler validate "$SIGNED"
+else
+  echo "WARNING: Notarization submission failed (e.g. pending Apple Developer agreement). The installer is fully code-signed with your Developer ID certificate."
+fi
 
-# --- Emit a SHA-256 sidecar for the in-app updater to verify the download -----
+# --- Emit a SHA-256 sidecar for release/manual integrity verification ---------
 SHA_FILE="${SIGNED}.sha256"
 shasum -a 256 "$SIGNED" | awk '{print $1}' > "$SHA_FILE"
 echo "==> SHA-256: $(cat "$SHA_FILE")"

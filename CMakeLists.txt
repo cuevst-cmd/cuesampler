@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.22)
 # `project()` command. `project()` sets up some helpful variables that describe source/binary
 # directories, and the current project version. This is a standard CMake command.
 
-project(CueSampler VERSION 1.0.5)
+project(CueSampler VERSION 1.0.6)
 include(FetchContent)
 
 # Copy the built plugin into the OS plugin directory after each build. On by

@@ -330,6 +330,21 @@ const AudioPluginAudioProcessor::ChopDefinition* findSelectedChop (const AudioPl
     return nullptr;
 }
 
+const AudioPluginAudioProcessor::ChopDefinition* findChopById (const AudioPluginAudioProcessor::ChopState* state,
+                                                                int chopId) noexcept
+{
+    if (state == nullptr || chopId < 0)
+        return nullptr;
+
+    for (const auto& chop : state->chops)
+    {
+        if (chop.id == chopId)
+            return &chop;
+    }
+
+    return nullptr;
+}
+
 double wrapToLoopRange (double position, double loopStart, double loopLength) noexcept
 {
     if (loopLength <= 0.0)
@@ -579,6 +594,15 @@ double mapChopSourceSampleToTimeline (const AudioPluginAudioProcessor::ChopDefin
     }
 
     return segmentToTimeline (chopLocalDuration, (double) chop->endSample);
+}
+
+double getChopCueTimelineSample (const AudioPluginAudioProcessor::ChopDefinition& chop,
+                                 double sampleRate) noexcept
+{
+    const auto cueSourceSample = (double) juce::jlimit (chop.startSample,
+                                                        juce::jmax (chop.startSample, chop.endSample - 1),
+                                                        chop.startSample + chop.cueOffsetSamples);
+    return mapChopSourceSampleToTimeline (&chop, cueSourceSample, sampleRate);
 }
 
 struct AnalysisWindow
@@ -2424,6 +2448,9 @@ void AudioPluginAudioProcessor::prepareToPlay (double sampleRate, int samplesPer
     juce::ignoreUnused (samplesPerBlock);
     hostSampleRate.store (sampleRate, std::memory_order_release);
     outputMeterLevel.store (0.0f, std::memory_order_release);
+    smoothedGlobalGain.reset (sampleRate, 0.02);
+    smoothedGlobalGain.setCurrentAndTargetValue (
+        juce::Decibels::decibelsToGain (globalGainDecibels.load (std::memory_order_acquire)));
     setLatencySamples (0);
 
     voice.reset();
@@ -2591,7 +2618,10 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     if (voiceResetRequest.exchange (false, std::memory_order_acq_rel))
         voice.bungeeResetPending = true;
     if (clearVoiceStopRequest.exchange (false, std::memory_order_acq_rel))
+    {
         voice.playbackStopSample = -1.0;
+        voice.activeChopId = -1;
+    }
 
     const auto pendingCommand = (TransportCommand) pendingTransportCommand.exchange ((int) TransportCommand::none,
                                                                                      std::memory_order_acq_rel);
@@ -2629,6 +2659,7 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
                 v.playbackSamplePosition = clampedPosition;
                 v.playbackStopSample = -1.0;
+                v.activeChopId = -1;
                 v.bungeeResetPending = true;
 
                 if (syncToHost.load (std::memory_order_acquire)
@@ -2654,6 +2685,7 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             v.playbackSamplePosition = pendingStartPosition.load (std::memory_order_acquire);
             v.playbackStopSample = pendingStartStopSample.load (std::memory_order_acquire);
             v.playbackLoopStartSample = pendingStartLoopSample.load (std::memory_order_acquire);
+            v.activeChopId = pendingStartChopId.load (std::memory_order_acquire);
             v.playbackTriggeredByMidi = false;
             v.playbackActive = true;
             v.bungeeResetPending = true;
@@ -2705,6 +2737,55 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         const auto sourceLength = sampleForBlock->buffer.getNumSamples();
         const auto outputChannels = buffer.getNumChannels();
         const auto sourceRate = juce::jmax (1.0, sampleForBlock->sampleRate);
+
+        // The voice owns a stable chop id, while the immutable ChopState may be
+        // replaced by the UI every time a knob or edge moves. Refresh the
+        // latched loop geometry at this audio-block/segment boundary so edits
+        // become audible without retriggering. This is allocation-free and
+        // never touches the message-thread cache builders.
+        const auto* voiceChop = findChopById (currentChopState.get(), v.activeChopId);
+        if (voiceChop == nullptr && v.activeChopId >= 0 && ! v.playbackTriggeredByMidi)
+        {
+            // Grid rebuilds can replace chop ids. Transport playback follows
+            // the newly selected chop in that case; MIDI voices keep their
+            // original pad identity and simply retain their last geometry.
+            voiceChop = findSelectedChop (currentChopState.get());
+            if (voiceChop != nullptr)
+                v.activeChopId = voiceChop->id;
+        }
+
+        if (voiceChop != nullptr)
+        {
+            const auto liveLoopStart = getChopCueTimelineSample (*voiceChop, sourceRate);
+            const auto liveStop = (double) voiceChop->endSample;
+            const bool geometryChanged = std::abs (liveLoopStart - v.playbackLoopStartSample) > 0.5
+                                      || std::abs (liveStop - v.playbackStopSample) > 0.5;
+
+            if (geometryChanged)
+            {
+                v.playbackLoopStartSample = liveLoopStart;
+                v.playbackStopSample = liveStop;
+                v.bungeeResetPending = true;
+
+                // A shortened chop or a cue moved past the playhead cannot
+                // continue from the old position. Retarget at this safe block
+                // boundary and re-anchor host sync so it cannot restore the
+                // stale position immediately afterward.
+                if (v.playbackSamplePosition < liveLoopStart
+                    || v.playbackSamplePosition >= liveStop)
+                {
+                    v.playbackSamplePosition = liveLoopStart;
+
+                    if (! v.playbackTriggeredByMidi && blockHasHostPpq)
+                    {
+                        v.playbackSyncStartPpq = blockStartHostPpq
+                            + (double) segmentOffset / currentHostRate
+                                * (hostBpm.load (std::memory_order_acquire) / 60.0);
+                        v.playbackSyncStartSample = liveLoopStart;
+                    }
+                }
+            }
+        }
         
         auto stretchRatio = juce::jlimit (0.25f, 4.0f, timeStretchRatio.load (std::memory_order_acquire));
         const auto halfTimeActive = halfTimeEnabled.load (std::memory_order_acquire);
@@ -2728,8 +2809,13 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                 double currentPpq = blockStartHostPpq + (double) segmentOffset / currentHostRate * (hostBpm.load() / 60.0);
                 auto syncedSourcePosition = syncAnchorSample + (currentPpq - syncAnchorPpq) * beatPeriodSeconds * sourceRate * (halfTimeActive ? 0.5 : 1.0);
                 
-                if (v.playbackStopSample > syncAnchorSample + 1.0)
-                    syncedSourcePosition = wrapToLoopRange (syncedSourcePosition, syncAnchorSample, v.playbackStopSample - syncAnchorSample);
+                const auto syncLoopStart = v.playbackLoopStartSample >= 0.0
+                                             ? v.playbackLoopStartSample
+                                             : syncAnchorSample;
+                if (v.playbackStopSample > syncLoopStart + 1.0)
+                    syncedSourcePosition = wrapToLoopRange (syncedSourcePosition,
+                                                            syncLoopStart,
+                                                            v.playbackStopSample - syncLoopStart);
 
                 if (v.playbackStopSample < 0.0 && syncedSourcePosition >= (double) sourceLength)
                 {
@@ -2752,20 +2838,18 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
             // Single live sampler path: source sample + current chop edits are
             // evaluated directly, so playback never swaps between render engines.
-            const auto* activeChop = findChopAtSample (currentChopState.get(), v.playbackSamplePosition);
+            const auto* activeChop = findChopById (currentChopState.get(), v.activeChopId);
+            if (activeChop == nullptr && v.activeChopId < 0)
+                activeChop = findChopAtSample (currentChopState.get(), v.playbackSamplePosition);
             float chopGainLinear = 1.0f;
             auto effectivePitchSemitones = pitchSemitones.load (std::memory_order_acquire);
             double cueStart = v.playbackSamplePosition;
-            if (activeChop != nullptr
-                && v.playbackSamplePosition >= (double) activeChop->startSample
-                && v.playbackSamplePosition <  (double) activeChop->endSample)
+            if (activeChop != nullptr)
             {
                 chopGainLinear = juce::Decibels::decibelsToGain (activeChop->gainDecibels);
                 effectivePitchSemitones = juce::jlimit (-24.0f, 24.0f,
                                                         effectivePitchSemitones + activeChop->pitchSemitones);
-                cueStart = (double) juce::jlimit (activeChop->startSample,
-                                                   juce::jmax (activeChop->startSample, activeChop->endSample - 1),
-                                                   activeChop->startSample + activeChop->cueOffsetSamples);
+                cueStart = getChopCueTimelineSample (*activeChop, sourceRate);
             }
             const bool chopHasWarp = (activeChop != nullptr && ! activeChop->warpMarkers.empty());
 
@@ -3180,6 +3264,20 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     playbackActive.store (voice.playbackActive, std::memory_order_release);
     playbackSamplePosition.store (voice.playbackSamplePosition, std::memory_order_release);
 
+    // Apply the master level after every playback path has mixed into the
+    // output. The short ramp prevents zipper noise while the UI knob moves and
+    // uses only audio-thread-owned smoothing state.
+    if (buffer.getNumSamples() > 0)
+    {
+        smoothedGlobalGain.setTargetValue (
+            juce::Decibels::decibelsToGain (globalGainDecibels.load (std::memory_order_acquire)));
+        const auto gainStart = smoothedGlobalGain.getCurrentValue();
+        const auto gainEnd = smoothedGlobalGain.skip (buffer.getNumSamples());
+
+        for (int ch = 0; ch < totalNumOutputChannels; ++ch)
+            buffer.applyGainRamp (ch, 0, buffer.getNumSamples(), gainStart, gainEnd);
+    }
+
     float blockPeak = 0.0f;
     for (int ch = 0; ch < totalNumOutputChannels; ++ch)
     {
@@ -3247,6 +3345,7 @@ void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg,
     // note remains held. The matching note-off starts the existing short
     // de-click fade, which then deactivates the monophonic voice.
     vs.playbackLoopStartSample = startPos;
+    vs.activeChopId = chop.id;
     vs.playbackTriggeredByMidi = true;
     vs.fadeGain = 1.0f;
     vs.fadeTarget = 1.0f;
@@ -3279,12 +3378,13 @@ juce::AudioProcessorEditor* AudioPluginAudioProcessor::createEditor()
 void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     juce::ValueTree state ("CueSamplerState");
-    state.setProperty ("version", 2, nullptr);
+    state.setProperty ("version", 3, nullptr);
     state.setProperty ("gridBpmTrim", (double) gridBpmTrim.load (std::memory_order_acquire), nullptr);
     state.setProperty ("gridStartOffset", (double) gridStartOffset.load (std::memory_order_acquire), nullptr);
     state.setProperty ("waveformZoom", (double) waveformZoom.load (std::memory_order_acquire), nullptr);
     state.setProperty ("waveformScroll", (double) waveformScroll.load (std::memory_order_acquire), nullptr);
     state.setProperty ("globalPitchSemitones", (double) pitchSemitones.load (std::memory_order_acquire), nullptr);
+    state.setProperty ("globalGainDecibels", (double) globalGainDecibels.load (std::memory_order_acquire), nullptr);
     state.setProperty ("syncToHost", syncToHost.load (std::memory_order_acquire), nullptr);
     state.setProperty ("halfTimeEnabled", halfTimeEnabled.load (std::memory_order_acquire), nullptr);
     state.setProperty ("muteDrums", muteDrums.load (std::memory_order_acquire), nullptr);
@@ -3398,6 +3498,8 @@ void AudioPluginAudioProcessor::setStateInformation (const void* data, int sizeI
 
     if (! state.isValid() || ! state.hasType ("CueSamplerState"))
         return;
+
+    restoredStateReceived.store (true, std::memory_order_release);
 
     const auto restoreState = parseDeferredRestoreState (state);
     if (! restoreState.hasExplicitSampleState)
@@ -3548,6 +3650,8 @@ AudioPluginAudioProcessor::parseDeferredRestoreState (const juce::ValueTree& sta
                                                         (float) (double) state.getProperty ("waveformScroll", 0.0));
     restoreState.restoredGlobalPitch = juce::jlimit (-24.0f, 24.0f,
                                                      (float) (double) state.getProperty ("globalPitchSemitones", 0.0));
+    restoreState.restoredGlobalGainDecibels = juce::jlimit (-24.0f, 12.0f,
+                                                            (float) (double) state.getProperty ("globalGainDecibels", 0.0));
     restoreState.restoredSyncToHost = (bool) state.getProperty ("syncToHost", false);
     restoreState.restoredHalfTime = (bool) state.getProperty ("halfTimeEnabled", false);
     restoreState.restoredMuteDrums = (bool) state.getProperty ("muteDrums", false);
@@ -3583,6 +3687,7 @@ void AudioPluginAudioProcessor::applyParsedRestoreState (const DeferredRestoreSt
     waveformZoom.store (restoreState.restoredWaveformZoom, std::memory_order_release);
     waveformScroll.store (restoreState.restoredWaveformScroll, std::memory_order_release);
     pitchSemitones.store (restoreState.restoredGlobalPitch, std::memory_order_release);
+    globalGainDecibels.store (restoreState.restoredGlobalGainDecibels, std::memory_order_release);
     syncToHost.store (restoreState.restoredSyncToHost, std::memory_order_release);
     halfTimeEnabled.store (restoreState.restoredHalfTime, std::memory_order_release);
 
@@ -4347,6 +4452,12 @@ juce::File AudioPluginAudioProcessor::renderChopToTempWav (int chopId, bool appl
         framesToWrite = finalOutputFrames;
     }
 
+    // Exported chops match what users hear through the global output control.
+    if (framesToWrite > 0)
+        outputBuffer.applyGain (0, framesToWrite,
+                                juce::Decibels::decibelsToGain (
+                                    globalGainDecibels.load (std::memory_order_acquire)));
+
     const auto sampleName = sampleData->fileName.isNotEmpty() ? sampleData->fileName
                                                                : juce::String ("chop");
     auto tempDirectory = juce::File::getSpecialLocation (juce::File::tempDirectory);
@@ -4398,24 +4509,15 @@ void AudioPluginAudioProcessor::startPlayback() noexcept
     double startPosition = 0.0;
     double stopSample = -1.0;
     double loopStartSample = -1.0;
+    int startChopId = -1;
 
     const auto currentChopState = std::atomic_load (&chopState);
     const auto* selectedChop = findSelectedChop (currentChopState.get());
 
     if (selectedChop != nullptr)
     {
-        double cueStartSample = (double) juce::jlimit (selectedChop->startSample,
-                                                       juce::jmax (selectedChop->startSample, selectedChop->endSample - 1),
-                                                       selectedChop->startSample + selectedChop->cueOffsetSamples);
-
         const double sourceRate = juce::jmax (1.0, currentSample->sampleRate);
-        if (! selectedChop->warpMarkers.empty() && sourceRate > 0.0)
-        {
-            cuesampler::WarpMap tempMap;
-            tempMap.build (selectedChop->startSample, selectedChop->endSample, selectedChop->warpMarkers, sourceRate);
-            const double cueLocalSeconds = tempMap.localTimeAtSourceSample (cueStartSample);
-            cueStartSample = selectedChop->startSample + (cueLocalSeconds * sourceRate);
-        }
+        const double cueStartSample = getChopCueTimelineSample (*selectedChop, sourceRate);
 
         const auto currentPosition = playbackSamplePosition.load (std::memory_order_acquire);
         startPosition = currentPosition;
@@ -4427,6 +4529,7 @@ void AudioPluginAudioProcessor::startPlayback() noexcept
 
         stopSample = (double) selectedChop->endSample;
         loopStartSample = cueStartSample;
+        startChopId = selectedChop->id;
 
         lastTriggeredChopId.store (selectedChop->id, std::memory_order_release);
         chopTriggerRevision.fetch_add (1, std::memory_order_acq_rel);
@@ -4452,6 +4555,7 @@ void AudioPluginAudioProcessor::startPlayback() noexcept
     pendingStartPosition.store (startPosition, std::memory_order_release);
     pendingStartStopSample.store (stopSample, std::memory_order_release);
     pendingStartLoopSample.store (loopStartSample, std::memory_order_release);
+    pendingStartChopId.store (startChopId, std::memory_order_release);
 
     if (syncToHost.load (std::memory_order_acquire)
         && hostHasPpqPosition.load (std::memory_order_acquire)
@@ -4516,6 +4620,24 @@ void AudioPluginAudioProcessor::setPitchSemitones (float newSemitones) noexcept
     // correctly via getStateInformation when the project is saved.
 }
 
+void AudioPluginAudioProcessor::setGlobalGainDecibels (float newGainDecibels) noexcept
+{
+    globalGainDecibels.store (juce::jlimit (-24.0f, 12.0f, newGainDecibels),
+                              std::memory_order_release);
+}
+
+bool AudioPluginAudioProcessor::claimInitialLoadSamplePrompt() noexcept
+{
+    if (restoredStateReceived.load (std::memory_order_acquire)
+        || std::atomic_load (&loadedSample) != nullptr)
+        return false;
+
+    bool expected = false;
+    return initialLoadSamplePromptClaimed.compare_exchange_strong (expected, true,
+                                                                   std::memory_order_acq_rel,
+                                                                   std::memory_order_acquire);
+}
+
 bool AudioPluginAudioProcessor::isPlaying() const noexcept
 {
     return playbackActive.load (std::memory_order_acquire);
@@ -4549,6 +4671,11 @@ float AudioPluginAudioProcessor::getTimeStretchRatio() const noexcept
 float AudioPluginAudioProcessor::getPitchSemitones() const noexcept
 {
     return pitchSemitones.load (std::memory_order_acquire);
+}
+
+float AudioPluginAudioProcessor::getGlobalGainDecibels() const noexcept
+{
+    return globalGainDecibels.load (std::memory_order_acquire);
 }
 
 void AudioPluginAudioProcessor::setSyncToHost (bool shouldSync) noexcept
@@ -4713,7 +4840,7 @@ void AudioPluginAudioProcessor::setGridStartOffset (float offsetSeconds)
     requestHostStateSync();
 }
 
-void AudioPluginAudioProcessor::resizeChopBoundary (int chopId, int newStartSample, int newEndSample)
+void AudioPluginAudioProcessor::resizeChopBoundaryAndTempo (int chopId, int newStartSample, int newEndSample)
 {
     juce::ignoreUnused (chopId);
 
@@ -5473,6 +5600,11 @@ void AudioPluginAudioProcessor::requestChopWarpRender (int chopId)
         chopAudioCache.evict (chopId);
         return;
     }
+
+    // Never let an actively looping voice keep reading a buffer rendered from
+    // the previous marker layout. The audio thread will use its allocation-free
+    // live warp mapping until the replacement cache entry is ready.
+    chopAudioCache.evict (chopId);
 
     const auto generation = warpRenderGeneration.fetch_add (1, std::memory_order_acq_rel) + 1;
 

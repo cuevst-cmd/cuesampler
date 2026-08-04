@@ -6,10 +6,53 @@
 
 namespace cuesampler
 {
+namespace
+{
+constexpr int updateCacheSchema = 2;
 
-// Background worker: one settle delay, one network check, then exits. The
-// once-a-day throttle is persisted, so there is no reason to loop within a
-// session — `start()` spins this up again next launch if the cache is stale.
+const char* installerExtensionForCurrentPlatform() noexcept
+{
+   #if JUCE_WINDOWS
+    return ".exe";
+   #elif JUCE_MAC
+    return ".pkg";
+   #else
+    return nullptr;
+   #endif
+}
+
+const char* updateCachePlatform() noexcept
+{
+   #if JUCE_WINDOWS
+    return "windows";
+   #elif JUCE_MAC
+    return "macos";
+   #else
+    return "unsupported";
+   #endif
+}
+} // namespace
+
+struct UpdateChecker::SharedState
+{
+    std::mutex mutex;
+    std::atomic<bool> available { false };
+    std::atomic<int> checkStatus { (int) CheckStatus::idle };
+    Result current;
+    juce::String skippedVersion;
+    juce::int64 lastCheckMs = 0;
+    bool cacheLoaded = false;
+    bool checkRunning = false;
+};
+
+UpdateChecker::SharedState& UpdateChecker::sharedState()
+{
+    static SharedState state;
+    return state;
+}
+
+// Background worker: one network check, then exits. The once-a-day throttle is
+// persisted, so there is no reason to loop within a session.
 class UpdateChecker::CheckThread final : public juce::Thread
 {
 public:
@@ -18,12 +61,10 @@ public:
 
     void run() override
     {
-        // Brief settle so we're likely online before the first attempt.
-        if (wait (4000))
-            return; // stopThread() asked us to bail
-
         if (! threadShouldExit())
             owner.performCheck();
+        else
+            owner.markCheckFinished();
     }
 
 private:
@@ -38,7 +79,10 @@ UpdateChecker::UpdateChecker()
 UpdateChecker::~UpdateChecker()
 {
     if (thread != nullptr)
+    {
         thread->stopThread (5000); // signals exit + notify, then joins
+        markCheckFinished();
+    }
 }
 
 juce::String UpdateChecker::currentVersion()
@@ -48,130 +92,213 @@ juce::String UpdateChecker::currentVersion()
 
 void UpdateChecker::start()
 {
+    beginCheck (false);
+}
+
+void UpdateChecker::checkNow()
+{
+    auto& state = sharedState();
+    bool clearedSkippedVersion = false;
+
+    {
+        const std::lock_guard<std::mutex> lock (state.mutex);
+        if (state.skippedVersion.isNotEmpty())
+        {
+            state.skippedVersion.clear();
+            clearedSkippedVersion = true;
+        }
+    }
+
+    if (clearedSkippedVersion)
+        saveCache();
+
+    beginCheck (true);
+}
+
+bool UpdateChecker::beginCheck (bool bypassThrottle)
+{
+    // publish() completes just before CheckThread::run() returns. Avoid claiming
+    // a new request in that tiny window; a second click can restart immediately
+    // once JUCE reports the worker as stopped.
+    if (thread != nullptr && thread->isThreadRunning())
+        return false;
+
+    auto& state = sharedState();
+
     // Re-eval cache against the live version first, in case
     // the user updated since the cache was written.
     {
-        const std::lock_guard<std::mutex> lock (mutex);
-        current.available = isNewer (current.latestVersion, currentVersion())
-                            && current.latestVersion != skippedVersion;
-        available.store (current.available, std::memory_order_release);
+        const std::lock_guard<std::mutex> lock (state.mutex);
+        state.current.available = isNewer (state.current.latestVersion, currentVersion())
+                                  && state.current.latestVersion != state.skippedVersion;
+        state.available.store (state.current.available, std::memory_order_release);
 
         const auto now = juce::Time::currentTimeMillis();
-        if (lastCheckMs != 0 && (now - lastCheckMs) < kThrottleMs)
-            return; // checked recently — cached result stands
+        if (state.checkRunning)
+            return false; // share the check already in flight
+
+        if (! bypassThrottle
+            && state.lastCheckMs != 0
+            && (now - state.lastCheckMs) < kThrottleMs)
+            return false; // checked recently — cached result stands
+
+        state.checkRunning = true;
+        state.checkStatus.store ((int) CheckStatus::checking, std::memory_order_release);
+        ownsRunningCheck.store (true, std::memory_order_release);
     }
 
-    // if (thread == nullptr)
-    //     thread = std::make_unique<CheckThread> (*this);
+    if (thread == nullptr)
+        thread = std::make_unique<CheckThread> (*this);
 
-    // if (! thread->isThreadRunning())
-    //     thread->startThread();
+    if (! thread->isThreadRunning())
+        thread->startThread();
+
+    return true;
 }
 
 UpdateChecker::Result UpdateChecker::getResult() const
 {
-    const std::lock_guard<std::mutex> lock (mutex);
-    return current;
+    auto& state = sharedState();
+    const std::lock_guard<std::mutex> lock (state.mutex);
+    return state.current;
+}
+
+bool UpdateChecker::isUpdateAvailable() const noexcept
+{
+    return sharedState().available.load (std::memory_order_acquire);
+}
+
+UpdateChecker::CheckStatus UpdateChecker::getCheckStatus() const noexcept
+{
+    return (CheckStatus) sharedState().checkStatus.load (std::memory_order_acquire);
 }
 
 void UpdateChecker::skipCurrentVersion()
 {
+    auto& state = sharedState();
     {
-        const std::lock_guard<std::mutex> lock (mutex);
-        skippedVersion    = current.latestVersion;
-        current.available = false;
+        const std::lock_guard<std::mutex> lock (state.mutex);
+        state.skippedVersion    = state.current.latestVersion;
+        state.current.available = false;
+        state.available.store (false, std::memory_order_release);
     }
-    available.store (false, std::memory_order_release);
     saveCache();
 }
 
 void UpdateChecker::performCheck()
 {
-    juce::URL url (kApiUrl);
+    bool shouldPublish = false;
+    Result newestForPlatform;
 
-    // GitHub's API rejects requests without a User-Agent (HTTP 403). The Accept
-    // header pins the response schema. No auth token: the repo is public and the
-    // 60 req/hr unauthenticated limit is irrelevant for a daily check.
-    juce::WebInputStream req (url, /*addParametersToRequestBody*/ false);
-    req.withExtraHeaders ("User-Agent: CueSampler-Updater\r\n"
-                          "Accept: application/vnd.github+json\r\n")
-       .withConnectionTimeout (8000)
-       .withNumRedirectsToFollow (5);
-
-    if (! req.connect (nullptr))
-        return;
-
-    const int status = req.getStatusCode();
-    const auto body  = req.readEntireStreamAsString(); // drain before teardown
-    if (status < 200 || status >= 300)
-        return;
-
-    const auto parsed = juce::JSON::parse (body);
-    auto* obj = parsed.getDynamicObject();
-    if (obj == nullptr)
-        return;
-
-    Result r;
-    r.latestVersion = normaliseVersion (obj->getProperty ("tag_name").toString());
-    r.pageUrl       = obj->getProperty ("html_url").toString();
-    r.notes         = obj->getProperty ("body").toString();
-
-    // Prefer a direct installer asset FOR THIS PLATFORM so the button starts the
-    // download immediately; fall back to the release page when none is attached.
-    // Windows ships a .exe (Inno Setup), macOS a notarized .pkg. Note ".exe" does
-    // not match the ".exe.sha256" checksum sidecar, so the picker grabs the
-    // installer, not its hash file.
-   #if JUCE_WINDOWS
-    const char* const installerExt = ".exe";
-   #elif JUCE_MAC
-    const char* const installerExt = ".pkg";
-   #else
-    const char* const installerExt = nullptr;
-   #endif
-
-    const auto assets = obj->getProperty ("assets");
-    if (installerExt != nullptr)
+    do
     {
-        if (auto* arr = assets.getArray())
+        juce::URL url (kApiUrl);
+
+        // GitHub's API rejects requests without a User-Agent (HTTP 403). The
+        // Accept header pins the response schema. No auth token is sent.
+        juce::WebInputStream req (url, /*addParametersToRequestBody*/ false);
+        req.withExtraHeaders ("User-Agent: CueSampler-Updater\r\n"
+                              "Accept: application/vnd.github+json\r\n")
+           .withConnectionTimeout (8000)
+           .withNumRedirectsToFollow (5);
+
+        if (! req.connect (nullptr))
+            break;
+
+        const int status = req.getStatusCode();
+        const auto body  = req.readEntireStreamAsString(); // drain before teardown
+        if (status < 200 || status >= 300)
+            break;
+
+        const auto parsed = juce::JSON::parse (body);
+        auto* releases = parsed.getArray();
+        if (releases == nullptr)
+            break;
+
+        // Require a direct installer for this platform. The exact suffix does
+        // not match checksum sidecars such as ".pkg.sha256".
+        const auto* installerExt = installerExtensionForCurrentPlatform();
+
+        if (installerExt == nullptr)
+            break;
+
+        for (const auto& releaseValue : *releases)
         {
-            for (const auto& a : *arr)
+            auto* release = releaseValue.getDynamicObject();
+            if (release == nullptr
+                || (bool) release->getProperty ("draft")
+                || (bool) release->getProperty ("prerelease"))
+                continue;
+
+            Result candidate;
+            candidate.latestVersion = normaliseVersion (release->getProperty ("tag_name").toString());
+            if (candidate.latestVersion.isEmpty())
+                continue;
+
+            const auto assetsValue = release->getProperty ("assets");
+            if (auto* assets = assetsValue.getArray())
             {
-                if (auto* ao = a.getDynamicObject())
+                for (const auto& assetValue : *assets)
                 {
-                    const auto name = ao->getProperty ("name").toString();
-                    if (name.endsWithIgnoreCase (installerExt))
+                    if (auto* asset = assetValue.getDynamicObject())
                     {
-                        r.downloadUrl = ao->getProperty ("browser_download_url").toString();
-                        break;
+                        const auto name = asset->getProperty ("name").toString();
+                        if (name.endsWithIgnoreCase (installerExt))
+                        {
+                            candidate.downloadUrl = asset->getProperty ("browser_download_url").toString();
+                            break;
+                        }
                     }
                 }
             }
+
+            // A release for the other OS is not an update for this instance.
+            if (candidate.downloadUrl.isEmpty())
+                continue;
+
+            candidate.pageUrl = release->getProperty ("html_url").toString();
+            candidate.notes   = release->getProperty ("body").toString();
+
+            if (newestForPlatform.latestVersion.isEmpty()
+                || isNewer (candidate.latestVersion, newestForPlatform.latestVersion))
+                newestForPlatform = std::move (candidate);
         }
+
+        // A valid releases array is a successful check even when this platform
+        // has no installer yet. Caching that result preserves the daily throttle.
+        shouldPublish = true;
     }
+    while (false);
 
-    if (r.latestVersion.isEmpty())
-        return; // malformed response — keep the existing cache
-
-    publish (std::move (r), /*fromNetwork*/ true);
+    if (shouldPublish)
+        publish (std::move (newestForPlatform), /*fromNetwork*/ true);
+    else
+        markCheckFinished();
 }
 
 void UpdateChecker::publish (Result result, bool fromNetwork)
 {
     std::function<void()> notify;
+    auto& state = sharedState();
 
     {
-        const std::lock_guard<std::mutex> lock (mutex);
+        const std::lock_guard<std::mutex> lock (state.mutex);
 
         result.available = isNewer (result.latestVersion, currentVersion())
-                           && result.latestVersion != skippedVersion;
+                           && result.latestVersion != state.skippedVersion;
 
-        const bool firstTimeAvailable = result.available && ! current.available;
+        const bool firstTimeAvailable = result.available && ! state.current.available;
 
-        current = std::move (result);
+        state.current = std::move (result);
         if (fromNetwork)
-            lastCheckMs = juce::Time::currentTimeMillis();
+            state.lastCheckMs = juce::Time::currentTimeMillis();
+        state.checkRunning = false;
 
-        available.store (current.available, std::memory_order_release);
+        state.available.store (state.current.available, std::memory_order_release);
+        state.checkStatus.store ((int) (state.current.available ? CheckStatus::updateAvailable
+                                                                : CheckStatus::upToDate),
+                                 std::memory_order_release);
+        ownsRunningCheck.store (false, std::memory_order_release);
 
         if (firstTimeAvailable && onUpdateAvailable)
             notify = onUpdateAvailable; // copy under lock; fire outside
@@ -182,6 +309,17 @@ void UpdateChecker::publish (Result result, bool fromNetwork)
 
     if (notify)
         juce::MessageManager::callAsync ([notify] { notify(); });
+}
+
+void UpdateChecker::markCheckFinished()
+{
+    auto& state = sharedState();
+    const std::lock_guard<std::mutex> lock (state.mutex);
+    if (! ownsRunningCheck.exchange (false, std::memory_order_acq_rel))
+        return;
+
+    state.checkRunning = false;
+    state.checkStatus.store ((int) CheckStatus::failed, std::memory_order_release);
 }
 
 juce::File UpdateChecker::baseDir() const
@@ -196,7 +334,12 @@ juce::File UpdateChecker::cacheFile() const { return baseDir().getChildFile ("up
 
 void UpdateChecker::loadCache()
 {
-    const std::lock_guard<std::mutex> lock (mutex);
+    auto& state = sharedState();
+    const std::lock_guard<std::mutex> lock (state.mutex);
+
+    if (state.cacheLoaded)
+        return;
+    state.cacheLoaded = true;
 
     const auto file = cacheFile();
     if (! file.existsAsFile())
@@ -205,26 +348,33 @@ void UpdateChecker::loadCache()
     const auto parsed = juce::JSON::parse (file);
     if (auto* obj = parsed.getDynamicObject())
     {
-        current.latestVersion = obj->getProperty ("latestVersion").toString();
-        current.downloadUrl   = obj->getProperty ("downloadUrl").toString();
-        current.pageUrl       = obj->getProperty ("pageUrl").toString();
-        current.notes         = obj->getProperty ("notes").toString();
-        skippedVersion        = obj->getProperty ("skippedVersion").toString();
-        lastCheckMs           = (juce::int64) (double) obj->getProperty ("lastCheckMs");
+        if ((int) obj->getProperty ("schema") != updateCacheSchema
+            || obj->getProperty ("platform").toString() != updateCachePlatform())
+            return; // discard legacy/non-platform-aware cache entries
+
+        state.current.latestVersion = obj->getProperty ("latestVersion").toString();
+        state.current.downloadUrl   = obj->getProperty ("downloadUrl").toString();
+        state.current.pageUrl       = obj->getProperty ("pageUrl").toString();
+        state.current.notes         = obj->getProperty ("notes").toString();
+        state.skippedVersion        = obj->getProperty ("skippedVersion").toString();
+        state.lastCheckMs           = (juce::int64) (double) obj->getProperty ("lastCheckMs");
     }
 }
 
 void UpdateChecker::saveCache()
 {
-    const std::lock_guard<std::mutex> lock (mutex);
+    auto& state = sharedState();
+    const std::lock_guard<std::mutex> lock (state.mutex);
 
     auto obj = juce::DynamicObject::Ptr (new juce::DynamicObject());
-    obj->setProperty ("latestVersion", current.latestVersion);
-    obj->setProperty ("downloadUrl",   current.downloadUrl);
-    obj->setProperty ("pageUrl",       current.pageUrl);
-    obj->setProperty ("notes",         current.notes);
-    obj->setProperty ("skippedVersion", skippedVersion);
-    obj->setProperty ("lastCheckMs",   (double) lastCheckMs);
+    obj->setProperty ("schema", updateCacheSchema);
+    obj->setProperty ("platform", updateCachePlatform());
+    obj->setProperty ("latestVersion", state.current.latestVersion);
+    obj->setProperty ("downloadUrl",   state.current.downloadUrl);
+    obj->setProperty ("pageUrl",       state.current.pageUrl);
+    obj->setProperty ("notes",         state.current.notes);
+    obj->setProperty ("skippedVersion", state.skippedVersion);
+    obj->setProperty ("lastCheckMs",   (double) state.lastCheckMs);
     cacheFile().replaceWithText (juce::JSON::toString (juce::var (obj.get())));
 }
 

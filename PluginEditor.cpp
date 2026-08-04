@@ -1637,8 +1637,8 @@ private:
         {
             "Click chop                     Select + preview",
             "Double-click chop           Toggle favourite (pink)",
-            "Drag chop edge              Resize grid + update tempo",
-            "Shift-drag chop edge       Snap edge to nearest bar",
+            "Drag chop edge              Resize this chop only",
+            "Shift-drag chop edge       Resize grid + update tempo",
             "Drag audio file onto view   Load new sample",
             "Alt-click any knob           Reset to default value",
             "Scroll wheel                   Zoom in / out to cursor",
@@ -1861,6 +1861,18 @@ public:
         themeButton.setTooltip ("Switch between light and dark themes.");
         themeButton.onClick = [this] { if (onThemeToggled) onThemeToggled(); };
         addAndMakeVisible (themeButton);
+
+        configureButton (checkUpdateButton, "CHECK UPDATE", textPrimary);
+        checkUpdateButton.getProperties().set ("cueStyle", "flatAction");
+        checkUpdateButton.setTooltip ("Check GitHub now for the newest CUE SAMPLER installer for this operating system.");
+        checkUpdateButton.onClick = [this]
+        {
+            manualUpdateCheckPending = true;
+            updateFeedbackUntilMs = 0.0;
+            processor.getUpdateChecker().checkNow();
+            refreshUpdateButton();
+        };
+        addAndMakeVisible (checkUpdateButton);
     }
 
     void mouseDown (const juce::MouseEvent& e) override
@@ -1880,13 +1892,16 @@ public:
         constexpr int topMargin = 12;
         constexpr int undoWidth = 76;
         constexpr int themeWidth = 86;
+        constexpr int checkUpdateWidth = 118;
         constexpr int gap = 8;
         helpButton.setBounds (getWidth() - rightMargin - buttonSize, topMargin, buttonSize, buttonSize);
         undoButton.setBounds (helpButton.getX() - gap - undoWidth, topMargin, undoWidth, buttonSize);
         themeButton.setBounds (undoButton.getX() - gap - themeWidth, topMargin, themeWidth, buttonSize);
+        checkUpdateButton.setBounds (themeButton.getX() - gap - checkUpdateWidth,
+                                     topMargin, checkUpdateWidth, buttonSize);
     }
 
-    int utilityControlsLeft() const noexcept { return themeButton.getX(); }
+    int utilityControlsLeft() const noexcept { return checkUpdateButton.getX(); }
 
     // Right edge of the CUE. wordmark in header-local coordinates, so the
     // editor can seat the orb flush beside the lockup.
@@ -1905,7 +1920,7 @@ public:
     // Re-apply cached colours + the theme button's label after a theme swap.
     void refreshColours()
     {
-        for (auto* b : { &helpButton, &undoButton, &themeButton })
+        for (auto* b : { &helpButton, &undoButton, &themeButton, &checkUpdateButton })
         {
             b->setColour (juce::TextButton::textColourOffId, textPrimary);
             b->setColour (juce::TextButton::textColourOnId, textPrimary);
@@ -1984,9 +1999,49 @@ private:
     void timerCallback() override
     {
         // The header is static now that the output meter is gone; the only live
-        // state is the undo button's enabled flag.
+        // state is the undo flag plus manual update-check feedback.
         if (const bool canUndo = processor.canUndoEdit(); canUndo != undoButton.isEnabled())
             undoButton.setEnabled (canUndo);
+
+        refreshUpdateButton();
+    }
+
+    void refreshUpdateButton()
+    {
+        using CheckStatus = cuesampler::UpdateChecker::CheckStatus;
+
+        const auto status = processor.getUpdateChecker().getCheckStatus();
+        const auto nowMs = juce::Time::getMillisecondCounterHiRes();
+
+        if (status == CheckStatus::checking)
+        {
+            checkUpdateButton.setEnabled (false);
+            checkUpdateButton.setButtonText ("CHECKING...");
+            return;
+        }
+
+        checkUpdateButton.setEnabled (true);
+
+        if (manualUpdateCheckPending)
+        {
+            manualUpdateCheckPending = false;
+            updateFeedbackUntilMs = nowMs + 2500.0;
+
+            if (status == CheckStatus::updateAvailable)
+                checkUpdateButton.setButtonText ("UPDATE FOUND");
+            else if (status == CheckStatus::upToDate)
+                checkUpdateButton.setButtonText ("UP TO DATE");
+            else
+                checkUpdateButton.setButtonText ("CHECK FAILED");
+
+            return;
+        }
+
+        if (updateFeedbackUntilMs > 0.0 && nowMs < updateFeedbackUntilMs)
+            return;
+
+        updateFeedbackUntilMs = 0.0;
+        checkUpdateButton.setButtonText ("CHECK UPDATE");
     }
 
     AudioPluginAudioProcessor& processor;
@@ -1994,6 +2049,9 @@ private:
     SmoothHoverButton helpButton;
     SmoothHoverButton undoButton;
     SmoothHoverButton themeButton;
+    SmoothHoverButton checkUpdateButton;
+    bool manualUpdateCheckPending = false;
+    double updateFeedbackUntilMs = 0.0;
     std::unique_ptr<juce::Drawable> cueWordmark;
     juce::Colour wordmarkColour { 0xfff2e7da };
 };
@@ -2011,8 +2069,8 @@ public:
           horizontalScrollBar (false)
     {
         setTooltip ("Click a chop to select and preview it.  Double-click to toggle favourite (pink highlight).  "
-                    "Drag a selected chop edge to resize the grid and update tempo.  "
-                    "Shift-drag a selected chop edge to snap that edge to the nearest bar without changing tempo.  "
+                    "Drag a selected chop edge to change only that chop's start or end.  "
+                    "Shift-drag a selected chop edge to resize the grid and update tempo.  "
                     "Drag an audio file here to load it.");
         processor.sampleChangeBroadcaster.addChangeListener (this);
         processor.editChangeBroadcaster.addChangeListener (this);
@@ -2176,7 +2234,7 @@ public:
             {
                 edgeDragChopId    = hitChopId;
                 edgeDragKind      = hitKind;
-                edgeDragBarSnap   = event.mods.isShiftDown();
+                edgeDragChangesTempo = event.mods.isShiftDown();
                 edgeDragLiveSample = sampleForDisplayPosition (event.position.x);
                 setMouseCursor (juce::MouseCursor::LeftRightResizeCursor);
                 repaint();
@@ -2322,7 +2380,7 @@ public:
         {
             edgeDragChopId = -1;
             edgeDragKind   = 0;
-            edgeDragBarSnap = false;
+            edgeDragChangesTempo = false;
             return;
         }
 
@@ -2331,9 +2389,6 @@ public:
         const int    minLen       = juce::jmax (1, (int) std::round (sr * 0.05)); // 50 ms minimum chop
 
         double newSample = sampleForDisplayPosition (mousePos.x);
-
-        if (edgeDragBarSnap)
-            newSample = sampleForNearestBarLine (newSample);
 
         if (edgeDragKind == 1) // left edge
         {
@@ -2372,17 +2427,17 @@ public:
 
             if (newEnd - newStart >= 2)
             {
-                if (edgeDragBarSnap)
-                    processor.setChopBounds (edgeDragChopId, newStart, newEnd);
+                if (edgeDragChangesTempo)
+                    processor.resizeChopBoundaryAndTempo (edgeDragChopId, newStart, newEnd);
                 else
-                    processor.resizeChopBoundary (edgeDragChopId, newStart, newEnd);
+                    processor.setChopBounds (edgeDragChopId, newStart, newEnd);
             }
         }
 
         edgeDragChopId     = -1;
         edgeDragKind       = 0;
         edgeDragLiveSample = 0.0;
-        edgeDragBarSnap = false;
+        edgeDragChangesTempo = false;
     }
 
     // ---- Warp-mode interaction helpers (step 9) ---------------------------
@@ -3705,34 +3760,6 @@ private:
         return displayBounds.getX() + relativePosition * displayBounds.getWidth();
     }
 
-    double sampleForNearestBarLine (double samplePosition) const
-    {
-        const auto sampleData = processor.getLoadedSample();
-        const auto analysis = processor.getTempoAnalysis();
-        if (sampleData == nullptr || analysis == nullptr || analysis->beatPeriodSeconds <= 0.0)
-            return samplePosition;
-
-        const double sr = sampleData->sampleRate;
-        if (sr <= 0.0)
-            return samplePosition;
-
-        const auto trimBpm = (double) processor.getGridBpmTrim();
-        const auto adjustedBpm = analysis->estimatedBpm + trimBpm;
-        const auto scaleFactor = (adjustedBpm > 0.0 && analysis->estimatedBpm > 0.0)
-                               ? analysis->estimatedBpm / adjustedBpm : 1.0;
-        const auto beatPeriod = analysis->beatPeriodSeconds * scaleFactor;
-        const auto barPeriod = beatPeriod * 4.0;
-        if (barPeriod <= 0.0)
-            return samplePosition;
-
-        const auto anchor = processor.getResolvedGridAnchorSeconds();
-        const auto sampleSeconds = samplePosition / sr;
-        const auto nearestBarSeconds = anchor + std::round ((sampleSeconds - anchor) / barPeriod) * barPeriod;
-        return juce::jlimit (0.0,
-                             (double) juce::jmax (0, sampleData->buffer.getNumSamples()),
-                             nearestBarSeconds * sr);
-    }
-
     void followTriggeredChopIfNeeded() {}
 
     void scrollToChop (int chopId, bool forceInstant = false)
@@ -3912,10 +3939,12 @@ private:
                                                           std::abs (ghostEndX - ghostStartX),
                                                           displayBounds.getHeight());
 
-        fillRectGradient (g, ghostBounds, juce::Colour (0xff00f57a).withAlpha (0.24f),
-                          juce::Colour (0xff00f57a).withAlpha (0.10f));
+        const auto dragAccent = edgeDragChangesTempo ? juce::Colour (0xffff6900)
+                                                      : juce::Colour (0xff00f57a);
+        fillRectGradient (g, ghostBounds, dragAccent.withAlpha (0.24f),
+                          dragAccent.withAlpha (0.10f));
 
-        g.setColour ((edgeDragBarSnap ? juce::Colour (0xffff6900) : juce::Colour (0xff00f57a)).withAlpha (0.95f));
+        g.setColour (dragAccent.withAlpha (0.95f));
         g.drawLine (ghostBounds.getX(), displayBounds.getY() + 2.0f, ghostBounds.getX(), displayBounds.getBottom() - 2.0f, 2.0f);
         g.drawLine (ghostBounds.getRight(), displayBounds.getY() + 2.0f, ghostBounds.getRight(), displayBounds.getBottom() - 2.0f, 2.0f);
     }
@@ -4900,7 +4929,7 @@ private:
     int    edgeDragChopId    = -1;
     int    edgeDragKind      = 0;
     double edgeDragLiveSample = 0.0;
-    bool   edgeDragBarSnap = false;
+    bool   edgeDragChangesTempo = false;
     static constexpr float kEdgeHitTestPixels = 6.0f;
 };
 
@@ -4912,6 +4941,9 @@ public:
 
     // Knob size for the condensed band's chop row (label + knob fit ~70px).
     static constexpr int bandKnobDiameter = 48;
+    static constexpr int chopToolButtonWidth = 128;
+    static constexpr int barsToolButtonWidth = 104;
+    static constexpr int chopToolButtonGap = 12;
 
     explicit TransportSectionComponent (AudioPluginAudioProcessor& p)
         : processor (p),
@@ -5169,11 +5201,25 @@ public:
                     badgeBounds.toNearestInt().withY ((int) std::round (badgeBounds.getY() - 1.0f)),
                     juce::Justification::centred, false);
 
+        // Make the scope of the three centred voice controls explicit. This
+        // label sits immediately to their left and moves with the centred bank.
+        constexpr int perChopKnobGap = 22;
+        constexpr int perChopClusterWidth = bandKnobDiameter * 3 + perChopKnobGap * 2;
+        const int perChopClusterX = (getWidth() - perChopClusterWidth) / 2;
+        const auto perChopLabelBounds = juce::Rectangle<int> (perChopClusterX - 82,
+                                                               transportPanel.getCentreY() - 9,
+                                                               70, 18);
+        g.setColour (themedTitleColour (accentOrange).withAlpha (0.92f));
+        g.setFont (heavyFont (9.6f).withExtraKerningFactor (0.08f));
+        g.drawText ("PER CHOP", perChopLabelBounds, juce::Justification::centredRight, false);
+
         g.setColour (glassTextMuted.withAlpha (0.85f));
         g.setFont (monoFont (8.5f).withExtraKerningFactor (0.06f));
         {
             // Centre the mapping hint under the CHOP/BARS pair on the left.
-            constexpr int centerBlockWidth = 140 + 12 + 120;
+            constexpr int centerBlockWidth = chopToolButtonWidth
+                                           + chopToolButtonGap
+                                           + barsToolButtonWidth;
             constexpr int centerBlockX = 34 + 122 + 24;
             g.drawText (getMidiMappingText(),
                         juce::Rectangle<int> (centerBlockX,
@@ -5205,26 +5251,30 @@ public:
         // Keep clear of the corner rivets (drawn at x = 13 +- 6 in paint()).
         const int sideMargin = 34;
 
-        const int buttonH = 44;
-        const int buttonY = chopPanel.getY() + (chopPanel.getHeight() - buttonH) / 2;
+        constexpr int toolButtonH = 40;
+        const int toolButtonY = chopPanel.getY() + (chopPanel.getHeight() - toolButtonH) / 2;
+        constexpr int warpButtonH = 44;
+        const int warpButtonY = chopPanel.getY() + (chopPanel.getHeight() - warpButtonH) / 2;
 
         // Chop-generation tools occupy the left bay, leaving the centred
         // global-knob bank unobstructed.
         constexpr int chopBadgeWidth = 122;
         constexpr int badgeToToolsGap = 24;
         const int centerBlockX = sideMargin + chopBadgeWidth + badgeToToolsGap;
-        chopTransientsButton.setBounds (centerBlockX, buttonY, 140, buttonH);
-        barsButton.setBounds (centerBlockX + 152, buttonY, 120, buttonH);
+        chopTransientsButton.setBounds (centerBlockX, toolButtonY,
+                                        chopToolButtonWidth, toolButtonH);
+        barsButton.setBounds (centerBlockX + chopToolButtonWidth + chopToolButtonGap,
+                              toolButtonY, barsToolButtonWidth, toolButtonH);
 
         // Warp cluster, right-aligned, with stacked octave buttons at the edge.
         const auto warp = warpClusterBounds();
-        warpButton.setBounds (warp.getX(), warp.getY(), 88, buttonH);
-        clearWarpButton.setBounds (warp.getX() + 96, warp.getY(), 88, buttonH);
-        warpDivisionCombo.setBounds (warp.getX() + 192, warp.getY(), 84, buttonH);
+        warpButton.setBounds (warp.getX(), warpButtonY, 88, warpButtonH);
+        clearWarpButton.setBounds (warp.getX() + 96, warpButtonY, 88, warpButtonH);
+        warpDivisionCombo.setBounds (warp.getX() + 192, warpButtonY, 84, warpButtonH);
 
         const int octX = getWidth() - sideMargin - 44;
-        octDownButton.setBounds (octX, buttonY, 44, 20);
-        octUpButton.setBounds (octX, buttonY + 24, 44, 20);
+        octDownButton.setBounds (octX, warpButtonY, 44, 20);
+        octUpButton.setBounds (octX, warpButtonY + 24, 44, 20);
 
         // ---- Row 2: playback | centred chop knobs | modes + readouts -------
         const auto transportPanel = getTransportPanelBounds();
@@ -5654,6 +5704,7 @@ public:
         : zoomKnob ("ZOOM", footerKnobDiameter, 13.0f, "miniColourKnob", lightCueOrange),
           scrollKnob ("SCROLL", footerKnobDiameter, 13.0f, "miniColourKnob", lightCueOrange),
           tempoKnob ("TEMPO", footerKnobDiameter, 13.0f, "miniColourKnob", lightCueOrange),
+          globalGainKnob ("GAIN", footerKnobDiameter, 13.0f, "miniColourKnob", lightCueOrange),
           globalPitchKnob ("PITCH", footerKnobDiameter, 13.0f, "miniColourKnob", lightCueOrange)
     {
         setBufferedToImage (false);
@@ -5676,6 +5727,13 @@ public:
         tempoKnob.getSlider().setTooltip ("TEMPO trim: adds a fine BPM offset (-10 to +10 BPM) to shift where chop boundaries fall. Use when chops feel slightly early or late. Alt-click to reset to 0.");
         tempoKnob.captureCurrentValueAsDefault();
 
+        globalGainKnob.getSlider().setRange (-24.0, 12.0, 0.1);
+        globalGainKnob.getSlider().setValue (0.0, juce::dontSendNotification);
+        globalGainKnob.getSlider().setNumDecimalPlacesToDisplay (1);
+        globalGainKnob.getSlider().setTextValueSuffix (" dB");
+        globalGainKnob.getSlider().setTooltip ("GAIN (global): adjusts the output level of every chop, -24 to +12 dB. Alt-click to reset to 0 dB.");
+        globalGainKnob.captureCurrentValueAsDefault();
+
         globalPitchKnob.getSlider().setRange (-12.0, 12.0, 0.1);
         globalPitchKnob.getSlider().setValue (0.0, juce::dontSendNotification);
         globalPitchKnob.getSlider().setNumDecimalPlacesToDisplay (1);
@@ -5683,14 +5741,14 @@ public:
         globalPitchKnob.getSlider().setTooltip ("PITCH (global): shifts pitch of every chop together, -12 to +12 semitones. The per-chop PITCH knob (in CHOP CONTROLS) adds on top of this. Alt-click to reset to 0.");
         globalPitchKnob.captureCurrentValueAsDefault();
 
-        for (auto* knob : { &zoomKnob, &scrollKnob, &tempoKnob, &globalPitchKnob })
+        for (auto* knob : { &zoomKnob, &scrollKnob, &tempoKnob, &globalGainKnob, &globalPitchKnob })
             addAndMakeVisible (*knob);
     }
 
     // Re-apply cached colours after a theme swap.
     void refreshColours()
     {
-        for (auto* knob : { &zoomKnob, &scrollKnob, &tempoKnob, &globalPitchKnob })
+        for (auto* knob : { &zoomKnob, &scrollKnob, &tempoKnob, &globalGainKnob, &globalPitchKnob })
             knob->refreshColours();
     }
 
@@ -5700,12 +5758,12 @@ public:
         const int knobH = juce::jmax (0, juce::jmin (footerKnobDiameter + 19,
                                                      getHeight() - topInset));
         const int knobY = topInset;
-        constexpr int gap = 28;
-        constexpr int knobCount = 4;
+        constexpr int gap = 20;
+        constexpr int knobCount = 5;
         constexpr int clusterWidth = knobCount * footerKnobDiameter + (knobCount - 1) * gap;
 
         int x = (getWidth() - clusterWidth) / 2;
-        for (auto* knob : { &zoomKnob, &scrollKnob, &tempoKnob, &globalPitchKnob })
+        for (auto* knob : { &zoomKnob, &scrollKnob, &tempoKnob, &globalGainKnob, &globalPitchKnob })
         {
             knob->setBounds (x, knobY, footerKnobDiameter, knobH);
             x += footerKnobDiameter + gap;
@@ -5715,6 +5773,7 @@ public:
     juce::Slider& getZoomSlider() noexcept { return zoomKnob.getSlider(); }
     juce::Slider& getScrollSlider() noexcept { return scrollKnob.getSlider(); }
     juce::Slider& getTempoSlider() noexcept { return tempoKnob.getSlider(); }
+    juce::Slider& getGlobalGainSlider() noexcept { return globalGainKnob.getSlider(); }
     juce::Slider& getGlobalPitchSlider() noexcept { return globalPitchKnob.getSlider(); }
     void updateScrollSensitivityForZoom (float zoomControlValue)
     {
@@ -5725,6 +5784,7 @@ private:
     LabelledKnob zoomKnob;
     LabelledKnob scrollKnob;
     LabelledKnob tempoKnob;
+    LabelledKnob globalGainKnob;
     LabelledKnob globalPitchKnob;
 };
 
@@ -6091,6 +6151,87 @@ private:
     cue::SmoothHoverButton downloadButton;
     cue::SmoothHoverButton laterButton;
 };
+
+// First-run prompt shown inside the plug-in. It deliberately does not open a
+// native file browser until the user presses LOAD SAMPLE, so creating a new
+// instance never steals focus from the host.
+class InitialLoadOverlayComponent final : public juce::Component
+{
+public:
+    std::function<void()> onLoad;
+    std::function<void()> onDismiss;
+
+    InitialLoadOverlayComponent()
+    {
+        setWantsKeyboardFocus (true);
+
+        loadButton.setButtonText ("LOAD SAMPLE");
+        loadButton.getProperties().set ("cueStyle", "flatAction");
+        loadButton.onClick = [this]
+        {
+            if (onLoad)
+                onLoad();
+        };
+        addAndMakeVisible (loadButton);
+
+        dismissButton.setButtonText ("NOT NOW");
+        dismissButton.getProperties().set ("cueStyle", "flatAction");
+        dismissButton.onClick = [this]
+        {
+            if (onDismiss)
+                onDismiss();
+        };
+        addAndMakeVisible (dismissButton);
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (juce::Colours::black.withAlpha (0.76f));
+
+        const auto card = getCardBounds().toFloat();
+        g.setColour (cue::panelDark);
+        g.fillRoundedRectangle (card, 8.0f);
+
+        g.setColour (accentOrange.withAlpha (0.9f));
+        g.drawRoundedRectangle (card, 8.0f, 1.2f);
+        g.fillRoundedRectangle (card.withHeight (4.0f), 2.0f);
+
+        auto textArea = getCardBounds().reduced (34, 24);
+        textArea.removeFromBottom (58);
+
+        g.setColour (cue::themedTitleColour (accentOrange));
+        g.setFont (cue::heavyFont (22.0f));
+        g.drawText ("LOAD A SAMPLE", textArea.removeFromTop (34),
+                    juce::Justification::centred, false);
+
+        textArea.removeFromTop (8);
+        g.setColour (cue::textPrimary.withAlpha (0.92f));
+        g.setFont (cue::monoFont (12.0f));
+        g.drawFittedText ("Choose an audio file to start chopping.\nWAV, AIFF, MP3, FLAC, and OGG are supported.",
+                          textArea, juce::Justification::centred, 2, 1.0f);
+    }
+
+    void resized() override
+    {
+        auto buttons = getCardBounds().reduced (34, 22).removeFromBottom (40);
+        constexpr int gap = 10;
+        const int dismissWidth = 104;
+        dismissButton.setBounds (buttons.removeFromRight (dismissWidth));
+        buttons.removeFromRight (gap);
+        loadButton.setBounds (buttons);
+    }
+
+private:
+    juce::Rectangle<int> getCardBounds() const noexcept
+    {
+        const int cardWidth = juce::jmin (460, juce::jmax (280, getWidth() - 40));
+        const int cardHeight = juce::jmin (220, juce::jmax (190, getHeight() - 40));
+        return juce::Rectangle<int> (cardWidth, cardHeight).withCentre (getLocalBounds().getCentre());
+    }
+
+    cue::SmoothHoverButton loadButton;
+    cue::SmoothHoverButton dismissButton;
+};
 } // namespace cue
 
 //==============================================================================
@@ -6208,6 +6349,11 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
         processorRef.setPitchSemitones ((float) waveformFooterComponent->getGlobalPitchSlider().getValue());
     };
 
+    waveformFooterComponent->getGlobalGainSlider().onValueChange = [this]
+    {
+        processorRef.setGlobalGainDecibels ((float) waveformFooterComponent->getGlobalGainSlider().getValue());
+    };
+
     waveformFooterComponent->getZoomSlider().setValue ((double) processorRef.getWaveformZoom(),
                                                        juce::dontSendNotification);
     waveformFooterComponent->updateScrollSensitivityForZoom (processorRef.getWaveformZoom());
@@ -6219,6 +6365,8 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
                                                         juce::dontSendNotification);
     waveformFooterComponent->getGlobalPitchSlider().setValue ((double) processorRef.getPitchSemitones(),
                                                               juce::dontSendNotification);
+    waveformFooterComponent->getGlobalGainSlider().setValue ((double) processorRef.getGlobalGainDecibels(),
+                                                             juce::dontSendNotification);
     transportSectionComponent->getBarsButton().setButtonText (juce::String (processorRef.getChopBarsCount())
                                                               + (processorRef.getChopBarsCount() == 1 ? " BAR" : " BARS"));
 
@@ -6300,13 +6448,29 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     };
     addChildComponent (*updateBannerComponent); // invisible by default
 
+    initialLoadOverlayComponent = std::make_unique<cue::InitialLoadOverlayComponent>();
+    initialLoadOverlayComponent->onLoad = [this]
+    {
+        initialLoadOverlayComponent->setVisible (false);
+        loadSampleFromFile();
+    };
+    initialLoadOverlayComponent->onDismiss = [this]
+    {
+        initialLoadOverlayComponent->setVisible (false);
+    };
+    addChildComponent (*initialLoadOverlayComponent); // shown asynchronously for a fresh instance
+
     setOpaque (true);
-    // Free-form resize with one uniform chassis scale.
+    // Keep the window on the chassis aspect ratio. The UI deliberately scales
+    // uniformly, so allowing height-only growth would leave an unused strip
+    // below the keyboard instead of enlarging the controls.
+    setResizable (true, true);
     setResizeLimits (juce::roundToInt ((float) cue::editorWidth * cue::minEditorScale),
                      juce::roundToInt ((float) cue::editorHeight * cue::minEditorScale),
                      3400,
                      juce::roundToInt ((float) cue::editorHeight * cue::maxEditorScale));
-    setResizable (true, true);
+    if (auto* constrainer = getConstrainer())
+        constrainer->setFixedAspectRatio ((double) cue::editorWidth / (double) cue::editorHeight);
     setSize (cue::editorWidth, cue::editorHeight);
     transportSectionComponent->refreshDisplays();
     startTimerHz (30);
@@ -6314,6 +6478,23 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     // Show immediately if a cached result already flags an update; otherwise the
     // 30 Hz timer will reveal it once the background check finishes.
     showUpdateBannerIfNeeded();
+
+    // Let the host attach and show the editor before revealing the in-plugin
+    // first-run prompt. The native chooser opens only after LOAD SAMPLE is
+    // pressed. The processor-side claim prevents the prompt from repeating
+    // when the editor window is reopened.
+    juce::Component::SafePointer<AudioPluginAudioProcessorEditor> safeThis (this);
+    juce::MessageManager::callAsync ([safeThis]
+    {
+        if (auto* editor = safeThis.getComponent();
+            editor != nullptr && editor->processorRef.claimInitialLoadSamplePrompt())
+        {
+            editor->initialLoadOverlayComponent->setBounds (editor->getLocalBounds());
+            editor->initialLoadOverlayComponent->setVisible (true);
+            editor->initialLoadOverlayComponent->toFront (true);
+            editor->initialLoadOverlayComponent->grabKeyboardFocus();
+        }
+    });
 }
 
 AudioPluginAudioProcessorEditor::~AudioPluginAudioProcessorEditor()
@@ -6420,6 +6601,10 @@ void AudioPluginAudioProcessorEditor::changeListenerCallback (juce::ChangeBroadc
 
         if (source == &processor.sampleChangeBroadcaster)
         {
+            // A load or host-state restore supersedes the first-run prompt.
+            if (editor->initialLoadOverlayComponent != nullptr)
+                editor->initialLoadOverlayComponent->setVisible (false);
+
             editor->waveformFooterComponent->getZoomSlider().setValue ((double) processor.getWaveformZoom(),
                                                                        juce::sendNotificationSync);
             editor->waveformFooterComponent->getScrollSlider().setValue ((double) processor.getWaveformScroll(),
@@ -6431,6 +6616,8 @@ void AudioPluginAudioProcessorEditor::changeListenerCallback (juce::ChangeBroadc
         // undo / auto-save recall).
         editor->waveformFooterComponent->getGlobalPitchSlider().setValue ((double) processor.getPitchSemitones(),
                                                                           juce::dontSendNotification);
+        editor->waveformFooterComponent->getGlobalGainSlider().setValue ((double) processor.getGlobalGainDecibels(),
+                                                                         juce::dontSendNotification);
         editor->waveformFooterComponent->getTempoSlider().setValue ((double) processor.getGridBpmTrim(),
                                                                     juce::dontSendNotification);
         editor->transportSectionComponent->getSyncButton().setToggleState (processor.getSyncToHost(),
@@ -6478,7 +6665,7 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
     // Keep interaction guidance outside the waveform screen so chop fills,
     // markers, and grid lines can never obscure it.
     cue::drawHelperText (g,
-                         "Click chop: preview/select   Drag edge: resize tempo   Shift-drag edge: snap to bar",
+                         "Click chop: preview/select   Drag edge: resize chop   Shift-drag edge: change tempo",
                          juce::Rectangle<int> (170, 84, juce::jmax (0, (int) fluidW - 180), 20),
                          juce::Justification::centred, 10.8f,
                          cue::textMuted.withAlpha (0.9f));
@@ -6541,6 +6728,12 @@ void AudioPluginAudioProcessorEditor::resized()
     {
         warpHelpOverlayComponent->setBounds (getLocalBounds());
         warpHelpOverlayComponent->toFront (true);
+    }
+
+    if (initialLoadOverlayComponent != nullptr && initialLoadOverlayComponent->isVisible())
+    {
+        initialLoadOverlayComponent->setBounds (getLocalBounds());
+        initialLoadOverlayComponent->toFront (true);
     }
 }
 

@@ -140,8 +140,14 @@ public:
     void setPlaybackSamplePosition (double newPosition) noexcept;
     void setTimeStretchRatio (float newRatio) noexcept;
     void setPitchSemitones (float newSemitones) noexcept;
+    void setGlobalGainDecibels (float newGainDecibels) noexcept;
     void setSyncToHost (bool shouldSync) noexcept;
     void setHalfTimeEnabled (bool shouldEnable) noexcept;
+
+    // Returns true once for a newly-created processor that has neither loaded
+    // a sample nor received host-restored state. Used to show the initial
+    // in-plugin load prompt without repeating it when the editor is reopened.
+    bool claimInitialLoadSamplePrompt() noexcept;
 
     // MIDI octave shift, in octaves, applied to the chop note mapping so users
     // whose keyboard lacks octave buttons can reach all chops. 0 = default
@@ -169,11 +175,13 @@ public:
     void setWaveformZoom (float zoomValue) noexcept;
     void setWaveformScroll (float scrollValue) noexcept;
 
-    // Resize a chop by moving its left or right edge to a new sample position.
-    // The implied chop length sets the new BPM trim, and the grid offset is
-    // adjusted so the dragged edge lands on a fresh chop boundary. All other
-    // chops are then rebuilt against this new grid.
-    void  resizeChopBoundary (int chopId, int newStartSample, int newEndSample);
+    // Shift-resize: the implied chop length sets the new BPM trim, and the grid
+    // offset is adjusted so the dragged edge becomes a fresh chop boundary.
+    // All chops are rebuilt against the resulting grid.
+    void  resizeChopBoundaryAndTempo (int chopId, int newStartSample, int newEndSample);
+
+    // Normal resize: change only this chop's source bounds. Tempo, grid, and
+    // every other chop remain untouched.
     void  setChopBounds (int chopId, int newStartSample, int newEndSample);
 
     bool isPlaying() const noexcept;
@@ -183,6 +191,7 @@ public:
     float getOutputMeterLevel() const noexcept;
     float getTimeStretchRatio() const noexcept;
     float getPitchSemitones() const noexcept;
+    float getGlobalGainDecibels() const noexcept;
     bool getSyncToHost() const noexcept;
     bool getHalfTimeEnabled() const noexcept;
     double getHostBpm() const noexcept;
@@ -374,6 +383,7 @@ private:
         float restoredWaveformZoom = 0.25f;
         float restoredWaveformScroll = 0.0f;
         float restoredGlobalPitch = 0.0f;
+        float restoredGlobalGainDecibels = 0.0f;
         bool restoredSyncToHost = false;
         bool restoredHalfTime = false;
         bool restoredMuteDrums = false;
@@ -402,6 +412,10 @@ private:
         // playbackStopSample / sourceLength instead of deactivating. Transport
         // playback loops continuously; MIDI playback loops until note-off.
         double playbackLoopStartSample = -1.0;
+        // Stable identity of the chop that started this voice. Keeping this
+        // separate from the moving playhead lets live boundary/cue edits keep
+        // targeting the same chop while it loops.
+        int activeChopId = -1;
         bool playbackActive = false;
         bool bungeeResetPending = true;
         float midiVelocity = 1.0f;
@@ -428,6 +442,7 @@ private:
             playbackSamplePosition = 0.0;
             playbackStopSample = -1.0;
             playbackLoopStartSample = -1.0;
+            activeChopId = -1;
             playbackTriggeredByMidi = false;
             bungeeResetPending = true;
             fadeGain = 1.0f;
@@ -530,12 +545,13 @@ private:
     // thread setters post these flags instead of touching the voice directly
     // (the old direct writes were a data race). Consumed once per block.
     std::atomic<bool> voiceResetRequest { false };        // → voice.bungeeResetPending
-    std::atomic<bool> clearVoiceStopRequest { false };    // → voice.playbackStopSample = -1
+    std::atomic<bool> clearVoiceStopRequest { false };    // → clear the voice's chop binding/stop
     std::atomic<int>  pendingSyncAnchorCommand { 0 };     // 0 none, 1 rebase to current pos, 2 clear
     std::atomic<double> pendingTransportSeekPosition { 0.0 };
     std::atomic<double> pendingStartPosition { 0.0 };
     std::atomic<double> pendingStartStopSample { -1.0 };
     std::atomic<double> pendingStartLoopSample { -1.0 };
+    std::atomic<int> pendingStartChopId { -1 };
     std::atomic<double> pendingStartSyncPpq { 0.0 };
     std::atomic<double> pendingStartSyncSample { 0.0 };
     std::atomic<bool> pendingStartSyncAnchorValid { false };
@@ -582,6 +598,8 @@ private:
     std::atomic<float> outputMeterLevel { 0.0f };
     std::atomic<float> timeStretchRatio { 1.0f };
     std::atomic<float> pitchSemitones { 0.0f };
+    std::atomic<float> globalGainDecibels { 0.0f };
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> smoothedGlobalGain;
     std::atomic<double> hostBpm { 0.0 };
     std::atomic<double> hostPpqPosition { 0.0 };
     std::atomic<bool> hostHasPpqPosition { false };
@@ -595,6 +613,8 @@ private:
     std::atomic<float> gridStartOffset { 0.0f };
     std::atomic<float> waveformZoom { 0.25f };
     std::atomic<float> waveformScroll { 0.0f };
+    std::atomic<bool> restoredStateReceived { false };
+    std::atomic<bool> initialLoadSamplePromptClaimed { false };
 
     // (Re)build the per-voice Bungee stretcher/stream pair so it matches the
     // currently known source sample rate, host sample rate, and channel
