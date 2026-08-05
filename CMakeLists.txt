@@ -8,10 +8,12 @@ cmake_minimum_required(VERSION 3.22)
 
 project(CueSampler VERSION 1.0.6)
 include(FetchContent)
+find_package(Git REQUIRED)
 
-# Copy the built plugin into the OS plugin directory after each build. On by
-# default for local dev; CI sets -DCUE_COPY_PLUGIN_AFTER_BUILD=OFF so it never
-# tries to write to a system location (e.g. Program Files) on the runner.
+# Copy the fully staged plugin into the OS plugin directory after each build.
+# This is enabled manually after our runtime/model POST_BUILD commands below;
+# enabling JUCE's copy step inside juce_add_plugin() would copy the bundle before
+# those files are present.
 option(CUE_COPY_PLUGIN_AFTER_BUILD "Install plugin to the default OS plugin dir after build" ON)
 
 if(APPLE)
@@ -60,6 +62,7 @@ FetchContent_Declare(bungee
     PATCH_COMMAND ${CMAKE_COMMAND}
         -DSRC_DIR=<SOURCE_DIR>
         -DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/bungee-stream-reset.patch
+        -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/patches/apply_bungee_patch.cmake)
 FetchContent_MakeAvailable(bungee)
 
@@ -151,7 +154,7 @@ juce_add_plugin(CueSampler
     # NEEDS_MIDI_OUTPUT TRUE/FALSE              # Does the plugin need midi output?
     # IS_MIDI_EFFECT TRUE/FALSE                 # Is this plugin a MIDI effect?
     # EDITOR_WANTS_KEYBOARD_FOCUS TRUE/FALSE    # Does the editor need keyboard focus?
-    COPY_PLUGIN_AFTER_BUILD ${CUE_COPY_PLUGIN_AFTER_BUILD}  # Install to the default plugin dir after each build (off in CI)
+    COPY_PLUGIN_AFTER_BUILD FALSE               # Enabled manually after runtime/model staging below
     COMPANY_NAME "CUE SOFTWARE"
     BUNDLE_ID "com.cuesoftware.cuesampler"
     PLUGIN_MANUFACTURER_CODE Cues               # A four-character manufacturer id with at least one upper-case character
@@ -335,6 +338,15 @@ elseif(WIN32)
     # the .vst3 / Standalone to run self-contained.
     foreach(_fmt VST3 Standalone)
         if(TARGET CueSampler_${_fmt})
+            # When the optional model exists at configure time, make it a link
+            # dependency. This forces POST_BUILD staging to run when the model
+            # is first added or replaced instead of leaving an otherwise
+            # up-to-date plugin bundle silently model-less.
+            if(EXISTS "${CUE_STEM_MODEL_SRC}")
+                set_property(TARGET CueSampler_${_fmt} APPEND PROPERTY
+                    LINK_DEPENDS "${CUE_STEM_MODEL_SRC}")
+            endif()
+
             # htdemucs model staged next to the binary (htdemucs/htdemucs.onnx),
             # in the SAME POST_BUILD so it precedes JUCE's install copy (so the
             # installed plugin gets it too). copy_if_exists skips it if absent.
@@ -399,6 +411,18 @@ if(CUE_BUILD_STEM_TEST)
         # So the test can find the bundled onnxruntime dylib when run in-tree.
         set_target_properties(test_stem_separator PROPERTIES
             BUILD_RPATH "${ONNXRUNTIME_ROOT}/lib")
+    elseif(WIN32)
+        # Keep the offline test self-contained just like the plugin. Without
+        # these copies Windows fails at process startup before it can validate
+        # the model or report which execution provider was selected.
+        add_custom_command(TARGET test_stem_separator POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${ORT_RUNTIME_DLL}"
+                "$<TARGET_FILE_DIR:test_stem_separator>/onnxruntime.dll"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${DIRECTML_DLL}"
+                "$<TARGET_FILE_DIR:test_stem_separator>/DirectML.dll"
+            COMMENT "Windows: staging ONNX Runtime + DirectML beside test_stem_separator")
     endif()
 endif()
 
@@ -409,4 +433,12 @@ if(WIN32 AND MSVC)
             target_link_options(${_tgt} PRIVATE "/DELAYLOAD:onnxruntime.dll")
         endif()
     endforeach()
+endif()
+
+# JUCE documents that projects which modify/stage a plugin bundle must enable
+# the copy step only after all custom POST_BUILD work has been registered. This
+# ensures the system-installed VST3/AU contains ONNX Runtime, DirectML, models,
+# and (on macOS) the final valid signature.
+if(CUE_COPY_PLUGIN_AFTER_BUILD)
+    juce_enable_copy_plugin_step(CueSampler)
 endif()

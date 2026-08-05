@@ -140,9 +140,17 @@ int main (int argc, char* argv[])
     auto secsSince = [] (clock::time_point t0)
     { return std::chrono::duration<double> (clock::now() - t0).count(); };
 
+   #if defined(_WIN32)
+    const bool dmlOn = std::getenv ("CUE_DISABLE_DIRECTML") == nullptr;
+    std::cout << "Execution provider: " << (dmlOn ? "DirectML + CPU fallback (default)"
+                                                  : "CPU only (CUE_DISABLE_DIRECTML set)") << "\n";
+   #elif defined(__APPLE__)
     const bool coremlOn = std::getenv ("CUE_ENABLE_COREML") != nullptr;
     std::cout << "Execution provider: " << (coremlOn ? "CoreML + CPU fallback (CUE_ENABLE_COREML set)"
                                                      : "CPU only (default)") << "\n";
+   #else
+    std::cout << "Execution provider: CPU\n";
+   #endif
 
     const auto tLoad0 = clock::now();
     StemSeparator sep (paths);

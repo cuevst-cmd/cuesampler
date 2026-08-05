@@ -1,0 +1,43 @@
+CUE SAMPLER - THIRD-PARTY SOFTWARE NOTICES
+==========================================
+
+This product includes third-party software and model weights. The applicable
+licence texts and notices are installed beside this file. These components are
+not covered by the CUE SAMPLER end-user licence where their own terms apply.
+
+JUCE 8.0.12
+Source: https://github.com/juce-framework/JUCE/tree/8.0.12
+Licence: Commercial JUCE 8 licence, or AGPLv3 when its requirements are met.
+CUE SAMPLER's commercial binary distribution requires the product owner to
+hold and maintain the appropriate JUCE commercial licence.
+
+Bungee, commit 7354c0c62652dd85af90fddfeec307881f3b4252
+Source: https://github.com/bungee-audio-stretch/bungee
+Licence: Mozilla Public License 2.0.
+CUE SAMPLER modifies bungee/Stream.h. The complete corresponding modified
+source, including its versioned submodules, is provided in
+Bungee-7354c0c-modified-source.zip under the MPL 2.0. CUE SAMPLER itself is a
+Larger Work and is not licensed under the MPL.
+
+ONNX Runtime 1.20.1
+Source: https://github.com/microsoft/onnxruntime/tree/v1.20.1
+Licence: MIT. See ONNX-Runtime-MIT.txt and its third-party notices.
+
+Microsoft DirectML 1.15.2
+Source: https://www.nuget.org/packages/Microsoft.AI.DirectML/1.15.2
+Licence: Microsoft Software License Terms. See DirectML-LICENSE.txt and its
+third-party notices.
+
+Beat This! model weights
+Source: https://github.com/CPJKU/beat_this
+Copyright (c) 2024 Institute of Computational Perception, JKU Linz, Austria.
+Licence: MIT. See Beat-This-MIT.txt.
+
+Hybrid Transformer Demucs model weights (only when included)
+Source: https://github.com/facebookresearch/demucs
+Copyright (c) Meta Platforms, Inc. and affiliates.
+Licence: MIT. See Demucs-MIT.txt.
+
+Syne typeface
+Copyright 2017 The Syne Project Authors.
+Licence: SIL Open Font License 1.1. See Syne-OFL-1.1.txt.

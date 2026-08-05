@@ -1,11 +1,10 @@
 # CUE SAMPLER — Windows VM build checklist (CLion)
 
-> Goal: get the first **green Windows build** of CUE SAMPLER on a Windows VM using
+> Goal: reproduce a **green Windows x64 build** of CUE SAMPLER on a Windows VM using
 > CLion. The repo is already cross-platform (`CMakeLists.txt` uses FetchContent for
 > JUCE / Bungee / ONNX with `if(APPLE) / elseif(WIN32)` branches, and there is a
-> GitHub Actions Windows+macOS matrix). **The Windows build has never actually been
-> compiled**, so treat this as a debugging session, not a one-click build. The most
-> likely thing to break is **Bungee under MSVC** (see Known risks).
+> GitHub Actions Windows+macOS matrix). The Release VST3 build has been verified
+> with MSVC on a Windows ARM64 VM targeting x64.
 >
 > Use the VM to fix compile errors fast (CI is too slow to iterate on). Once it's
 > green, let GitHub Actions keep both platforms green on every push.
@@ -23,6 +22,12 @@
       runs `git apply`.
 - [ ] CMake + Ninja — **no install needed**, CLion bundles both (well above the
       3.22 minimum). If you prefer system tools, CMake ≥ 3.22 is the floor.
+- [ ] **NSIS 3.12 or newer**, used by `make-installer-windows.ps1` to create the
+      commercial-use-compatible Windows installer.
+
+On an Apple Silicon VM, Windows and CLion run as ARM64 but CueSampler must still
+target **amd64/x64**: the bundled ONNX Runtime, DirectML package, VST3 layout, and
+installer are x64. Visual Studio's ARM64-hosted x64 cross-compiler supports this.
 
 ## 2. Before you clone — line endings (one Windows gotcha)
 
@@ -45,9 +50,9 @@ FetchContent clones separately. Do both.
       git clone https://github.com/cuevst-cmd/cuesampler.git
       ```
 - [ ] **Stem-separation model is NOT in the clone.** `assets/htdemucs/htdemucs.onnx`
-      (~302 MB) is gitignored. The build **skips it gracefully** (stem separation
-      disables, StemSeparator falls back; everything else works). Copy it onto the
-      VM into `assets/htdemucs/` only if you want to test stems.
+      (~302 MB) is gitignored. Run `download-htdemucs-model.ps1` to fetch and
+      SHA-256-verify the pinned model before configuring a stem-enabled build. The
+      build skips it gracefully when absent, but commercial packaging fails closed.
 - [ ] The **beat model `assets/beat_this.onnx` (+ `.data`) IS committed**, so beat
       analysis works out of the box.
 
@@ -77,9 +82,8 @@ cmake --build build --config Release --parallel
 
 ## 5. Known risks (where to look if it goes red)
 
-1. **Bungee under MSVC — the #1 unknown.** It's a SIMD time-stretch lib that may
-   assume Clang/GCC flags or intrinsics. If the build fails here first, that's
-   expected; fix the MSVC compile flags/intrinsics in Bungee's usage.
+1. **Bungee under MSVC.** The checked-in compatibility shim covers the currently
+   pinned Bungee commit. Re-test this first whenever that dependency is updated.
 2. **Bungee patch didn't apply** → almost always line endings. Re-check section 2
    (`core.autocrlf input`) and that `.gitattributes` is present in the clone.
 3. **LTO build time.** The project links `juce_recommended_lto_flags`; LTO under
@@ -102,6 +106,35 @@ cmake --build build --config Release --parallel
 
 - The GitHub Actions matrix (`.github/workflows/build.yml`) builds Windows + macOS
   on every push and uploads artifacts — treat a red Windows job like a red Mac job.
-- Optionally add the `API_KEYS_H` GitHub secret (CI falls back to the example file
-  if absent), and later a Windows installer (Inno Setup / WiX) + Authenticode
-  signing. See `WINDOWS_PORT_PLAN.md` Phases 5–7.
+- Build the NSIS installer with `make-installer-windows.ps1`, validate it in
+  Windows DAWs, and Authenticode-sign the VST3 and installer before public release.
+  The script packages the signed Microsoft VC++ x64 redistributable required by
+  both the plugin and ONNX Runtime.
+
+## 8. Commercial Windows release
+
+The normal script invocation creates an **unsigned development candidate** whose
+filename ends in `-UNSIGNED.exe`. It
+must not be represented as the sellable release. Before a paid distribution:
+
+- Confirm eligibility for the applicable JUCE 8 plan. The free Starter plan is
+  currently available when annual revenue or funding is no more than $20,000;
+  purchasing Indie or Pro is not required while Starter remains applicable.
+- Install NSIS 3.12 or newer. NSIS is distributed under licences that permit
+  commercial use; no paid installer-builder licence or activation key is needed.
+- Install a publicly trusted Authenticode code-signing certificate with its
+  private key in `CurrentUser\My` or `LocalMachine\My`.
+- Run the commercial gate (replace the example with the real certificate SHA-1
+  thumbprint):
+
+```powershell
+.\make-installer-windows.ps1 -BuildDir build -CommercialRelease `
+  -JuceLicenseEligibilityConfirmed `
+  -SigningCertificateThumbprint "0123456789ABCDEF0123456789ABCDEF01234567"
+```
+
+That mode signs and timestamp-verifies the VST3 binary and final installer,
+packages all third-party notices plus Bungee's corresponding MPL source, and
+only then writes the final SHA-256 sidecar. It fails closed when a confirmation,
+trusted certificate/private key, timestamp, signature verification, or licensed
+JUCE entitlement is missing. NSIS itself does not add a paid-tool entitlement.

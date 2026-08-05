@@ -8,20 +8,23 @@
 # it (PluginProcessor.cpp, bungeeResetPending path). Keeping the change as a
 # patch lets us pin pristine upstream and stay reproducible on macOS + Windows.
 
-if(NOT DEFINED SRC_DIR OR NOT DEFINED PATCH_FILE)
-    message(FATAL_ERROR "apply_bungee_patch: SRC_DIR and PATCH_FILE must be set")
+if(NOT DEFINED SRC_DIR OR NOT DEFINED PATCH_FILE OR NOT DEFINED GIT_EXECUTABLE)
+    message(FATAL_ERROR "apply_bungee_patch: SRC_DIR, PATCH_FILE, and GIT_EXECUTABLE must be set")
 endif()
 
 # Can the patch be applied as-is?
 execute_process(
-    COMMAND git apply --ignore-whitespace --check "${PATCH_FILE}"
+    # FetchContent directories can be created by the interactive Windows user
+    # and later configured by a sandbox/CI identity. Trust only this exact
+    # fetched worktree for this invocation instead of mutating global Git config.
+    COMMAND "${GIT_EXECUTABLE}" -c "safe.directory=${SRC_DIR}" apply --ignore-whitespace --check "${PATCH_FILE}"
     WORKING_DIRECTORY "${SRC_DIR}"
     RESULT_VARIABLE can_apply
     ERROR_QUIET OUTPUT_QUIET)
 
 if(can_apply EQUAL 0)
     execute_process(
-        COMMAND git apply --ignore-whitespace "${PATCH_FILE}"
+        COMMAND "${GIT_EXECUTABLE}" -c "safe.directory=${SRC_DIR}" apply --ignore-whitespace "${PATCH_FILE}"
         WORKING_DIRECTORY "${SRC_DIR}"
         RESULT_VARIABLE applied)
     if(NOT applied EQUAL 0)
@@ -31,7 +34,7 @@ if(can_apply EQUAL 0)
 else()
     # Already applied? The reverse patch should then apply cleanly.
     execute_process(
-        COMMAND git apply --ignore-whitespace --reverse --check "${PATCH_FILE}"
+        COMMAND "${GIT_EXECUTABLE}" -c "safe.directory=${SRC_DIR}" apply --ignore-whitespace --reverse --check "${PATCH_FILE}"
         WORKING_DIRECTORY "${SRC_DIR}"
         RESULT_VARIABLE already_applied
         ERROR_QUIET OUTPUT_QUIET)

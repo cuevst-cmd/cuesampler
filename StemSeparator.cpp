@@ -439,7 +439,16 @@ StemSeparator::Stems44 StemSeparator::runModel (const Model& model,
     const double t0      = juce::Time::getMillisecondCounterHiRes();
     const double overlap = resolveOverlap (kOverlap);
 
-    const int seg    = resolveSegment (kSegmentSamples);
+    // The published fp32 graph currently has a fixed T=343980 input. Honour a
+    // fixed model dimension even if CUE_STEM_SEGMENT is set; only apply the
+    // memory-tuning override to a future export whose time axis is dynamic.
+    const auto modelInputShape = model.session->GetInputTypeInfo (0)
+                                     .GetTensorTypeAndShapeInfo().GetShape();
+    const bool dynamicTimeAxis = modelInputShape.size() >= 3 && modelInputShape[2] < 0;
+    const int fixedModelSegment = (modelInputShape.size() >= 3 && modelInputShape[2] > 0)
+                                ? (int) modelInputShape[2]
+                                : kSegmentSamples;
+    const int seg    = dynamicTimeAxis ? resolveSegment (kSegmentSamples) : fixedModelSegment;
     const int stride = juce::jmax (1, (int) std::llround ((double) seg * (1.0 - overlap)));
 
     // Triangular overlap-add weight (Demucs, transition_power = 1): ramp 1..max

@@ -1,17 +1,18 @@
 # Stem Separation — Manual Test Checklist
 
-End-to-end manual verification for the HTDemucs-FT stem-mute feature. Run after any
-change to the separation / mute / cache-refresh paths. Assumes the three models are
-present in `assets/htdemucs_ft/` (drums.onnx, bass.onnx, vocals.onnx) — produce them
-with `export_htdemucs.py` or download from `StemSplitio/htdemucs-ft-onnx` on Hugging
-Face. Load the VST3 or AU in a DAW (or AudioPluginHost); watch the log for lines
+End-to-end manual verification for the HTDemucs stem-mute feature. Run after any
+change to the separation / mute / cache-refresh paths. Assumes the single model is
+present at `assets/htdemucs/htdemucs.onnx`; on Windows, fetch and verify it with
+`download-htdemucs-model.ps1`.
+Load the VST3 or AU in a DAW (or AudioPluginHost); watch the log for lines
 prefixed `StemSeparator:`.
 
 ## Happy path
 - [ ] Load a short song (≤ a few minutes). The STEMS panel shows **SEPARATING n%** with
       the three buttons disabled/dimmed; progress climbs.
-- [ ] Log shows `StemSeparator: ... ready=YES` at startup and (macOS) either
-      `CoreML execution provider enabled` or `CoreML EP unavailable, using CPU`.
+- [ ] Log shows `StemSeparator: ... ready=YES` after the first separation request.
+      Windows should report DirectML or a clean CPU fallback; macOS uses CPU unless
+      `CUE_ENABLE_COREML=1` is explicitly set.
 - [ ] When done, status shows **READY** and BASS / DRUMS / VOCALS become enabled.
 - [ ] Toggle **VOCALS** → the keycap lights; vocals drop out of playback within a moment.
       Toggle off → vocals return. Repeat for **DRUMS** and **BASS** (audible each time).
@@ -40,7 +41,7 @@ prefixed `StemSeparator:`.
 
 ## Edge cases
 - [ ] No sample loaded → panel is neutral (title only / blank status), buttons disabled.
-- [ ] Models missing (empty `assets/htdemucs_ft/`) → status **NO MODEL**, buttons disabled,
+- [ ] Model missing (empty `assets/htdemucs/`) → status **NO MODEL**, buttons disabled,
       original plays normally, log: `separation unavailable (models not ready)`. No crash.
 - [ ] Load a very long sample (> 10 min) → status **SAMPLE TOO LONG**, buttons disabled,
       original plays, log: `sample too long (... ) — skipping separation`. (Constant:
@@ -55,4 +56,4 @@ prefixed `StemSeparator:`.
 The offline `tools/test_stem_separator.cpp` (build with `-DCUE_BUILD_STEM_TEST=ON`,
 target `test_stem_separator`) asserts stem shapes, the subtraction reconstruction, per-stem
 energy/distinctness, and the mute-mix model (no-mute == original; vocals-muted ==
-original − vocals). Run it on a short stereo WAV with the models present.
+original − vocals). Run it on a short stereo WAV with the model present.
