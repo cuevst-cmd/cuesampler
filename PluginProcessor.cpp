@@ -3642,8 +3642,17 @@ AudioPluginAudioProcessor::parseDeferredRestoreState (const juce::ValueTree& sta
 
     restoreState.restoredGridBpmTrim = juce::jlimit (-10.0f, 10.0f,
                                                      (float) (double) state.getProperty ("gridBpmTrim", 0.0));
-    restoreState.restoredGridStartOffset = juce::jlimit (-1.0f, 1.0f,
-                                                         (float) (double) state.getProperty ("gridStartOffset", 0.0));
+    // gridStartOffset is measured in seconds, not as a normalized control value.
+    // resizeChopBoundaryAndTempo() can legitimately produce offsets beyond one
+    // second (a slow bar alone can be several seconds long).  Clamping the saved
+    // value to +/-1 here made restored chops keep their exact sample positions
+    // while the independently painted tempo grid used a different anchor.
+    const auto savedGridStartOffset = (double) state.getProperty ("gridStartOffset", 0.0);
+    restoreState.restoredGridStartOffset = std::isfinite (savedGridStartOffset)
+        && savedGridStartOffset >= -(double) std::numeric_limits<float>::max()
+        && savedGridStartOffset <=  (double) std::numeric_limits<float>::max()
+            ? (float) savedGridStartOffset
+            : 0.0f;
     restoreState.restoredWaveformZoom = juce::jlimit (0.0f, 1.0f,
                                                       (float) (double) state.getProperty ("waveformZoom", 0.25));
     restoreState.restoredWaveformScroll = juce::jlimit (0.0f, 1.0f,
