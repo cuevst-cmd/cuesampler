@@ -20,9 +20,9 @@ if(APPLE)
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Build for both architectures" FORCE)
     # Minimum supported macOS. Without this, the binary inherits the build
     # machine's SDK version as its floor (macOS 26), which makes the plugin
-    # refuse to load on older systems. macOS 15.0 is our supported floor; the
-    # bundled onnxruntime (minos 13.3) is satisfied by this.
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS version" FORCE)
+    # refuse to load on older systems. ONNX Runtime 1.18.1 is universal and
+    # supports macOS 11.0 for both Intel and Apple Silicon.
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version" FORCE)
 endif()
 
 set(BUILD_TOOLS OFF CACHE BOOL "" FORCE)
@@ -92,11 +92,12 @@ if(WIN32 AND MSVC)
     endif()
 endif()
 
-# ONNX Runtime 1.20.1 — official prebuilt package, downloaded per-platform.
+# ONNX Runtime — official prebuilt package, downloaded per-platform.
 # Not committed to the repo (binaries are gitignored). The archive has no
 # CMakeLists.txt, so FetchContent_MakeAvailable just populates it.
 #
-# macOS uses the GitHub CPU build (CoreML is off by default — see StemSeparator).
+# macOS pins 1.18.1 because its universal binary supports macOS 11.0 while still
+# loading both bundled models. CoreML is off by default — see StemSeparator.
 # Windows uses the DirectML-enabled NuGet build instead of the GitHub CPU zip so
 # the htdemucs stem pass can run on any DX12 GPU (NVIDIA/AMD/Intel), ~10x faster
 # than the CPU path. The NuGet packages are zips with a different internal layout
@@ -105,14 +106,18 @@ endif()
 # onnxruntime 1.20.1's DML EP needs the matching DirectML 1.15.2 redistributable,
 # shipped as its own NuGet (Microsoft.AI.DirectML) — staged next to the DLL below.
 if(APPLE)
+    set(ORT_VERSION "1.18.1")
+    set(ORT_DYLIB_NAME "libonnxruntime.${ORT_VERSION}.dylib")
     FetchContent_Declare(onnxruntime
-        URL https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-osx-universal2-1.20.1.tgz
+        URL https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-universal2-${ORT_VERSION}.tgz
+        URL_HASH SHA256=014f6332da3fa51926c57ca973c2d03ceebae069a537f55765848260ab4bf8f7
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
     FetchContent_MakeAvailable(onnxruntime)
 elseif(WIN32)
+    set(ORT_VERSION "1.20.1")
     FetchContent_Declare(onnxruntime
-        URL https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/1.20.1
-        DOWNLOAD_NAME onnxruntime-directml-1.20.1.zip
+        URL https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/${ORT_VERSION}
+        DOWNLOAD_NAME onnxruntime-directml-${ORT_VERSION}.zip
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
     FetchContent_Declare(directml
         URL https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/1.15.2
@@ -124,7 +129,7 @@ endif()
 set(ONNXRUNTIME_ROOT "${onnxruntime_SOURCE_DIR}")
 if(APPLE)
     set(ORT_INCLUDE_DIR "${ONNXRUNTIME_ROOT}/include")
-    set(ORT_LINK_LIB    "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.1.20.1.dylib")
+    set(ORT_LINK_LIB    "${ONNXRUNTIME_ROOT}/lib/${ORT_DYLIB_NAME}")
 elseif(WIN32)
     set(ORT_INCLUDE_DIR "${ONNXRUNTIME_ROOT}/build/native/include")
     set(ORT_LINK_LIB    "${ONNXRUNTIME_ROOT}/runtimes/win-x64/native/onnxruntime.lib")
@@ -262,7 +267,7 @@ target_include_directories(CueSampler
 #     installed plugin (~/Library/Audio/Plug-Ins/...) gets the same complete,
 #     validly-signed bundle. A separate later block would populate only the build
 #     tree, leaving the DAW-loaded plugin without the stem models.
-set(ONNX_DYLIB "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.1.20.1.dylib")
+set(ONNX_DYLIB "${ONNXRUNTIME_ROOT}/lib/${ORT_DYLIB_NAME}")
 
 # Single base-htdemucs model. export_htdemucs.py writes ONE file,
 # assets/htdemucs/htdemucs.onnx (~316 MB, opset 17, weights embedded — NO
@@ -274,6 +279,7 @@ set(ONNX_DYLIB "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.1.20.1.dylib")
 # juce_add_binary_data — too large.
 set(CUE_STEM_MODEL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/assets/htdemucs/htdemucs.onnx")
 set(CUE_COPY_IF_EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_if_exists.cmake")
+set(CUE_REMOVE_STALE_ONNX "${CMAKE_CURRENT_SOURCE_DIR}/cmake/remove_stale_onnx_dylibs.cmake")
 
 if(APPLE)
     # VST3 (.vst3), AU (.component) and Standalone (.app) all share the bundle
@@ -296,10 +302,17 @@ if(APPLE)
             COMMAND ${CMAKE_COMMAND} -E make_directory
                 "$<TARGET_FILE_DIR:${_tgt}>/../Resources"
 
+            # Incremental builds may still contain the previously pinned dylib.
+            # Remove any version other than the one this build will stage.
+            COMMAND ${CMAKE_COMMAND}
+                "-DDST_DIR=$<TARGET_FILE_DIR:${_tgt}>"
+                "-DKEEP_NAME=${ORT_DYLIB_NAME}"
+                -P "${CUE_REMOVE_STALE_ONNX}"
+
             # libonnxruntime next to the binary (resolved via @loader_path)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${ONNX_DYLIB}"
-                "$<TARGET_FILE_DIR:${_tgt}>/libonnxruntime.1.20.1.dylib"
+                "$<TARGET_FILE_DIR:${_tgt}>/${ORT_DYLIB_NAME}"
 
             # beat_this model into Resources/ (small, committed → direct copy)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -315,15 +328,15 @@ if(APPLE)
 
             # Patch the binary so it finds libonnxruntime via @loader_path
             COMMAND install_name_tool
-                -change "@rpath/libonnxruntime.1.20.1.dylib"
-                        "@loader_path/libonnxruntime.1.20.1.dylib"
+                -change "@rpath/${ORT_DYLIB_NAME}"
+                        "@loader_path/${ORT_DYLIB_NAME}"
                 "$<TARGET_FILE:${_tgt}>"
 
             # Re-sign LAST: nested dylib first, then the whole bundle so the seal
             # (CodeResources) covers every file copied above. install_name_tool
             # invalidated the binary's signature; the bundle sign re-signs it too.
             COMMAND codesign --force --sign -
-                "$<TARGET_FILE_DIR:${_tgt}>/libonnxruntime.1.20.1.dylib"
+                "$<TARGET_FILE_DIR:${_tgt}>/${ORT_DYLIB_NAME}"
             COMMAND codesign --force --sign -
                 "$<TARGET_FILE_DIR:${_tgt}>/../.."
 

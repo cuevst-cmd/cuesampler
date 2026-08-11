@@ -2089,16 +2089,18 @@ public:
         const bool stretchUnity = std::abs (stretchRatio - 1.0f) < 0.005f;
         const bool ratesMatch   = std::abs (sourceRate - outputRate) < 0.5;
 
-        // Bake one chop (no-op if warped, unity, already cached, or superseded).
+        // Bake one chop (no-op if it has no expensive processing, is already
+        // cached, or this job has been superseded).
         auto bakeOne = [&] (const ChopDefinition& chop) -> bool
         {
             if (shouldExit()
                 || processor.prepareWarmGeneration.load (std::memory_order_acquire) != generation)
                 return false;
 
-            // Warp chops stay on the live path (their WarpMap mapping is not a
-            // straight 1:1 read), so don't spend RAM/CPU baking them here.
-            if (! chop.warpMarkers.empty())
+            // Forward warp chops stay on their dedicated cache/live path. A
+            // reversed warp chop needs a prepared buffer when pitch or stretch
+            // is active because Bungee only consumes forward input.
+            if (! chop.warpMarkers.empty() && ! chop.reversed)
                 return true;
 
             const float effPitch = juce::jlimit (-24.0f, 24.0f,
@@ -2685,8 +2687,12 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             v.playbackSamplePosition = pendingStartPosition.load (std::memory_order_acquire);
             v.playbackStopSample = pendingStartStopSample.load (std::memory_order_acquire);
             v.playbackLoopStartSample = pendingStartLoopSample.load (std::memory_order_acquire);
+            v.playbackCueStartSample = v.playbackLoopStartSample >= 0.0
+                                           ? v.playbackLoopStartSample
+                                           : v.playbackSamplePosition;
             v.activeChopId = pendingStartChopId.load (std::memory_order_acquire);
             v.playbackTriggeredByMidi = false;
+            v.midiOneShot = false;
             v.playbackActive = true;
             v.bungeeResetPending = true;
             v.fadeGain = 1.0f;
@@ -2758,12 +2764,17 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         {
             const auto liveLoopStart = getChopCueTimelineSample (*voiceChop, sourceRate);
             const auto liveStop = (double) voiceChop->endSample;
-            const bool geometryChanged = std::abs (liveLoopStart - v.playbackLoopStartSample) > 0.5
+            const auto desiredLoopStart = v.playbackTriggeredByMidi && v.midiOneShot
+                                              ? -1.0
+                                              : liveLoopStart;
+            const bool geometryChanged = std::abs (liveLoopStart - v.playbackCueStartSample) > 0.5
+                                      || std::abs (desiredLoopStart - v.playbackLoopStartSample) > 0.5
                                       || std::abs (liveStop - v.playbackStopSample) > 0.5;
 
             if (geometryChanged)
             {
-                v.playbackLoopStartSample = liveLoopStart;
+                v.playbackCueStartSample = liveLoopStart;
+                v.playbackLoopStartSample = desiredLoopStart;
                 v.playbackStopSample = liveStop;
                 v.bungeeResetPending = true;
 
@@ -2852,6 +2863,7 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                 cueStart = getChopCueTimelineSample (*activeChop, sourceRate);
             }
             const bool chopHasWarp = (activeChop != nullptr && ! activeChop->warpMarkers.empty());
+            const bool chopIsReversed = (activeChop != nullptr && activeChop->reversed);
 
             // Try to fetch the pre-baked pitch-neutral warp buffer from the cache.
             // renderWarpedChopBungee bakes each segment at pitchFactor=1.0 so the
@@ -2916,6 +2928,7 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
             const bool useBungee =
                 engineReady
+                && ! chopIsReversed
                 && (! pitchIsUnity || ! stretchIsUnity)
                 && (! chopHasWarp || warpedBuf != nullptr);
 
@@ -2944,7 +2957,9 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             // (settings just changed, not baked yet) simply falls through to the live
             // Bungee path below, so playback is never interrupted.
             bool handledByPrepared = false;
-            if (! chopHasWarp && activeChop != nullptr && (! pitchIsUnity || ! stretchIsUnity))
+            if (activeChop != nullptr
+                && (! chopHasWarp || chopIsReversed)
+                && (! pitchIsUnity || ! stretchIsUnity))
             {
                 const auto preparedKey = cuesampler::ChopAudioCache::makePreparedKey (
                     activeChop->startSample, activeChop->endSample, activeChop->cueOffsetSamples,
@@ -2963,7 +2978,10 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
                     for (int i = 0; i < chunk; ++i)
                     {
-                        const double preparedFrame = (v.playbackSamplePosition - chopStart) * invStep;
+                        const double forwardPreparedFrame = (v.playbackSamplePosition - chopStart) * invStep;
+                        const double preparedFrame = chopIsReversed
+                            ? (double) (pLen - 1) - (forwardPreparedFrame - (double) prepared->cueFrame)
+                            : forwardPreparedFrame;
                         const auto boundaryGain = computeSliceBoundaryGain (v.playbackSamplePosition, cueStart,
                                                                              v.playbackStopSample, fadeSamples,
                                                                              sliceEndFadeSamples);
@@ -3157,8 +3175,12 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
                         // Translate source-domain position to an offset into the warp buffer.
                         // The warp buffer starts at chopStart and covers chopEnd-chopStart frames.
-                        const double warpBufPos = v.playbackSamplePosition
-                                                  - (double) activeChop->startSample;
+                        const double forwardWarpBufPos = v.playbackSamplePosition
+                                                         - (double) activeChop->startSample;
+                        const double warpCueOffset = cueStart - (double) activeChop->startSample;
+                        const double warpBufPos = chopIsReversed
+                            ? (double) (warpBufLength - 1) - (forwardWarpBufPos - warpCueOffset)
+                            : forwardWarpBufPos;
 
                         for (int ch = 0; ch < outputChannels; ++ch)
                         {
@@ -3193,8 +3215,12 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                             const auto srcCh = juce::jmin (ch, sampleForBlock->buffer.getNumChannels() - 1);
                             const auto* srcData = sampleForBlock->buffer.getReadPointer (srcCh);
                             auto* outData       = buffer.getWritePointer (ch);
+                            const auto playbackTimelinePosition = chopIsReversed
+                                ? (double) (activeChop->endSample - 1)
+                                    - (v.playbackSamplePosition - cueStart)
+                                : v.playbackSamplePosition;
                             const auto mappedSourcePosition = mapChopTimelineToSourceSample (activeChop,
-                                                                                              v.playbackSamplePosition,
+                                                                                              playbackTimelinePosition,
                                                                                               sourceRate);
                             outData[segmentOffset + segmentWriteOffset + i] +=
                                 interpolateSampleLanczos (srcData, sourceLength, mappedSourcePosition, interpRadius)
@@ -3307,7 +3333,10 @@ void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg,
         if (msg.getNoteNumber() == heldMidiNote.load())
         {
             heldMidiNote.store (-1, std::memory_order_release);
-            voice.startFade (0.0f, (double) midiVoiceReleaseSamples);
+            // OneShot voices own their lifetime and play through the chop end.
+            // Gate voices retain the existing de-click release on note-off.
+            if (voice.playbackTriggeredByMidi && ! voice.midiOneShot)
+                voice.startFade (0.0f, (double) midiVoiceReleaseSamples);
         }
         return;
     }
@@ -3341,10 +3370,11 @@ void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg,
 
     vs.playbackSamplePosition = startPos;
     vs.playbackStopSample = (double) chop.endSample;
-    // Sustain the chop from its cue point for exactly as long as this MIDI
-    // note remains held. The matching note-off starts the existing short
-    // de-click fade, which then deactivates the monophonic voice.
-    vs.playbackLoopStartSample = startPos;
+    vs.playbackCueStartSample = startPos;
+    vs.midiOneShot = getChopPlaybackMode() == ChopPlaybackMode::OneShot;
+    // Gate sustains by wrapping from the chop end to its cue point. OneShot
+    // has no loop point, so the normal boundary path deactivates it at the end.
+    vs.playbackLoopStartSample = vs.midiOneShot ? -1.0 : startPos;
     vs.activeChopId = chop.id;
     vs.playbackTriggeredByMidi = true;
     vs.fadeGain = 1.0f;
@@ -3378,7 +3408,7 @@ juce::AudioProcessorEditor* AudioPluginAudioProcessor::createEditor()
 void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     juce::ValueTree state ("CueSamplerState");
-    state.setProperty ("version", 3, nullptr);
+    state.setProperty ("version", 4, nullptr);
     state.setProperty ("gridBpmTrim", (double) gridBpmTrim.load (std::memory_order_acquire), nullptr);
     state.setProperty ("gridStartOffset", (double) gridStartOffset.load (std::memory_order_acquire), nullptr);
     state.setProperty ("waveformZoom", (double) waveformZoom.load (std::memory_order_acquire), nullptr);
@@ -3387,6 +3417,7 @@ void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData
     state.setProperty ("globalGainDecibels", (double) globalGainDecibels.load (std::memory_order_acquire), nullptr);
     state.setProperty ("syncToHost", syncToHost.load (std::memory_order_acquire), nullptr);
     state.setProperty ("halfTimeEnabled", halfTimeEnabled.load (std::memory_order_acquire), nullptr);
+    state.setProperty ("chopPlaybackMode", chopPlaybackMode.load (std::memory_order_acquire), nullptr);
     state.setProperty ("muteDrums", muteDrums.load (std::memory_order_acquire), nullptr);
     state.setProperty ("muteBass", muteBass.load (std::memory_order_acquire), nullptr);
     state.setProperty ("muteVocals", muteVocals.load (std::memory_order_acquire), nullptr);
@@ -3450,6 +3481,7 @@ void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData
             chopTree.setProperty ("gainDecibels", chop.gainDecibels, nullptr);
             chopTree.setProperty ("pitchSemitones", chop.pitchSemitones, nullptr);
             chopTree.setProperty ("favorite", chop.favorite, nullptr);
+            chopTree.setProperty ("reversed", chop.reversed, nullptr);
 
             for (const auto& marker : chop.warpMarkers)
             {
@@ -3592,6 +3624,7 @@ AudioPluginAudioProcessor::parseDeferredRestoreState (const juce::ValueTree& sta
             chop.pitchSemitones = juce::jlimit (-12.0f, 12.0f,
                                                 (float) (double) chopTree.getProperty ("pitchSemitones", 0.0));
             chop.favorite = (bool) chopTree.getProperty ("favorite", false);
+            chop.reversed = (bool) chopTree.getProperty ("reversed", false);
 
             for (const auto markerTree : chopTree)
             {
@@ -3663,6 +3696,10 @@ AudioPluginAudioProcessor::parseDeferredRestoreState (const juce::ValueTree& sta
                                                             (float) (double) state.getProperty ("globalGainDecibels", 0.0));
     restoreState.restoredSyncToHost = (bool) state.getProperty ("syncToHost", false);
     restoreState.restoredHalfTime = (bool) state.getProperty ("halfTimeEnabled", false);
+    restoreState.restoredChopPlaybackMode = (int) state.getProperty ("chopPlaybackMode", 0)
+                                                  == (int) ChopPlaybackMode::OneShot
+                                              ? ChopPlaybackMode::OneShot
+                                              : ChopPlaybackMode::Gate;
     restoreState.restoredMuteDrums = (bool) state.getProperty ("muteDrums", false);
     restoreState.restoredMuteBass = (bool) state.getProperty ("muteBass", false);
     restoreState.restoredMuteVocals = (bool) state.getProperty ("muteVocals", false);
@@ -3699,6 +3736,7 @@ void AudioPluginAudioProcessor::applyParsedRestoreState (const DeferredRestoreSt
     globalGainDecibels.store (restoreState.restoredGlobalGainDecibels, std::memory_order_release);
     syncToHost.store (restoreState.restoredSyncToHost, std::memory_order_release);
     halfTimeEnabled.store (restoreState.restoredHalfTime, std::memory_order_release);
+    chopPlaybackMode.store ((int) restoreState.restoredChopPlaybackMode, std::memory_order_release);
 
     // Restore the mute flags and clear stem state — the new sample re-separates
     // (stem audio is never serialized), then these mutes apply on publish.
@@ -4461,6 +4499,15 @@ juce::File AudioPluginAudioProcessor::renderChopToTempWav (int chopId, bool appl
         framesToWrite = finalOutputFrames;
     }
 
+    if (chop->reversed && framesToWrite > 1)
+    {
+        for (int ch = 0; ch < numChannels; ++ch)
+        {
+            auto* samples = outputBuffer.getWritePointer (ch);
+            std::reverse (samples, samples + framesToWrite);
+        }
+    }
+
     // Exported chops match what users hear through the global output control.
     if (framesToWrite > 0)
         outputBuffer.applyGain (0, framesToWrite,
@@ -4719,6 +4766,28 @@ void AudioPluginAudioProcessor::setHalfTimeEnabled (bool shouldEnable) noexcept
     halfTimeEnabled.store (shouldEnable, std::memory_order_release);
     voiceResetRequest.store (true, std::memory_order_release);
     requestHostStateSync();
+}
+
+void AudioPluginAudioProcessor::setChopPlaybackMode (ChopPlaybackMode mode) noexcept
+{
+    const auto sanitizedMode = mode == ChopPlaybackMode::OneShot
+                                   ? ChopPlaybackMode::OneShot
+                                   : ChopPlaybackMode::Gate;
+    const auto modeValue = (int) sanitizedMode;
+    if (modeValue == chopPlaybackMode.exchange (modeValue, std::memory_order_acq_rel))
+        return;
+
+    // The active MIDI voice keeps the mode it was triggered with. This avoids
+    // a mid-note mode change either creating a surprise loop or cutting audio.
+    notifyEditStateChanged();
+}
+
+AudioPluginAudioProcessor::ChopPlaybackMode
+AudioPluginAudioProcessor::getChopPlaybackMode() const noexcept
+{
+    return chopPlaybackMode.load (std::memory_order_acquire) == (int) ChopPlaybackMode::OneShot
+               ? ChopPlaybackMode::OneShot
+               : ChopPlaybackMode::Gate;
 }
 
 void AudioPluginAudioProcessor::setMidiOctaveOffset (int octaves) noexcept
@@ -5372,7 +5441,7 @@ void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData&
                                                      juce::jmax (0, endSample - startSample - 1),
                                                      autoCueStart - startSample);
             ChopDefinition def { newChopState->nextChopId++, startSample, endSample,
-                                 autoCueOffset, 0.0f, 0.0f, false, {} };
+                                 autoCueOffset, 0.0f, 0.0f, false, false, {} };
 
             // Preserve any per-chop edits from the old chop at the same grid index.
             if (existingState != nullptr && chopIndex < (int) existingState->chops.size())
@@ -5383,6 +5452,7 @@ void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData&
                 def.gainDecibels     = old.gainDecibels;
                 def.pitchSemitones   = old.pitchSemitones;
                 def.favorite         = old.favorite;
+                def.reversed         = old.reversed;
 
                 // Carry warp markers across the rebuild, dropping any that no longer
                 // fall inside the new chop bounds.
@@ -5974,7 +6044,8 @@ void AudioPluginAudioProcessor::addChop (int startSample, int endSample)
     pushEditUndoSnapshot ({});
 
     const auto newChopId = nextState->nextChopId++;
-    nextState->chops.push_back ({ newChopId, clampedStart, clampedEnd, 0, 0.0f, 0.0f, false, {} });
+    nextState->chops.push_back ({ newChopId, clampedStart, clampedEnd,
+                                  0, 0.0f, 0.0f, false, false, {} });
     std::sort (nextState->chops.begin(), nextState->chops.end(),
                [] (const ChopDefinition& left, const ChopDefinition& right)
                {
@@ -6116,7 +6187,7 @@ int AudioPluginAudioProcessor::chopAtTransients (TransientSensitivity sensitivit
                                                  juce::jmax (0, endSample - startSample - 1),
                                                  autoCueStart - startSample);
         newChopState->chops.push_back ({ newChopState->nextChopId++, startSample, endSample,
-                                         autoCueOffset, 0.0f, 0.0f, false, {} });
+                                         autoCueOffset, 0.0f, 0.0f, false, false, {} });
     }
 
     if (newChopState->chops.empty())
@@ -6395,6 +6466,29 @@ void AudioPluginAudioProcessor::toggleSelectedChopFavorite()
         if (chop.id == nextState->selectedChopId)
         {
             chop.favorite = ! chop.favorite;
+            break;
+        }
+    }
+
+    std::atomic_store (&chopState, nextState);
+    touchTempoUiRevision();
+    notifyEditStateChanged();
+}
+
+void AudioPluginAudioProcessor::toggleSelectedChopReversed()
+{
+    const auto currentState = std::atomic_load (&chopState);
+    if (currentState == nullptr || currentState->selectedChopId < 0)
+        return;
+
+    pushEditUndoSnapshot ({});
+
+    auto nextState = std::make_shared<ChopState> (*currentState);
+    for (auto& chop : nextState->chops)
+    {
+        if (chop.id == nextState->selectedChopId)
+        {
+            chop.reversed = ! chop.reversed;
             break;
         }
     }

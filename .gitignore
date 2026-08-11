@@ -35,6 +35,10 @@ JuceLibraryCode/
 *.exe
 *.app
 
+# Release installers belong on GitHub Releases, not in repository history
+dist/*.pkg
+dist/*.pkg.zip
+
 # Large asset files if needed (you can comment these out if you want to track them)
 # *.wav
 # *.aif

@@ -83,6 +83,7 @@ public:
         float gainDecibels = 0.0f;
         float pitchSemitones = 0.0f;
         bool favorite = false;
+        bool reversed = false;
         std::vector<ChopWarpMarker> warpMarkers; // sorted by sourceSample; empty = no warp
     };
 
@@ -143,6 +144,17 @@ public:
     void setGlobalGainDecibels (float newGainDecibels) noexcept;
     void setSyncToHost (bool shouldSync) noexcept;
     void setHalfTimeEnabled (bool shouldEnable) noexcept;
+
+    enum class ChopPlaybackMode : int
+    {
+        Gate = 0,
+        OneShot = 1
+    };
+
+    // Global MIDI behavior for chops. Gate loops from the cue point until the
+    // matching note-off; OneShot ignores note-off and stops at the chop end.
+    void setChopPlaybackMode (ChopPlaybackMode mode) noexcept;
+    ChopPlaybackMode getChopPlaybackMode() const noexcept;
 
     // Returns true once for a newly-created processor that has neither loaded
     // a sample nor received host-restored state. Used to show the initial
@@ -325,6 +337,7 @@ public:
     void setSelectedChopGainDecibels (float gainDecibels);
     void setSelectedChopPitchSemitones (float pitchSemitones);
     void toggleSelectedChopFavorite();
+    void toggleSelectedChopReversed();
 
     // Edit undo. Snapshots the chop list + grid trim/offset/bars before each
     // destructive chop edit so the user can step back through their changes.
@@ -386,6 +399,7 @@ private:
         float restoredGlobalGainDecibels = 0.0f;
         bool restoredSyncToHost = false;
         bool restoredHalfTime = false;
+        ChopPlaybackMode restoredChopPlaybackMode = ChopPlaybackMode::Gate;
         bool restoredMuteDrums = false;
         bool restoredMuteBass = false;
         bool restoredMuteVocals = false;
@@ -410,8 +424,12 @@ private:
         double playbackStopSample = -1.0;
         // When >= 0, the render loop wraps back to this sample after hitting
         // playbackStopSample / sourceLength instead of deactivating. Transport
-        // playback loops continuously; MIDI playback loops until note-off.
+        // playback loops continuously; Gate-mode MIDI playback loops until
+        // note-off, while OneShot MIDI playback leaves this at -1.
         double playbackLoopStartSample = -1.0;
+        // Cue tracking remains separate from the loop point so a live cue edit
+        // can retarget a OneShot voice even though that voice never loops.
+        double playbackCueStartSample = -1.0;
         // Stable identity of the chop that started this voice. Keeping this
         // separate from the moving playhead lets live boundary/cue edits keep
         // targeting the same chop while it loops.
@@ -420,6 +438,7 @@ private:
         bool bungeeResetPending = true;
         float midiVelocity = 1.0f;
         bool playbackTriggeredByMidi = false;
+        bool midiOneShot = false;
 
         double playbackSyncStartPpq = 0.0;
         double playbackSyncStartSample = 0.0;
@@ -442,8 +461,10 @@ private:
             playbackSamplePosition = 0.0;
             playbackStopSample = -1.0;
             playbackLoopStartSample = -1.0;
+            playbackCueStartSample = -1.0;
             activeChopId = -1;
             playbackTriggeredByMidi = false;
+            midiOneShot = false;
             bungeeResetPending = true;
             fadeGain = 1.0f;
             fadeTarget = 1.0f;
@@ -606,6 +627,7 @@ private:
     std::atomic<bool> hostTransportPlaying { false };
     std::atomic<bool> syncToHost { false };
     std::atomic<bool> halfTimeEnabled { false };
+    std::atomic<int> chopPlaybackMode { (int) ChopPlaybackMode::Gate };
     std::atomic<float> gridBpmTrim { 0.0f };
     std::atomic<int> chopBarsCount { 1 };
     std::atomic<int> heldMidiNote { -1 };

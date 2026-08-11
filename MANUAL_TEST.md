@@ -7,6 +7,19 @@ present at `assets/htdemucs/htdemucs.onnx`; on Windows, fetch and verify it with
 Load the VST3 or AU in a DAW (or AudioPluginHost); watch the log for lines
 prefixed `StemSeparator:`.
 
+## Chop playback modes
+- [ ] In **GATE** mode, hold a mapped MIDI note past the chop end. The chop loops from its
+      cue point until note-off, then releases cleanly without a click.
+- [ ] In **GATE** mode, release before the chop end. Playback stops immediately with the
+      short de-click fade.
+- [ ] Switch to **ONE SHOT** and tap/release a mapped MIDI note. The chop ignores note-off,
+      plays from its cue point to its end exactly once, and does not loop.
+- [ ] Trigger another chop before the One-Shot finishes. The new chop chokes the old voice
+      and begins immediately; the two chops never overlap.
+- [ ] Check normal, reversed, pitched, warped, HALF-TIME, and SYNC playback in both modes.
+- [ ] Save a project in **ONE SHOT**, close/reopen it, and confirm the button and behavior
+      restore as One-Shot. Older projects should open in **GATE** mode.
+
 ## Happy path
 - [ ] Load a short song (≤ a few minutes). The STEMS panel shows **SEPARATING n%** with
       the three buttons disabled/dimmed; progress climbs.

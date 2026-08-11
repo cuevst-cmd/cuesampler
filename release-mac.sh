@@ -19,6 +19,7 @@
 #     ./release-mac.sh                 # version auto-read from CMakeLists.txt
 #     ./release-mac.sh 1.0.2           # override the version
 #     SKIP_BUILD=1 ./release-mac.sh    # re-package existing build/ (no recompile)
+#     PKG_TAG=osx11 ./release-mac.sh    # dist/CUESAMPLER-1.0.6-osx11.pkg
 # =============================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -32,17 +33,27 @@ fi
 
 APP_ID="Developer ID Application: JERRY OTTAVIO VOLPE (KUU9K5SWA8)"
 INSTALLER_ID="Developer ID Installer: JERRY OTTAVIO VOLPE (KUU9K5SWA8)"
-PKG="dist/CUESAMPLER-${VERSION}.pkg"
+PKG_TAG="${PKG_TAG:-}"
+if [[ -n "$PKG_TAG" && ! "$PKG_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "ERROR: PKG_TAG may contain only letters, numbers, dots, underscores, and hyphens"
+  exit 1
+fi
+PKG_SUFFIX="${PKG_TAG:+-${PKG_TAG}}"
+PKG="dist/CUESAMPLER-${VERSION}${PKG_SUFFIX}.pkg"
 
 echo "=================================================================="
 echo "  CUE SAMPLER — macOS release"
 echo "    version     : $VERSION"
+echo "    package tag : ${PKG_TAG:-none}"
 echo "    skip build  : ${SKIP_BUILD:-0}"
 echo "    output      : $PKG"
 echo "=================================================================="
 
 # --- Pre-flight: tools, license, and both signing certs -----------------------
-command -v cmake >/dev/null || { echo "ERROR: cmake not on PATH"; exit 1; }
+# CLion bundles CMake without adding it to non-interactive shell PATHs. Allow
+# an explicit task-specific override so the exact configured tool can be used.
+CMAKE_BIN="${CUE_CMAKE_BIN:-$(command -v cmake 2>/dev/null || true)}"
+[ -x "$CMAKE_BIN" ] || { echo "ERROR: cmake not found; set CUE_CMAKE_BIN to its executable path"; exit 1; }
 command -v xcrun >/dev/null || { echo "ERROR: Xcode command-line tools (xcrun) not found"; exit 1; }
 [ -e LICENSE.txt ] || { echo "ERROR: LICENSE.txt missing (installer license screen needs it)"; exit 1; }
 
@@ -58,8 +69,13 @@ if [ "${SKIP_BUILD:-0}" = "1" ]; then
   echo "==> SKIP_BUILD=1 — reusing the binaries already in build/"
 else
   echo "==> Configuring + building Release (arm64 + x86_64)…"
-  cmake -B build -DCMAKE_BUILD_TYPE=Release
-  cmake --build build --target CueSampler_VST3 CueSampler_AU --parallel
+  # Release builds must stay in-tree. The generated installer performs the
+  # eventual system install; building it must not replace the tester's current
+  # VST3/AU before the in-plugin update flow is exercised.
+  "$CMAKE_BIN" -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCUE_COPY_PLUGIN_AFTER_BUILD=OFF
+  "$CMAKE_BIN" --build build --target CueSampler_VST3 CueSampler_AU --parallel
 fi
 
 VST3="build/CueSampler_artefacts/Release/VST3/CUE SAMPLER.vst3"
@@ -79,7 +95,7 @@ echo "==> Signing + notarizing the plug-ins (./notarize.sh)…"
 #  builds the component + product archive with the EULA, productsigns it with the
 #  Installer cert, notarizes + staples the .pkg, and writes the .sha256 sidecar.)
 echo "==> Building + signing + notarizing the installer (./make-installer.sh $VERSION)…"
-./make-installer.sh "$VERSION"
+PKG_TAG="$PKG_TAG" ./make-installer.sh "$VERSION"
 
 # --- Done ---------------------------------------------------------------------
 echo

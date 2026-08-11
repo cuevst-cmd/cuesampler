@@ -1628,9 +1628,10 @@ private:
             "2.  The plugin detects BPM and slices the sample into chops.",
             "3.  Click any chop on the waveform to select and preview it.",
             "4.  Chops play via MIDI - C2 = chop 1, D2 = chop 2, and so on.",
-            "5.  Use BARS to set chop size: 1, 2, 4, or 8 bars.",
-            "6.  Tweak CUE, GAIN, and PITCH to customise each chop.",
-            "7.  Use the TEMPO trim knob if chop boundaries feel off-beat.",
+            "5.  Choose GATE (hold + loop) or ONE SHOT (play once).",
+            "6.  Use BARS to set chop size: 1, 2, 4, or 8 bars.",
+            "7.  Tweak CUE, GAIN, and PITCH to customise each chop.",
+            "8.  Use the TEMPO trim knob if chop boundaries feel off-beat.",
         });
 
         const float afterGestures = paintSection (g, rightCol, "MOUSE GESTURES",
@@ -1662,8 +1663,8 @@ private:
         g.setColour (textMuted);
         g.setFont (monoFont (10.0f));
         const juce::StringArray defs {
-            "CHOP = auto-sliced bar segment   |   MIDI C2 = chop 1,  D2 = chop 2 ...",
-            "CUE = loop-start point inside a chop   |   GRID = beat-grid anchor offset (ms)",
+            "CHOP = auto-sliced segment   |   GATE = hold + loop   |   ONE SHOT = play once",
+            "CUE = playback start inside a chop   |   GRID = beat-grid anchor offset (ms)",
             "PITCH (under waveform) = global shift   |   PITCH (chop controls) = per-chop shift",
             "SYNC = auto-match speed to DAW BPM   |   TEMPO trim = nudge grid +/-10 BPM",
         };
@@ -3993,27 +3994,35 @@ private:
             const bool isHovered = (chop.id == hoveredChopId);
 
             const bool isLight = (currentTheme == Theme::light);
+            const auto reverseAccent = isLight ? juce::Colour (0xff6d28d9)
+                                               : juce::Colour (0xffa78bfa);
 
-            const auto baseFill = isAlternativeChop
+            const auto baseFill = chop.reversed
+                ? reverseAccent.withAlpha (isLight ? 0.22f : 0.26f)
+                : isAlternativeChop
                 ? (isLight ? juce::Colour (0xffc82046).withAlpha (0.18f) : juce::Colour (0xffff4a6b).withAlpha (0.20f))
                 : (isLight ? juce::Colour (0xff1c72b8).withAlpha (0.13f) : juce::Colour (0xff3da5ff).withAlpha (0.12f));
             const auto hoverFill = isLight
                 ? juce::Colour (0xff1c72b8).withAlpha (0.14f)
                 : juce::Colour (0xff8fd9ff).withAlpha (0.14f);
-            const auto selectFill = isLight
-                ? juce::Colour (0xff00a33c).withAlpha (0.20f)
-                : juce::Colour (0xff00c950).withAlpha (0.22f);
+            const auto selectFill = chop.reversed
+                ? reverseAccent.withAlpha (isLight ? 0.34f : 0.38f)
+                : isLight ? juce::Colour (0xff00a33c).withAlpha (0.20f)
+                          : juce::Colour (0xff00c950).withAlpha (0.22f);
             const auto fillColour = baseFill.interpolatedWith (hoverFill, hoverVal).interpolatedWith (selectFill, selectVal);
 
-            const auto baseLine = isAlternativeChop
+            const auto baseLine = chop.reversed
+                ? reverseAccent.withAlpha (0.88f)
+                : isAlternativeChop
                 ? (isLight ? juce::Colour (0xffc82046).withAlpha (0.75f) : juce::Colour (0xffff4a6b).withAlpha (0.75f))
                 : (isLight ? juce::Colour (0xff1c72b8).withAlpha (0.65f) : juce::Colour (0xff3da5ff).withAlpha (0.55f));
             const auto hoverLine = isLight
                 ? juce::Colour (0xff1c72b8).withAlpha (0.85f)
                 : juce::Colour (0xff8fd9ff).withAlpha (0.82f);
-            const auto selectLine = isLight
-                ? juce::Colour (0xff00b844).withAlpha (0.98f)
-                : juce::Colour (0xff00f57a).withAlpha (0.98f);
+            const auto selectLine = chop.reversed
+                ? reverseAccent.withAlpha (0.98f)
+                : isLight ? juce::Colour (0xff00b844).withAlpha (0.98f)
+                          : juce::Colour (0xff00f57a).withAlpha (0.98f);
             const auto lineColour = baseLine.interpolatedWith (hoverLine, hoverVal).interpolatedWith (selectLine, selectVal);
 
             fillRectGradient (g, chopBounds, fillColour.brighter (0.35f), fillColour.darker (0.25f));
@@ -4021,8 +4030,8 @@ private:
             if (selectVal > 0.01f)
             {
                 fillRectGradient (g, chopBounds,
-                                  juce::Colour (0xff00f57a).withAlpha (0.16f * selectVal),
-                                  juce::Colour (0xff00f57a).withAlpha (0.07f * selectVal));
+                                  (chop.reversed ? reverseAccent : juce::Colour (0xff00f57a)).withAlpha (0.16f * selectVal),
+                                  (chop.reversed ? reverseAccent : juce::Colour (0xff00f57a)).withAlpha (0.07f * selectVal));
             }
             else if (hoverVal > 0.01f)
             {
@@ -4140,9 +4149,11 @@ private:
             if (chop.favorite)
             {
                 const juce::Colour favColour (0xffff2db1);
-                // Fill
-                fillRectGradient (g, chopBounds, favColour.withAlpha (isSelected ? 0.5f : 0.36f),
-                                  favColour.withAlpha (isSelected ? 0.24f : 0.18f));
+                // Preserve the reverse-purple body while retaining the pink
+                // favorite rails/stripe as a second, independent state cue.
+                if (! chop.reversed)
+                    fillRectGradient (g, chopBounds, favColour.withAlpha (isSelected ? 0.5f : 0.36f),
+                                      favColour.withAlpha (isSelected ? 0.24f : 0.18f));
                 // Side border lines
                 g.setColour (favColour.withAlpha (isSelected ? 1.0f : 0.88f));
                 g.drawLine (chopBounds.getX(), chopBounds.getY() + 4.0f,
@@ -4164,7 +4175,9 @@ private:
                 auto header = juce::Rectangle<float> (chopBounds.getX(), headerTop,
                                                       chopBounds.getWidth(), headerH);
 
-                const auto tabColour = chop.favorite ? juce::Colour (0xffff2db1) : lineColour;
+                const auto tabColour = chop.reversed ? reverseAccent
+                                     : chop.favorite ? juce::Colour (0xffff2db1)
+                                                     : lineColour;
                 g.setColour (tabColour.withAlpha (isSelected ? 0.50f : 0.22f + 0.12f * hoverVal));
                 g.fillRect (header);
                 g.setColour (tabColour.withAlpha (0.60f + 0.35f * selectVal));
@@ -4960,6 +4973,8 @@ public:
         configureButton (playButton, "", textPrimary);
         configureButton (pauseButton, "", textPrimary);
         configureButton (stopButton, "", textPrimary);
+        configureButton (reverseButton, "REVERSE", textPrimary.withAlpha (0.90f));
+        configureButton (playbackModeButton, "GATE", textPrimary.withAlpha (0.90f));
         configureButton (halfSpeedButton, "HALF\nTIME", textPrimary.withAlpha (0.90f));
         configureButton (chopTransientsButton, "CHOP @ TRANS.", textPrimary.withAlpha (0.75f));
         configureButton (barsButton, "# OF BARS", textPrimary.withAlpha (0.75f));
@@ -4970,6 +4985,25 @@ public:
         playButton.getProperties().set ("cueIcon", "play");
         pauseButton.getProperties().set ("cueIcon", "pause");
         stopButton.getProperties().set ("cueIcon", "stop");
+        reverseButton.getProperties().set ("cueStyle", "halfTime");
+        reverseButton.setClickingTogglesState (true);
+        reverseButton.onClick = [this]
+        {
+            processor.toggleSelectedChopReversed();
+            updateChopControls();
+            if (auto* parent = getParentComponent())
+                parent->repaint();
+        };
+        playbackModeButton.getProperties().set ("cueStyle", "halfTime");
+        playbackModeButton.setClickingTogglesState (true);
+        playbackModeButton.setTooltip ("Chop playback mode: GATE loops while a MIDI note is held; ONE SHOT plays the chop once and ignores note-off.");
+        playbackModeButton.onClick = [this]
+        {
+            processor.setChopPlaybackMode (playbackModeButton.getToggleState()
+                                               ? AudioPluginAudioProcessor::ChopPlaybackMode::OneShot
+                                               : AudioPluginAudioProcessor::ChopPlaybackMode::Gate);
+            updatePlaybackModeControl();
+        };
         halfSpeedButton.getProperties().set ("cueStyle", "halfTime");
         halfSpeedButton.setClickingTogglesState (true);
         halfSpeedButton.onClick = [this]
@@ -5031,6 +5065,7 @@ public:
         playButton.setTooltip ("Play the selected chop from its cue point. Click a chop on the waveform first to pick which one plays.");
         pauseButton.setTooltip ("Pause playback - press Play to resume from the same spot.");
         stopButton.setTooltip ("Stop playback and return to the beginning of the current chop.");
+        reverseButton.setTooltip ("Reverse playback for the currently selected chop. Active when lit.");
         halfSpeedButton.setTooltip ("Half-Time: plays at half speed while preserving pitch. Active when lit.");
         chopTransientsButton.setTooltip ("Chop at transients: scans the sample for hits and places a chop marker at each onset. Click to choose sensitivity - Light (heavy hits only), Medium (kicks + snares), or Fine (busy / fills).");
         barsButton.setTooltip ("Sets how many bars each chop covers - cycles 1 / 2 / 4 / 8. Larger = fewer, longer chops.");
@@ -5039,6 +5074,8 @@ public:
         for (juce::TextButton* button : { static_cast<juce::TextButton*> (&playButton),
                                           static_cast<juce::TextButton*> (&pauseButton),
                                           static_cast<juce::TextButton*> (&stopButton),
+                                          static_cast<juce::TextButton*> (&reverseButton),
+                                          static_cast<juce::TextButton*> (&playbackModeButton),
                                           static_cast<juce::TextButton*> (&halfSpeedButton),
                                           static_cast<juce::TextButton*> (&chopTransientsButton),
                                           static_cast<juce::TextButton*> (&barsButton),
@@ -5047,6 +5084,7 @@ public:
 
         halfSpeedButton.setToggleState (processor.getHalfTimeEnabled(), juce::dontSendNotification);
         cue::isHalfTimeActive = processor.getHalfTimeEnabled();
+        updatePlaybackModeControl();
 
         configureButton (warpButton, "WARP", textPrimary.withAlpha (0.85f));
         warpButton.getProperties().set ("cueStyle", "flatAction");
@@ -5149,7 +5187,7 @@ public:
         cueKnob.getSlider().setNumDecimalPlacesToDisplay (1);
         cueKnob.getSlider().setTextValueSuffix (" %");
         cueKnob.captureCurrentValueAsDefault();
-        cueKnob.getSlider().setTooltip ("CUE: sets where playback starts inside this chop - 0% = chop start, 100% = chop end. Looping always returns to this point. Alt-click to reset.");
+        cueKnob.getSlider().setTooltip ("CUE: sets where playback starts inside this chop - 0% = chop start, 100% = chop end. GATE loops return to this point; ONE SHOT plays from here once. Alt-click to reset.");
         addAndMakeVisible (cueKnob);
 
         gainKnob.getSlider().setRange (-24.0, 12.0, 0.1);
@@ -5200,18 +5238,6 @@ public:
         g.drawText ("CHOP CONTROLS",
                     badgeBounds.toNearestInt().withY ((int) std::round (badgeBounds.getY() - 1.0f)),
                     juce::Justification::centred, false);
-
-        // Make the scope of the three centred voice controls explicit. This
-        // label sits immediately to their left and moves with the centred bank.
-        constexpr int perChopKnobGap = 22;
-        constexpr int perChopClusterWidth = bandKnobDiameter * 3 + perChopKnobGap * 2;
-        const int perChopClusterX = (getWidth() - perChopClusterWidth) / 2;
-        const auto perChopLabelBounds = juce::Rectangle<int> (perChopClusterX - 82,
-                                                               transportPanel.getCentreY() - 9,
-                                                               70, 18);
-        g.setColour (themedTitleColour (accentOrange).withAlpha (0.92f));
-        g.setFont (heavyFont (9.6f).withExtraKerningFactor (0.08f));
-        g.drawText ("PER CHOP", perChopLabelBounds, juce::Justification::centredRight, false);
 
         g.setColour (glassTextMuted.withAlpha (0.85f));
         g.setFont (monoFont (8.5f).withExtraKerningFactor (0.06f));
@@ -5297,7 +5323,7 @@ public:
         constexpr int innerTransportGap = 8;
         constexpr int halfW = 56;
         constexpr int syncW = 76;
-        constexpr int modeGroupW = halfW + innerTransportGap + syncW; // half-time + sync pair
+        constexpr int modeGroupW = halfW + innerTransportGap + syncW;
         constexpr int innerDisplayGap = 8;
         constexpr int displaysGroupW = 150 + innerDisplayGap + 76 + innerDisplayGap + 76; // 318
 
@@ -5310,6 +5336,10 @@ public:
         playButton.setBounds (transportX, transportCenterY - 24, 48, 48);
         pauseButton.setBounds (transportX + 48 + innerTransportGap, transportCenterY - 24, 48, 48);
         stopButton.setBounds (transportX + 2 * (48 + innerTransportGap), transportCenterY - 24, 48, 48);
+        reverseButton.setBounds (transportX + 3 * (48 + innerTransportGap) + 16,
+                                 transportCenterY - 24, 72, 48);
+        playbackModeButton.setBounds (reverseButton.getRight() + innerTransportGap,
+                                      transportCenterY - 24, 76, 48);
 
         // Readouts anchor to the right edge; HALF TIME / SYNC form the mode
         // bank immediately before them, keeping the centre clear for chop knobs.
@@ -5367,7 +5397,16 @@ private:
         updateTempoDisplay();
         updateKeyDisplay();
         updateChopControls();
+        updatePlaybackModeControl();
         updateOctaveControls();
+    }
+
+    void updatePlaybackModeControl()
+    {
+        const bool isOneShot = processor.getChopPlaybackMode()
+                               == AudioPluginAudioProcessor::ChopPlaybackMode::OneShot;
+        playbackModeButton.setToggleState (isOneShot, juce::dontSendNotification);
+        playbackModeButton.setButtonText (isOneShot ? "ONE\nSHOT" : "GATE");
     }
 
     // Mirrors the selected chop's cue/gain/pitch into the knobs and greys
@@ -5393,9 +5432,11 @@ private:
         cueKnob.getSlider().setEnabled (hasSelectedChop);
         gainKnob.getSlider().setEnabled (hasSelectedChop);
         pitchKnob.getSlider().setEnabled (hasSelectedChop);
+        reverseButton.setEnabled (hasSelectedChop);
 
         if (! hasSelectedChop)
         {
+            reverseButton.setToggleState (false, juce::dontSendNotification);
             cueKnob.getSlider().setValue (0.0, juce::dontSendNotification);
             gainKnob.getSlider().setValue (0.0, juce::dontSendNotification);
             pitchKnob.getSlider().setValue (0.0, juce::dontSendNotification);
@@ -5407,6 +5448,7 @@ private:
         cueKnob.getSlider().setValue (cuePercent, juce::dontSendNotification);
         gainKnob.getSlider().setValue ((double) selectedChop->gainDecibels, juce::dontSendNotification);
         pitchKnob.getSlider().setValue ((double) selectedChop->pitchSemitones, juce::dontSendNotification);
+        reverseButton.setToggleState (selectedChop->reversed, juce::dontSendNotification);
     }
 
     void syncWarpAccentState()
@@ -5673,6 +5715,8 @@ private:
     SmoothHoverButton playButton;
     SmoothHoverButton pauseButton;
     SmoothHoverButton stopButton;
+    SmoothAnimatedSwitchButton reverseButton;
+    SmoothAnimatedSwitchButton playbackModeButton;
     SmoothAnimatedSwitchButton halfSpeedButton;
     SmoothHoverButton chopTransientsButton;
     SmoothHoverButton barsButton;

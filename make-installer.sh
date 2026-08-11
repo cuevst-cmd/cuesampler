@@ -9,9 +9,16 @@
 #   - Notary profile "cue-notary" stored (already done).
 #
 # Usage:  ./make-installer.sh [version]
+#         PKG_TAG=osx11 ./make-installer.sh 1.0.6
 set -euo pipefail
 
 VERSION="${1:-1.0.0}"
+PKG_TAG="${PKG_TAG:-}"
+if [[ -n "$PKG_TAG" && ! "$PKG_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "ERROR: PKG_TAG may contain only letters, numbers, dots, underscores, and hyphens"
+  exit 1
+fi
+PKG_SUFFIX="${PKG_TAG:+-${PKG_TAG}}"
 INSTALLER_ID="Developer ID Installer: JERRY OTTAVIO VOLPE (KUU9K5SWA8)"
 PROFILE="cue-notary"
 PKG_ID="com.cuesoftware.cuesampler.installer"
@@ -25,7 +32,7 @@ UNSIGNED="$STAGE/unsigned.pkg"
 # URL-safe filename (no spaces) so GitHub Release asset links don't need %20
 # escaping. The installer UI title still reads "CUE SAMPLER" (from the
 # distribution.xml <title>), independent of this filename.
-SIGNED="$OUT/CUESAMPLER-${VERSION}.pkg"
+SIGNED="$OUT/CUESAMPLER-${VERSION}${PKG_SUFFIX}.pkg"
 mkdir -p "$OUT"
 
 # --- Stage the bundles into their real install locations -------------------
