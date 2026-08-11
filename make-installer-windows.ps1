@@ -2,7 +2,7 @@
 # Generates the installer executable and a SHA-256 checksum sidecar file.
 #
 # Development build:
-#   .\make-installer-windows.ps1 [-Version "1.0.6"] [-BuildDir "build"]
+#   .\make-installer-windows.ps1 [-Version "1.0.7"] [-BuildDir "build"]
 # Commercial release (requires confirmed JUCE plan eligibility and a trusted certificate):
 #   .\make-installer-windows.ps1 -CommercialRelease `
 #       -JuceLicenseEligibilityConfirmed `
@@ -114,7 +114,7 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
 }
 
 if ($Version -notmatch '^\d+\.\d+\.\d+$') {
-    Write-Error "Installer version must contain exactly three numeric components (for example, 1.0.6)."
+    Write-Error "Installer version must contain exactly three numeric components (for example, 1.0.7)."
 }
 
 $BuildDir = [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $BuildDir))
