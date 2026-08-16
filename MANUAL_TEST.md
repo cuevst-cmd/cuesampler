@@ -60,6 +60,30 @@ prefixed `StemSeparator:`.
       manual audition still plays at the sample's native pitch/speed without crackles, and the
       completed chop resumes the configured playback processing when retriggered.
 
+## Manual chop: ghost line, marker editing, delete, default key
+- [ ] In manual mode, an orange ghost line with an arrowhead follows the mouse across the
+      waveform. It disappears while dragging a marker or a chop edge, and returns on release.
+      Outside manual mode the guide is still neon red (purple in warp mode).
+- [ ] Place a start marker, then hover it: cursor becomes horizontal resize, the line thickens
+      and shows a soft halo. Drag it — the marker moves and a subsequent pad hold auditions
+      from the new position, not the original one.
+- [ ] While holding a pad mid-capture, the marker must NOT be draggable or removable.
+- [ ] Double-click the pending marker to remove it. Double-clicking anywhere else still sets
+      the chop end.
+- [ ] Select a completed chop in manual mode. A red **×** badge appears immediately right of
+      the ADSR/EXPORT pill. Click it and the chop is removed; undo restores it.
+- [ ] Press the × but release the mouse away from it — nothing is deleted.
+- [ ] Scroll a selected chop to the far left and far right edges of the view. The × never
+      overlaps the +/- zoom buttons and never leaves the display.
+- [ ] Outside manual mode no × appears, and the ADSR/EXPORT pill sits exactly where it did
+      before (position must be unchanged).
+- [ ] Complete a manual chop by double-clicking the end (no pad held). It is assigned **C3**.
+      The next such chop takes C#3, then D3. Delete the C#3 chop and create another — it
+      reuses C#3 rather than continuing upward.
+- [ ] Chops captured by holding a pad keep that exact pad; the auto-assigned ones skip over
+      any note already taken.
+- [ ] Load an older project saved before this change. Its chops still map from C2 as before.
+
 ## Happy path
 - [ ] Load a short song (≤ a few minutes). The STEMS panel shows **SEPARATING n%** with
       the three buttons disabled/dimmed; progress climbs.

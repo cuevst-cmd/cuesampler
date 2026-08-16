@@ -114,6 +114,11 @@ constexpr double maximumTempoBpm = 210.0;
 constexpr double preferredTempoLow = 72.0;
 constexpr double preferredTempoHigh = 160.0;
 constexpr int midiRootNote = 36; // C2 — chop 0
+// Manual chops created without holding a pad are given an explicit assignment
+// starting here rather than falling back to the positional map. C3 under this
+// plugin's naming (C4 = 60). Deliberately separate from midiRootNote so that
+// existing projects and auto-chopped samples keep their historic C2 mapping.
+constexpr int manualChopDefaultRootNote = 48; // C3 — first manual chop
 constexpr int defaultSliceStartFadeSamples = 64;
 // MIDI chops need a near-instant front edge; keep only a tiny de-click ramp.
 constexpr int midiSliceStartFadeSamples = 4;
@@ -6351,6 +6356,36 @@ int AudioPluginAudioProcessor::addManualChop (int startSample, int endSample, in
     touchTempoUiRevision();
     notifyEditStateChanged();
     return newId;
+}
+
+int AudioPluginAudioProcessor::getNextManualChopMidiNote() const noexcept
+{
+    const auto current = std::atomic_load (&chopState);
+    if (current == nullptr)
+        return manualChopDefaultRootNote;
+
+    // Lowest free note at or above C3. Walking upward keeps a run of chops
+    // made without pads landing on consecutive keys, and reusing gaps means
+    // deleting a chop frees its pad for the next one.
+    for (int note = manualChopDefaultRootNote; note <= 127; ++note)
+    {
+        bool taken = false;
+        for (const auto& chop : current->chops)
+        {
+            if (chop.assignedMidiNote == note)
+            {
+                taken = true;
+                break;
+            }
+        }
+
+        if (! taken)
+            return note;
+    }
+
+    // Every pad from C3 up is spoken for. -1 falls back to the legacy
+    // positional map rather than silently stealing an existing assignment.
+    return -1;
 }
 
 void AudioPluginAudioProcessor::armManualChopCapture (int startSample) noexcept

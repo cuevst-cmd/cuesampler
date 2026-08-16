@@ -336,6 +336,9 @@ public:
     int  addManualChop (int startSample, int endSample, int assignedMidiNote);
     void armManualChopCapture (int startSample) noexcept;
     void cancelManualChopCapture() noexcept;
+    // Lowest unassigned MIDI note at or above C3, for manual chops completed
+    // without holding a pad. Returns -1 only if every pad from C3 up is taken.
+    int getNextManualChopMidiNote() const noexcept;
     int getManualChopCaptureHeldNote() const noexcept;
     int getManualChopCaptureCompletedNote() const noexcept;
     int getManualChopCaptureEndSample() const noexcept;

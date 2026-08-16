@@ -2249,6 +2249,10 @@ public:
     {
         manualChopMode = active;
         pendingManualStartSample = -1;
+        pendingMarkerDragging = false;
+        pendingMarkerHovered = false;
+        deleteBadgeHovered = false;
+        deleteBadgePressed = false;
         lastManualCaptureCompletionRevision = processor.getManualChopCaptureCompletionRevision();
         processor.cancelManualChopCapture();
         setTooltip (active
@@ -2264,6 +2268,7 @@ public:
         {
             isSelectingAnalysisRegion = false;
             pendingManualStartSample = -1;
+            pendingMarkerDragging = false;
             processor.cancelManualChopCapture();
             targetZoomLevel = zoomLevel = 0.07f;
             targetScrollPosition = scrollPosition = 0.0f;
@@ -2365,6 +2370,15 @@ public:
         // The compact chop-action pill remains available in manual mode once
         // a completed chop is selected. Click opens ADSR/export; drag retains
         // the direct drag-to-DAW gesture.
+        // Delete badge outranks everything: it sits on top of the pill row and
+        // is only a 20 px target, so a hit here is unambiguous.
+        if (hitTestDeleteBadge (event.position))
+        {
+            deleteBadgePressed = true;
+            repaint();
+            return;
+        }
+
         if (hitTestExportButton (event.position))
         {
             exportButtonPressed   = true;
@@ -2381,6 +2395,16 @@ public:
         {
             if (event.getNumberOfClicks() == 1)
             {
+                // The pending marker is the thing the user is actively working
+                // with, so it outranks completed chop edges underneath it.
+                if (hitTestPendingMarker (event.position))
+                {
+                    pendingMarkerDragging = true;
+                    setMouseCursor (juce::MouseCursor::LeftRightResizeCursor);
+                    repaint();
+                    return;
+                }
+
                 int hitKind = 0;
                 int hitChopId = -1;
                 if (hitTestAnyChopEdge (event.position, hitKind, hitChopId))
@@ -2453,6 +2477,18 @@ public:
 
     void updateCursorForMode (juce::Point<float> pos)
     {
+        const bool overDelete = hitTestDeleteBadge (pos);
+        if (overDelete != deleteBadgeHovered)
+        {
+            deleteBadgeHovered = overDelete;
+            repaint();
+        }
+        if (overDelete)
+        {
+            setMouseCursor (juce::MouseCursor::PointingHandCursor);
+            return;
+        }
+
         const bool overExport = hitTestExportButton (pos);
         if (overExport != exportButtonHovered)
         {
@@ -2467,14 +2503,26 @@ public:
 
         if (manualChopMode && isPositionInsideDisplay (pos))
         {
-            if (edgeDragChopId < 0)
+            const bool overPendingMarker = hitTestPendingMarker (pos);
+            if (overPendingMarker != pendingMarkerHovered)
+            {
+                pendingMarkerHovered = overPendingMarker;
+                repaint();
+            }
+
+            if (edgeDragChopId < 0 && ! overPendingMarker)
             {
                 int hitKind = 0;
                 int hitChopId = -1;
                 edgeHoverKind = hitTestAnyChopEdge (pos, hitKind, hitChopId) ? hitKind : 0;
             }
+            else if (overPendingMarker)
+            {
+                edgeHoverKind = 0;
+            }
 
-            setMouseCursor (edgeDragChopId >= 0 || edgeHoverKind != 0
+            setMouseCursor (pendingMarkerDragging || overPendingMarker
+                                || edgeDragChopId >= 0 || edgeHoverKind != 0
                                 ? juce::MouseCursor::LeftRightResizeCursor
                                 : juce::MouseCursor::CrosshairCursor);
             return;
@@ -2561,6 +2609,56 @@ public:
             return true;
         }
         return false;
+    }
+
+    // The pending start marker — placed by double-click, not yet turned into a
+    // chop. Draggable to reposition, double-clickable to remove. Locked while a
+    // MIDI pad is held, because the capture start is already committed on the
+    // audio thread by then and moving it would desync the captured range.
+    bool hitTestPendingMarker (juce::Point<float> mousePos) const
+    {
+        if (! manualChopMode || pendingManualStartSample < 0)
+            return false;
+        if (! isPositionInsideDisplay (mousePos))
+            return false;
+        if (processor.getManualChopCaptureHeldNote() >= 0)
+            return false;
+
+        const auto sampleData = processor.getLoadedSample();
+        if (sampleData == nullptr || sampleData->buffer.getNumSamples() <= 1)
+            return false;
+
+        const auto visibleRange = getVisibleRange (sampleData->buffer.getNumSamples());
+        const float markerX = displayXForSamplePosition ((double) pendingManualStartSample,
+                                                         visibleRange, getDisplayBounds());
+        return std::abs (mousePos.x - markerX) <= kEdgeHitTestPixels;
+    }
+
+    // Moves the pending marker and re-arms the capture at the new position, so
+    // a subsequent pad hold auditions from where the marker now sits.
+    void movePendingMarkerTo (juce::Point<float> mousePos)
+    {
+        const auto sampleData = processor.getLoadedSample();
+        if (sampleData == nullptr || sampleData->buffer.getNumSamples() <= 1)
+            return;
+
+        const int moved = juce::jlimit (0, sampleData->buffer.getNumSamples() - 1,
+                                        (int) std::round (sampleForDisplayPosition (mousePos.x)));
+        if (moved == pendingManualStartSample)
+            return;
+
+        pendingManualStartSample = moved;
+        processor.armManualChopCapture (moved);
+        repaint();
+    }
+
+    void clearPendingMarker()
+    {
+        pendingManualStartSample = -1;
+        pendingMarkerDragging = false;
+        pendingMarkerHovered = false;
+        processor.cancelManualChopCapture();
+        repaint();
     }
 
     // Manual chopping exposes every completed start/end marker for resizing,
@@ -3005,6 +3103,12 @@ public:
             return;
         }
 
+        if (pendingMarkerDragging)
+        {
+            movePendingMarkerTo (event.position);
+            return;
+        }
+
         if (edgeDragChopId >= 0)
         {
             updateEdgeDragLiveSample (event.position);
@@ -3023,6 +3127,19 @@ public:
 
     void mouseUp (const juce::MouseEvent& event) override
     {
+        // Released on the delete badge => remove the chop. Releasing off the
+        // badge cancels, matching normal button behaviour.
+        if (deleteBadgePressed)
+        {
+            const bool stillOver = hitTestDeleteBadge (event.position);
+            deleteBadgePressed = false;
+            if (stillOver)
+                deleteTargetChop();
+            else
+                repaint();
+            return;
+        }
+
         // Released on the chop-action pill without dragging => open the
         // per-chop ADSR/export callout.
         if (exportButtonPressed)
@@ -3045,6 +3162,14 @@ public:
             warpDragRetarget    = false;
             warpDragSnap        = true;
             updateCursorForMode (event.position);
+            return;
+        }
+
+        if (pendingMarkerDragging)
+        {
+            pendingMarkerDragging = false;
+            updateCursorForMode (event.position);
+            repaint();
             return;
         }
 
@@ -3081,6 +3206,16 @@ public:
             if (sampleData == nullptr || sampleData->buffer.getNumSamples() <= 1)
                 return;
 
+            // Double-clicking the pending marker itself removes it, so a
+            // misplaced start can be undone without leaving manual mode. This
+            // is checked first: on the marker, remove wins over set-end.
+            if (hitTestPendingMarker (event.position))
+            {
+                clearPendingMarker();
+                updateCursorForMode (event.position);
+                return;
+            }
+
             const int clickedSample = juce::jlimit (0, sampleData->buffer.getNumSamples() - 1,
                 (int) std::round (sampleForDisplayPosition (event.position.x)));
 
@@ -3094,7 +3229,12 @@ public:
                 const int start = pendingManualStartSample;
                 pendingManualStartSample = -1;
                 processor.cancelManualChopCapture();
-                processor.addManualChop (start, clickedSample, -1);
+                // No pad was held, so give the chop an explicit assignment
+                // starting at C3 instead of leaving it on the positional map.
+                // Explicit notes are stable: inserting a chop earlier in the
+                // timeline no longer shifts what any existing pad triggers.
+                processor.addManualChop (start, clickedSample,
+                                         processor.getNextManualChopMidiNote());
             }
 
             repaint();
@@ -3665,9 +3805,15 @@ private:
         constexpr float h = 22.0f;
         const float leftLimit  = display.getX() + 6.0f;
         const float rightLimit = display.getRight() - 70.0f; // keep clear of +/- buttons
-        float cx = juce::jlimit (leftLimit + w * 0.5f,
-                                 juce::jmax (leftLimit + w * 0.5f, rightLimit - w * 0.5f),
-                                 (visL + visR) * 0.5f);
+
+        // In manual mode the delete badge sits immediately right of the pill.
+        // Centre the pair as one group so the badge cannot be pushed into the
+        // +/- button zone when the chop is near the right edge.
+        const float groupW = manualChopMode ? (w + kDeleteBadgeGap + kDeleteBadgeSize) : w;
+        const float groupCx = juce::jlimit (leftLimit + groupW * 0.5f,
+                                            juce::jmax (leftLimit + groupW * 0.5f, rightLimit - groupW * 0.5f),
+                                            (visL + visR) * 0.5f);
+        const float cx = groupCx - (groupW - w) * 0.5f;
         const float y = display.getY() + (manualChopMode ? 34.0f : 8.0f);
         return juce::Rectangle<float> (cx - w * 0.5f, y, w, h);
     }
@@ -3676,6 +3822,49 @@ private:
     {
         const auto b = getExportButtonBounds();
         return ! b.isEmpty() && b.contains (p);
+    }
+
+    // ---- Delete badge (manual mode only) ----
+    //
+    // Sits immediately right of the ADSR/EXPORT pill and targets the same chop
+    // the pill does, so the two always act on the same thing.
+    juce::Rectangle<float> getDeleteBadgeBounds() const
+    {
+        if (! manualChopMode)
+            return {};
+
+        const auto pill = getExportButtonBounds();
+        if (pill.isEmpty())
+            return {};
+
+        return juce::Rectangle<float> (pill.getRight() + kDeleteBadgeGap,
+                                       pill.getY() + (pill.getHeight() - kDeleteBadgeSize) * 0.5f,
+                                       kDeleteBadgeSize, kDeleteBadgeSize);
+    }
+
+    bool hitTestDeleteBadge (juce::Point<float> p) const
+    {
+        const auto b = getDeleteBadgeBounds();
+        return ! b.isEmpty() && b.contains (p);
+    }
+
+    void deleteTargetChop()
+    {
+        const int chopId = exportTargetChopId;
+        if (chopId < 0)
+            return;
+
+        // removeSelectedChop() operates on the current selection, so point the
+        // selection at the badge's target first. Both already handle the undo
+        // snapshot, cache eviction and voice stop.
+        processor.selectChopById (chopId);
+        processor.removeSelectedChop();
+
+        setExportTarget (-1);
+        deleteBadgePressed = false;
+        deleteBadgeHovered = false;
+        setMouseCursor (juce::MouseCursor::CrosshairCursor);
+        repaint();
     }
 
     void showChopAdsrMenu (int chopId)
@@ -3808,6 +3997,53 @@ private:
 
         g.setFont (monoFont (9.5f).withExtraKerningFactor (0.06f));
         g.drawText ("ADSR / EXPORT", content, juce::Justification::centred);
+
+        paintDeleteBadge (g, appear);
+    }
+
+    // Round × badge beside the pill. Deliberately red rather than the pill's
+    // amber: this is the one destructive control on the waveform, so it should
+    // not read as another neutral action.
+    void paintDeleteBadge (juce::Graphics& g, float appear)
+    {
+        const auto b = getDeleteBadgeBounds();
+        if (b.isEmpty() || appear <= 0.01f)
+            return;
+
+        const float scale = 0.9f + 0.1f * appear;
+        auto rect = b.withSizeKeepingCentre (b.getWidth() * scale, b.getHeight() * scale);
+
+        const juce::Colour red (0xffe5484d);
+        const juce::Colour base = deleteBadgePressed ? red.darker (0.22f)
+                                : deleteBadgeHovered ? red.brighter (0.16f)
+                                                     : red;
+
+        if (deleteBadgeHovered || deleteBadgePressed)
+        {
+            g.setColour (red.withAlpha (0.28f * appear));
+            g.fillEllipse (rect.expanded (3.0f));
+        }
+
+        g.setColour (juce::Colours::black.withAlpha (0.34f * appear));
+        g.fillEllipse (rect.translated (0.0f, 1.0f));
+
+        g.setColour (base.withAlpha (appear));
+        g.fillEllipse (rect);
+        g.setColour (juce::Colours::white.withAlpha (0.26f * appear));
+        g.drawEllipse (rect.reduced (0.5f), 1.0f);
+
+        // The × glyph.
+        const auto c = rect.getCentre();
+        const float arm = rect.getWidth() * 0.22f;
+        juce::Path cross;
+        cross.startNewSubPath (c.x - arm, c.y - arm);
+        cross.lineTo          (c.x + arm, c.y + arm);
+        cross.startNewSubPath (c.x + arm, c.y - arm);
+        cross.lineTo          (c.x - arm, c.y + arm);
+
+        g.setColour (juce::Colours::white.withAlpha (0.95f * appear));
+        g.strokePath (cross, juce::PathStrokeType (1.8f, juce::PathStrokeType::curved,
+                                                         juce::PathStrokeType::rounded));
     }
 
     void timerCallback() override
@@ -3977,9 +4213,12 @@ private:
 
         const auto currentPlayheadPosition = processor.getPlaybackSamplePosition();
         
+        // Manual mode deliberately KEEPS the hover guide: it is the ghost line
+        // showing where a double-click would drop a marker. It is still
+        // suppressed during an actual drag, same as every other mode.
         const bool isUserInteracting = (edgeDragChopId >= 0)
                                     || (warpDragChopId >= 0)
-                                    || manualChopMode
+                                    || pendingMarkerDragging
                                     || isSelectingAnalysisRegion
                                     || isHoldingToPlay
                                     || exportDragReady
@@ -4541,10 +4780,12 @@ private:
         g.reduceClipRegion (clip);
 
         juce::String instruction = "DOUBLE-CLICK TO PLACE CHOP START";
-        if (pendingManualStartSample >= 0)
+        if (pendingMarkerDragging)
+            instruction = "DRAG TO REPOSITION CHOP START";
+        else if (pendingManualStartSample >= 0)
             instruction = processor.getManualChopCaptureHeldNote() >= 0
                 ? "RELEASE MIDI PAD TO SET CHOP END"
-                : "HOLD A MIDI PAD  |  OR DOUBLE-CLICK THE END";
+                : "HOLD A PAD OR DOUBLE-CLICK THE END  |  DRAG MARKER TO MOVE, DOUBLE-CLICK IT TO REMOVE";
 
         auto instructionBounds = displayBounds.withHeight (22.0f).reduced (8.0f, 2.0f);
         g.setColour (juce::Colours::black.withAlpha (0.58f));
@@ -4558,9 +4799,24 @@ private:
 
         const float startX = displayXForSamplePosition ((double) pendingManualStartSample,
                                                        visibleRange, displayBounds);
+
+        // Grabbable state: widen the line and lay down a soft halo so the
+        // marker visibly answers the resize cursor.
+        const bool markerActive = pendingMarkerDragging || pendingMarkerHovered;
+        if (markerActive)
+        {
+            g.setColour (instructionColour.withAlpha (0.16f));
+            g.fillRect (juce::Rectangle<float> (startX - kEdgeHitTestPixels, displayBounds.getY(),
+                                                kEdgeHitTestPixels * 2.0f, displayBounds.getHeight()));
+        }
+
         g.setColour (instructionColour);
-        g.drawLine (startX, displayBounds.getY(), startX, displayBounds.getBottom(), 2.2f);
-        g.fillEllipse (startX - 4.0f, displayBounds.getY() + 24.0f, 8.0f, 8.0f);
+        g.drawLine (startX, displayBounds.getY(), startX, displayBounds.getBottom(),
+                    markerActive ? 3.2f : 2.2f);
+        const float handleSize = markerActive ? 11.0f : 8.0f;
+        g.fillEllipse (startX - handleSize * 0.5f,
+                       displayBounds.getY() + 24.0f + (8.0f - handleSize) * 0.5f,
+                       handleSize, handleSize);
 
         int pendingNumber = 1;
         if (const auto stateSnapshot = processor.getChopState())
@@ -4979,7 +5235,13 @@ private:
 
         const auto hoverX = juce::jlimit (displayBounds.getX(), displayBounds.getRight(), hoveredDisplayX);
         // Vibrant glowing neon red — but follows the WARP accent and turns purple in warp-edit mode.
-        const auto guideColour = cue::isWarpModeActive ? juce::Colour (0xffa855f7)  // WARP purple
+        // In manual chop mode it becomes the orange ghost line marking where a
+        // double-click would drop a marker, matching the placed-marker colour
+        // so the preview and the result read as the same object.
+        const auto guideColour = manualChopMode        ? (currentTheme == Theme::light
+                                                             ? juce::Colour (0xff8c4b00)
+                                                             : accentOrange)
+                               : cue::isWarpModeActive ? juce::Colour (0xffa855f7)  // WARP purple
                                                        : juce::Colour (0xffff2233); // neon red
         lastPaintedHoverAlpha = hoverAnimationAlpha;
         lastPaintedHoverX = hoverX;
@@ -5273,6 +5535,11 @@ private:
     bool isHoldingToPlay = false;
     bool manualChopMode = false;
     int pendingManualStartSample = -1;
+    // True while the placed-but-not-yet-completed start marker is being
+    // dragged to a new position, and while the mouse is within grab range
+    // of it (drives the hover highlight).
+    bool pendingMarkerDragging = false;
+    bool pendingMarkerHovered = false;
     uint64_t lastManualCaptureCompletionRevision = 0;
     float zoomLevel = 0.0f;
     float targetZoomLevel = 0.0f;
@@ -5337,6 +5604,11 @@ private:
     bool  exportButtonHovered   = false;
     bool  exportButtonPressed   = false;
     bool  exportButtonDragArmed = false;
+    // Delete badge beside the pill (manual mode only).
+    static constexpr float kDeleteBadgeSize = 20.0f;
+    static constexpr float kDeleteBadgeGap  = 6.0f;
+    bool  deleteBadgeHovered    = false;
+    bool  deleteBadgePressed    = false;
     juce::Point<float> exportButtonPressPos;
     float exportButtonAppear    = 0.0f; // 0->1 pop-in when the target chop changes
     float exportButtonPulse     = 0.0f; // continuous breathing phase
