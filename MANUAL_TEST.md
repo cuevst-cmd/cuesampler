@@ -20,6 +20,46 @@ prefixed `StemSeparator:`.
 - [ ] Save a project in **ONE SHOT**, close/reopen it, and confirm the button and behavior
       restore as One-Shot. Older projects should open in **GATE** mode.
 
+## Per-chop ADSR and export
+- [ ] Select a chop and click its floating **ADSR / EXPORT** pill. The compact callout opens
+      with Attack, Decay, Sustain, and Release knobs; dragging the pill still starts a direct
+      file drag into the DAW.
+- [ ] Give two chops clearly different envelopes and retrigger each from MIDI. Attack/decay/
+      sustain remain independent per chop; in GATE mode Release begins on note-off.
+- [ ] In ONE SHOT mode, confirm Release fades into the chop boundary without shortening or
+      looping the chop. Exercise normal, pitched, warped, reversed, HALF-TIME, and SYNC playback.
+- [ ] Use **EXPORT CHOP** inside the callout and confirm the saved WAV has the selected chop's
+      ADSR baked in. Save/reopen the project and confirm all four values restore per chop.
+- [ ] Enter manual-chop mode, complete and select a chop, then open the same ADSR/export callout.
+      Changing the selection while a callout is open must not redirect its knobs to another chop.
+
+## Manual chopping
+- [ ] Press **CHOP MANUALLY** after automatic chops exist. The waveform immediately becomes
+      a clean slate and shows the double-click start instruction.
+- [ ] Double-click a start point, hold a hardware or on-screen MIDI key/pad, and release it
+      later in the audio. One numbered chop appears from the start point to the exact release
+      position and retriggers only from the MIDI note used during capture.
+- [ ] Place another start marker, then double-click its end without touching MIDI. A numbered,
+      sequentially MIDI-mapped chop appears and MIDI capture is cleanly cancelled.
+- [ ] Create several chops out of timeline order. Labels remain numbered in waveform order,
+      while each MIDI-captured chop retains its exact key/pad assignment.
+- [ ] Hover either boundary of any completed manual chop. The cursor changes to horizontal
+      resize; drag the start and end markers independently and confirm the chop bounds update,
+      the label follows waveform order, and its MIDI key/pad assignment is unchanged.
+- [ ] With overlapping or adjacent chops, click a chop to select it, then resize its shared or
+      nearby boundary. The selected chop's marker wins when two edges occupy the same position.
+- [ ] Reassign the same MIDI note to a newer chop. The newer chop owns the pad; the older chop
+      remains selectable and exportable by mouse.
+- [ ] Start manual mode while tempo analysis is still running. Its late result must not refill
+      the cleared chop list. Toggle manual mode off, save/reopen, and confirm completed chop
+      bounds and MIDI assignments persist.
+- [ ] While holding a pad during capture, confirm the live end guide follows playback and audio
+      remains clean throughout the hold and click-free on release. Exercise short taps, long holds,
+      release at sample end, zoom, scroll, and several host buffer sizes (especially 64/128 samples).
+- [ ] Enable host sync, HALF TIME, and a non-zero pitch setting before capturing. The in-progress
+      manual audition still plays at the sample's native pitch/speed without crackles, and the
+      completed chop resumes the configured playback processing when retriggered.
+
 ## Happy path
 - [ ] Load a short song (≤ a few minutes). The STEMS panel shows **SEPARATING n%** with
       the three buttons disabled/dimmed; progress climbs.

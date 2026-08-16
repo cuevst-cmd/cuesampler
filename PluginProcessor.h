@@ -62,7 +62,7 @@ public:
         std::vector<double> beatPositionsSeconds;
         std::vector<double> barPositionsSeconds;
         int downbeatPhase = 0;
-        double analysisStartSeconds = 0.0;
+         double analysisStartSeconds = 0.0;
         double analysisEndSeconds = 0.0;
     };
 
@@ -85,6 +85,13 @@ public:
         bool favorite = false;
         bool reversed = false;
         std::vector<ChopWarpMarker> warpMarkers; // sorted by sourceSample; empty = no warp
+        // -1 keeps the legacy consecutive mapping, -2 means deliberately
+        // unassigned, and 0..127 pins this chop to an exact MIDI note.
+        int assignedMidiNote = -1;
+        float attackMilliseconds = 0.0f;
+        float decayMilliseconds = 0.0f;
+        float sustainLevel = 1.0f;
+        float releaseMilliseconds = 5.0f;
     };
 
     struct ChopState
@@ -320,6 +327,20 @@ public:
     void clearTempoAnalysisRegion();
     void addChop (int startSample, int endSample);
 
+    // Manual chopping. The editor arms a start point, then the audio thread
+    // auditions from there while a MIDI note is held and publishes the exact
+    // source position reached on note-off. All communication is atomic.
+    void setManualChopModeActive (bool active) noexcept;
+    bool isManualChopModeActive() const noexcept;
+    void clearAllChops();
+    int  addManualChop (int startSample, int endSample, int assignedMidiNote);
+    void armManualChopCapture (int startSample) noexcept;
+    void cancelManualChopCapture() noexcept;
+    int getManualChopCaptureHeldNote() const noexcept;
+    int getManualChopCaptureCompletedNote() const noexcept;
+    int getManualChopCaptureEndSample() const noexcept;
+    uint64_t getManualChopCaptureCompletionRevision() const noexcept;
+
     // Replaces the chop list with one chop per detected transient onset.
     // Light favors heavy hits only (sparser markers); Medium captures more
     // moderate hits as well. Runs on the calling thread; returns the number
@@ -336,6 +357,8 @@ public:
     void setSelectedChopCueNormalized (float normalizedValue);
     void setSelectedChopGainDecibels (float gainDecibels);
     void setSelectedChopPitchSemitones (float pitchSemitones);
+    enum class ChopEnvelopeParameter : int { Attack = 0, Decay, Sustain, Release };
+    void setChopEnvelopeParameter (int chopId, ChopEnvelopeParameter parameter, float value);
     void toggleSelectedChopFavorite();
     void toggleSelectedChopReversed();
 
@@ -439,6 +462,21 @@ private:
         float midiVelocity = 1.0f;
         bool playbackTriggeredByMidi = false;
         bool midiOneShot = false;
+        bool manualChopCapture = false;
+        juce::ADSR envelope;
+        bool envelopeConfigured = false;
+        bool envelopeReleaseTriggered = false;
+        int envelopeChopId = -1;
+        double envelopeSampleRate = 44100.0;
+        float envelopeReleaseSeconds = 0.005f;
+        // Backstop for the envelope. juce::ADSR only advances when a render
+        // path actually emits samples, so a voice whose render path produces
+        // zero frames for a stretch (Bungee re-priming, warp cache miss,
+        // prepared-cache swap mid-note) would never reach the end of its
+        // release and would hang as a stuck note. This counter is decremented
+        // by the host block size instead, so it always makes progress.
+        // Negative = inactive.
+        double releaseWatchdogSamples = -1.0;
 
         double playbackSyncStartPpq = 0.0;
         double playbackSyncStartSample = 0.0;
@@ -465,12 +503,103 @@ private:
             activeChopId = -1;
             playbackTriggeredByMidi = false;
             midiOneShot = false;
+            manualChopCapture = false;
+            envelope.reset();
+            envelopeConfigured = false;
+            envelopeReleaseTriggered = false;
+            envelopeChopId = -1;
+            envelopeReleaseSeconds = 0.005f;
+            releaseWatchdogSamples = -1.0;
             bungeeResetPending = true;
             fadeGain = 1.0f;
             fadeTarget = 1.0f;
             fadeStep = 0.0f;
             playbackSyncAnchorValid = false;
             observedPitchEngineGeneration = 0;
+        }
+
+        void startEnvelope (const ChopDefinition& chop, double sampleRate)
+        {
+            envelopeSampleRate = juce::jmax (1.0, sampleRate);
+            // Even R=0 retains the existing 32-sample MIDI de-click tail.
+            envelopeReleaseSeconds = juce::jmax ((float) (32.0 / envelopeSampleRate),
+                                                  chop.releaseMilliseconds * 0.001f);
+            envelope.reset();
+            envelope.setSampleRate (envelopeSampleRate);
+            envelope.setParameters ({ juce::jmax (0.0f, chop.attackMilliseconds * 0.001f),
+                                      juce::jmax (0.0f, chop.decayMilliseconds * 0.001f),
+                                      juce::jlimit (0.0f, 1.0f, chop.sustainLevel),
+                                      envelopeReleaseSeconds });
+            envelope.noteOn();
+            envelopeConfigured = true;
+            envelopeReleaseTriggered = false;
+            envelopeChopId = chop.id;
+            releaseWatchdogSamples = -1.0;
+        }
+
+        void beginEnvelopeRelease() noexcept
+        {
+            if (envelopeConfigured && ! envelopeReleaseTriggered)
+            {
+                envelope.noteOff();
+                envelopeReleaseTriggered = true;
+                // Generous margin: the watchdog exists to catch a stalled
+                // envelope, never to cut a healthy release short. A release
+                // that is progressing normally always finishes well inside
+                // this window and clears the voice via envelope.isActive().
+                releaseWatchdogSamples = (double) envelopeReleaseSeconds * envelopeSampleRate * 2.0
+                                       + 4.0 * envelopeSampleRate * 0.001; // + 4 ms floor
+            }
+        }
+
+        // Called once per processBlock with the host block size, regardless of
+        // which render path ran or whether it emitted anything. Returns true
+        // when the release has overrun its window and the voice must be cut.
+        bool tickReleaseWatchdog (int hostBlockSamples) noexcept
+        {
+            if (releaseWatchdogSamples < 0.0)
+                return false;
+
+            releaseWatchdogSamples -= (double) juce::jmax (0, hostBlockSamples);
+            return releaseWatchdogSamples <= 0.0;
+        }
+
+        float nextEnvelopeGain (bool autoRelease,
+                                double outputSamplesUntilStop,
+                                double totalOutputSamples) noexcept
+        {
+            if (! envelopeConfigured)
+                return 1.0f;
+
+            if (autoRelease && ! envelopeReleaseTriggered && envelopeReleaseSeconds > 0.0f)
+            {
+                // Release can run to 4000 ms, so on a chop shorter than that
+                // the trigger point would land at or before frame zero and the
+                // chop would be nothing but a fade-out. Cap the auto-release
+                // window at half the chop so every chop keeps an audible body,
+                // and retune the ADSR to match so the ramp still reaches
+                // silence exactly at the boundary rather than being cut off.
+                const auto configuredReleaseSamples = (double) envelopeReleaseSeconds * envelopeSampleRate;
+                const auto releaseSamples = totalOutputSamples > 0.0
+                    ? juce::jmin (configuredReleaseSamples, totalOutputSamples * 0.5)
+                    : configuredReleaseSamples;
+
+                if (outputSamplesUntilStop <= releaseSamples)
+                {
+                    if (releaseSamples < configuredReleaseSamples)
+                    {
+                        const auto shortened = (float) (releaseSamples / envelopeSampleRate);
+                        auto params = envelope.getParameters();
+                        params.release = juce::jmax (1.0e-4f, shortened);
+                        envelope.setParameters (params);
+                        envelopeReleaseSeconds = params.release;
+                    }
+
+                    beginEnvelopeRelease();
+                }
+            }
+
+            return envelope.getNextSample();
         }
 
         void startFade (float target, double durationSamples)
@@ -632,6 +761,13 @@ private:
     std::atomic<int> chopBarsCount { 1 };
     std::atomic<int> heldMidiNote { -1 };
     std::atomic<int> midiOctaveOffset { 0 };
+    std::atomic<bool> manualChopModeActive { false };
+    std::atomic<bool> manualChopCaptureArmed { false };
+    std::atomic<int> manualChopCaptureStartSample { 0 };
+    std::atomic<int> manualChopCaptureHeldNote { -1 };
+    std::atomic<int> manualChopCaptureCompletedNote { -1 };
+    std::atomic<int> manualChopCaptureEndSample { 0 };
+    std::atomic<uint64_t> manualChopCaptureCompletionRevision { 0 };
     std::atomic<float> gridStartOffset { 0.0f };
     std::atomic<float> waveformZoom { 0.25f };
     std::atomic<float> waveformScroll { 0.0f };
@@ -691,6 +827,7 @@ private:
     void handleAsyncUpdate() override;
     void handleMidiEvent (const juce::MidiMessage& msg, 
                           int sampleOffset, 
+                          const std::shared_ptr<LoadedSampleData>& currentSample,
                           const std::shared_ptr<ChopState>& currentChopState,
                           double currentHostRate,
                           bool blockHasHostPpq,

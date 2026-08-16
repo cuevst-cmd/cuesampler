@@ -39,6 +39,14 @@ JuceLibraryCode/
 dist/*.pkg
 dist/*.pkg.zip
 
+# Vendored CLI binaries — install these via brew/winget, don't commit them.
+# tools/gh was a 37 MB GitHub CLI binary referenced by nothing; stripped from
+# history 2026-08-16.
+tools/gh
+
+# Claude Code local settings
+.claude/
+
 # Large asset files if needed (you can comment these out if you want to track them)
 # *.wav
 # *.aif
