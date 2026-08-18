@@ -6992,8 +6992,15 @@ void AudioPluginAudioProcessor::undoLastEdit()
                 requestChopWarpRender (c.id);
 
     touchTempoUiRevision();
+
+    // Deliberately NOT sampleChangeBroadcaster: that broadcast means "a new
+    // sample was loaded", and the waveform view responds by resetting zoom and
+    // scroll to the fully-zoomed-out default. Undo never changes the audio —
+    // only chops, markers and grid params — so throwing away the user's zoom
+    // and scroll position on every undo was pure collateral damage. The edit
+    // broadcast repaints everything that actually changed and leaves the view
+    // where the user put it.
     notifyEditStateChanged();
-    sampleChangeBroadcaster.sendChangeMessage();
 }
 
 void AudioPluginAudioProcessor::toggleSelectedChopFavorite()

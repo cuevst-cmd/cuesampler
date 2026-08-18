@@ -7,6 +7,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <vector>
 
 namespace cue
 {
@@ -1734,7 +1735,7 @@ public:
         // Dismiss hint
         g.setColour (textMuted);
         g.setFont (monoFont (10.0f).withExtraKerningFactor (0.06f));
-        g.drawText ("PRESS ? OR CLICK ANYWHERE TO CLOSE",
+        g.drawText ("PRESS ? OR ESC, OR CLICK ANYWHERE, TO CLOSE",
                     bounds.withTrimmedTop (12.0f).withHeight (18.0f),
                     juce::Justification::centred, false);
 
@@ -1754,89 +1755,191 @@ public:
     }
 
 private:
+    // One reference line. An empty `right` renders `left` across the full
+    // column (the numbered quick-start steps); otherwise the pair is drawn as
+    // an aligned label/description couple. The old layout faked that alignment
+    // with padded spaces inside a single string, which only lined up at one
+    // font size and drifted the moment a label changed length.
+    struct Row
+    {
+        const char* left;
+        const char* right = nullptr;
+    };
+
+    struct Section
+    {
+        const char* heading;
+        std::vector<Row> rows;
+    };
+
+    // Vertical metrics for a column, scaled as a set when the card is shorter
+    // than its content. Keeping them in one struct is what keeps measurement
+    // and painting honest: both read the same numbers.
+    struct Metrics
+    {
+        float headingH   = 22.0f;
+        float ruleGap    = 8.0f;
+        float rowH       = 19.0f;
+        float sectionGap = 18.0f;
+    };
+
+    static float measureColumn (const std::vector<Section>& sections, const Metrics& m)
+    {
+        float h = 0.0f;
+        for (size_t i = 0; i < sections.size(); ++i)
+        {
+            h += m.headingH + m.ruleGap + (float) sections[i].rows.size() * m.rowH;
+            if (i + 1 < sections.size())
+                h += m.sectionGap;
+        }
+        return h;
+    }
+
     void paintContent (juce::Graphics& g, juce::Rectangle<float> area)
     {
-        const float colW  = (area.getWidth() - 34.0f) * 0.5f;
-        auto leftCol  = area.withWidth (colW);
-        auto rightCol = area.withX (area.getX() + colW + 34.0f).withWidth (colW);
-
-        paintSection (g, leftCol, "QUICK START",
+        // Static: the tables are constant, and paint() runs on every repaint of
+        // the parent — no reason to rebuild three vectors each frame.
+        static const std::vector<Section> leftSections
         {
-            "1.  Drag an audio file onto the waveform, or press LOAD SAMPLE.",
-            "2.  The plugin detects BPM and slices the sample into chops.",
-            "3.  Click any chop on the waveform to select and preview it.",
-            "4.  Chops play via MIDI - C2 = chop 1, D2 = chop 2, and so on.",
-            "5.  Choose GATE (hold + loop) or ONE SHOT (play once).",
-            "6.  Use BARS to set chop size: 1, 2, 4, or 8 bars.",
-            "7.  Tweak CUE, GAIN, and PITCH to customise each chop.",
-            "8.  Use the TEMPO trim knob if chop boundaries feel off-beat.",
-        });
+            { "QUICK START", {
+                { "1.  Drag an audio file onto the waveform, or press LOAD SAMPLE." },
+                { "2.  CUE detects the BPM and key, then slices the sample into chops." },
+                { "3.  Click any chop on the waveform to select and preview it." },
+                { "4.  Chops play over MIDI - C2 = chop 1, D2 = chop 2, and so on." },
+                { "5.  BARS sets chop size (1 / 2 / 4 / 8); OCT -/+ moves the mapping." },
+                { "6.  GATE holds and loops a chop; ONE SHOT plays it through once." },
+                { "7.  TEMPO trim nudges the grid when chops feel early or late." },
+            }},
+            { "TOOLS & DISPLAYS", {
+                { "SYNC",        "Lock playback speed to the host BPM" },
+                { "HALF-TIME",   "Half speed, original pitch" },
+                { "REVERSE",     "Play the selected chop backwards" },
+                { "MANUAL",      "Hand-place chops from a clean slate" },
+                { "STEMS",       "Split into DRUMS / BASS / VOCALS to mute" },
+                { "UNDO",        "Step back through chop edits" },
+                { "TEMPO / KEY", "Click either readout to correct it" },
+            }},
+        };
 
-        const float afterGestures = paintSection (g, rightCol, "MOUSE GESTURES",
+        static const std::vector<Section> rightSections
         {
-            "Click chop                     Select + preview",
-            "Double-click chop           Toggle favourite (pink)",
-            "Drag chop edge              Resize this chop only",
-            "Shift-drag chop edge       Resize grid + update tempo",
-            "Drag audio file onto view   Load new sample",
-            "Alt-click any knob           Reset to default value",
-            "Scroll wheel                   Zoom in / out to cursor",
-            "Horizontal scroll              Pan left / right",
-        });
+            { "MOUSE GESTURES", {
+                { "Click chop",            "Select + preview" },
+                { "Double-click chop",     "Toggle favourite (pink)" },
+                { "Drag chop edge",        "Resize this chop only" },
+                { "Shift-drag chop edge",  "Resize grid + update tempo" },
+                { "Drag EXPORT badge out", "Drop the chop into your DAW" },
+                { "Drop an audio file",    "Load a new sample" },
+                { "Alt-click any knob",    "Reset to default value" },
+                { "Scroll / h-scroll",     "Zoom to cursor / pan left-right" },
+            }},
+            { "WARP MODE", {
+                { "WARP button",         "Enter / exit warp-edit mode" },
+                { "Click inside a chop", "Drop a marker on the snap division" },
+                { "Drag a marker",       "Move it freely (hold Shift to snap)" },
+                { "Cmd-drag a marker",   "Re-pin it to different source audio" },
+                { "Right-click marker",  "Snap to a division, or clear it" },
+                { "Double-click marker", "Delete that marker" },
+                { "CLEAR ALL",           "Wipe every marker on the selected chop" },
+            }},
+        };
 
-        paintSection (g, rightCol.withY (afterGestures + 22.0f), "WARP MARKERS",
+        static const juce::StringArray glossary {
+            "CHOP = auto-sliced segment   |   GATE = hold + loop   |   ONE SHOT = play once",
+            "CUE = start point inside a chop   |   GRID = beat-grid anchor offset (ms)",
+            "PITCH under waveform = global, in CHOP CONTROLS = per-chop   |   TEMPO trim = +/-10 BPM",
+        };
+
+        // The footer is fixed-size and claims its space first; the columns then
+        // auto-fit whatever is left. Previously the sections were positioned
+        // from hard-coded offsets, so the last one on the right ran straight
+        // through the glossary rule.
+        constexpr float glossaryLineH = 15.0f;
+        auto footer = area.removeFromBottom (10.0f + (float) glossary.size() * glossaryLineH);
+        area.removeFromBottom (14.0f); // breathing room above the rule
+
+        Metrics m;
+        const float needed = juce::jmax (measureColumn (leftSections,  m),
+                                         measureColumn (rightSections, m));
+        if (needed > area.getHeight() && needed > 0.0f)
         {
-            "Press WARP to enter warp-edit mode.",
-            "Click the waveform to place a time-stretch marker.",
-            "Drag a marker left / right to shift local timing.",
-            "Right-click a marker to snap it to a grid division or clear it.",
-            "BAR / BEAT / 1-2 / 16 combo sets the snap grid.",
-            "Press WARP again (or Escape) to exit warp-edit mode.",
-        });
+            // Floor the shrink so text can never collapse into an unreadable
+            // smear — if the card is ever that small, clipping is the honest
+            // failure, not 4pt type.
+            const float scale = juce::jmax (0.70f, area.getHeight() / needed);
+            m.headingH   *= scale;
+            m.ruleGap    *= scale;
+            m.rowH       *= scale;
+            m.sectionGap *= scale;
+        }
 
-        // Footer glossary
-        auto footer = area.withY (area.getBottom() - 82.0f).withHeight (82.0f);
+        const float colW = (area.getWidth() - 34.0f) * 0.5f;
+        paintColumn (g, area.withWidth (colW), leftSections, m);
+        paintColumn (g, area.withX (area.getX() + colW + 34.0f).withWidth (colW), rightSections, m);
+
         g.setColour (borderMid.withAlpha (0.6f));
         g.drawLine (footer.getX(), footer.getY(), footer.getRight(), footer.getY(), 1.0f);
         g.setColour (textMuted);
-        g.setFont (monoFont (10.0f));
-        const juce::StringArray defs {
-            "CHOP = auto-sliced segment   |   GATE = hold + loop   |   ONE SHOT = play once",
-            "CUE = playback start inside a chop   |   GRID = beat-grid anchor offset (ms)",
-            "PITCH (under waveform) = global shift   |   PITCH (chop controls) = per-chop shift",
-            "SYNC = auto-match speed to DAW BPM   |   TEMPO trim = nudge grid +/-10 BPM",
-        };
-        float fy = footer.getY() + 12.0f;
-        for (const auto& d : defs)
+        g.setFont (monoFont (9.5f));
+        float fy = footer.getY() + 8.0f;
+        for (const auto& d : glossary)
         {
-            g.drawText (d, juce::Rectangle<float> (footer.getX(), fy, footer.getWidth(), 16.0f),
+            g.drawText (d, juce::Rectangle<float> (footer.getX(), fy, footer.getWidth(), glossaryLineH),
                         juce::Justification::centred, false);
-            fy += 18.0f;
+            fy += glossaryLineH;
         }
     }
 
-    float paintSection (juce::Graphics& g, juce::Rectangle<float> col,
-                        const juce::String& heading,
-                        std::initializer_list<const char*> lines)
+    void paintColumn (juce::Graphics& g, juce::Rectangle<float> col,
+                      const std::vector<Section>& sections, const Metrics& m)
     {
         float y = col.getY();
-        g.setColour (themedTitleColour (accentOrange));
-        g.setFont (heavyFont (14.0f).withExtraKerningFactor (0.08f));
-        g.drawText (heading, juce::Rectangle<float> (col.getX(), y, col.getWidth(), 22.0f),
-                    juce::Justification::centredLeft, false);
-        y += 27.0f;
-        g.setColour (borderMid.withAlpha (0.7f));
-        g.drawLine (col.getX(), y, col.getRight(), y, 1.0f);
-        y += 10.0f;
-        g.setFont (monoFont (11.0f));
-        for (const auto* line : lines)
+
+        for (size_t s = 0; s < sections.size(); ++s)
         {
-            g.setColour (textPrimary.withAlpha (0.88f));
-            g.drawText (line, juce::Rectangle<float> (col.getX(), y, col.getWidth(), 20.0f),
+            const auto& section = sections[s];
+
+            g.setColour (themedTitleColour (accentOrange));
+            g.setFont (heavyFont (juce::jmin (14.0f, m.headingH * 0.64f)).withExtraKerningFactor (0.08f));
+            g.drawText (section.heading,
+                        juce::Rectangle<float> (col.getX(), y, col.getWidth(), m.headingH),
                         juce::Justification::centredLeft, false);
-            y += 22.0f;
+            y += m.headingH;
+
+            g.setColour (borderMid.withAlpha (0.7f));
+            g.drawLine (col.getX(), y, col.getRight(), y, 1.0f);
+            y += m.ruleGap;
+
+            // Descriptions align on a real edge rather than on padded spaces.
+            const float labelW = col.getWidth() * 0.44f;
+            const float fontH  = juce::jmin (11.0f, m.rowH * 0.62f);
+            g.setFont (monoFont (fontH));
+
+            for (const auto& row : section.rows)
+            {
+                const juce::Rectangle<float> line (col.getX(), y, col.getWidth(), m.rowH);
+
+                if (row.right == nullptr || *row.right == '\0')
+                {
+                    g.setColour (textPrimary.withAlpha (0.88f));
+                    g.drawText (row.left, line, juce::Justification::centredLeft, false);
+                }
+                else
+                {
+                    g.setColour (textPrimary.withAlpha (0.92f));
+                    g.drawText (row.left, line.withWidth (labelW - 8.0f),
+                                juce::Justification::centredLeft, false);
+                    g.setColour (textMuted);
+                    g.drawText (row.right, line.withTrimmedLeft (labelW),
+                                juce::Justification::centredLeft, false);
+                }
+
+                y += m.rowH;
+            }
+
+            if (s + 1 < sections.size())
+                y += m.sectionGap;
         }
-        return y;
     }
 };
 
@@ -1903,10 +2006,10 @@ public:
         struct Bullet { const char* label; const char* desc; };
         const Bullet bullets[] = {
             { "DROP MARKERS",  "Click inside any chop on the waveform to add warp markers." },
-            { "TIME STRETCH",  "Drag markers left or right to shift local audio timing." },
-            { "GRID SNAP",     "Markers auto-snap to your grid. Right-click to snap or remove." },
+            { "TIME STRETCH",  "Drag markers freely left or right to shift local audio timing." },
+            { "GRID SNAP",     "New markers snap to the grid. Hold SHIFT while dragging to re-snap." },
             { "CLEAR ALL",     "Use the CLEAR ALL button to wipe markers for the active chop." },
-            { "EXITING WARP",  "Click WARP again or press Escape anytime to exit WARP mode." }
+            { "EXITING WARP",  "Click the WARP button again to leave WARP mode." }
         };
 
         float y = card.getY() + 78.0f;
@@ -2890,7 +2993,12 @@ public:
         }
 
         if (hitTestWarpMarker (event.position))
-            return; // existing marker — drag begins on next mouseDrag
+        {
+            // Existing marker — drag begins on next mouseDrag, and repositioning
+            // is free-moving unless Shift is held (see handleWarpMouseDrag).
+            warpDragSnap = event.mods.isShiftDown();
+            return;
+        }
 
         // No marker hit → drop a new one. The cursor x within the chop is the
         // PLAYBACK-time axis (local-time-x), so we derive localTime from it
@@ -3017,8 +3125,16 @@ public:
     {
         // Re-evaluate modifiers each frame so the user can change strategy
         // mid-drag.
+        //
+        // REPOSITIONING is free by default: once a marker exists the user is
+        // fine-tuning against what they hear, and quantising every drag frame
+        // to the division made small corrections impossible. Snapping is now
+        // opt-in (hold Shift), and the right-click menu still offers explicit
+        // "snap to nearest" for the cases where the grid is what you want.
+        // Note: placing a NEW marker still snaps by default — see
+        // handleWarpMouseDown.
         warpDragRetarget = event.mods.isCommandDown() || event.mods.isCtrlDown();
-        warpDragSnap     = ! event.mods.isShiftDown();
+        warpDragSnap     = event.mods.isShiftDown();
 
         const auto sampleData = processor.getLoadedSample();
         const auto chopState  = processor.getChopState();
@@ -4808,8 +4924,8 @@ private:
 
         juce::String hint;
         if (warpDragChopId >= 0 && warpDragMarkerIndex >= 0)
-            hint = warpDragSnap ? "DRAGGING  |  SNAPPING TO GRID  |  HOLD SHIFT FOR FREE"
-                                : "DRAGGING FREELY  |  RELEASE SHIFT TO SNAP";
+            hint = warpDragSnap ? "DRAGGING  |  SNAPPING TO GRID  |  RELEASE SHIFT FOR FREE"
+                                : "DRAGGING FREELY  |  HOLD SHIFT TO SNAP TO GRID";
         else
             hint = "CLICK INSIDE A CHOP TO DROP A MARKER  |  DRAG TO SHIFT TIMING"
                    "  |  RIGHT-CLICK A MARKER FOR OPTIONS  |  ? BUTTON FOR FULL GUIDE";
@@ -5821,7 +5937,8 @@ public:
         warpButton.setToggleState (processor.isWarpModeActive(), juce::dontSendNotification);
         cue::isWarpModeActive = processor.isWarpModeActive();
         warpButton.setTooltip ("WARP mode: click inside a chop to drop a warp marker on the audio. "
-                                "The marker auto-snaps to the nearest grid division.");
+                                "New markers snap to the nearest grid division; dragging an "
+                                "existing marker moves it freely (hold Shift to snap).");
         warpButton.onClick = [this]
         {
             const auto active = warpButton.getToggleState();
@@ -6419,6 +6536,11 @@ private:
             processor.setWarpModeActive (false);
             warpButton.setToggleState (false, juce::dontSendNotification);
             cue::isWarpModeActive = false;
+
+            // Tell the editor warp just closed so the warp guide card can't
+            // stay up over a mode that is no longer active.
+            if (onWarpToggled)
+                onWarpToggled (false);
         }
 
         // Swaps the live and stashed chop sets. No-op if already on this
@@ -7219,13 +7341,29 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
 
     transportSectionComponent->onWarpToggled = [this] (bool active)
     {
-        // The guide no longer opens automatically on entering warp mode — the
-        // waveform now carries a persistent hint bar instead, which teaches the
-        // same things at the point of use. The guide is still available on
-        // demand via ? (see onHelpRequested). Leaving warp mode still closes it
-        // so it can never outlive the mode it describes.
-        if (warpHelpOverlayComponent != nullptr && ! active)
+        if (warpHelpOverlayComponent == nullptr)
+            return;
+
+        if (active)
+        {
+            // Entering warp mode opens the guide/warning card again. Warping is
+            // destructive to timing and hands the waveform click over to marker
+            // placement, so the user gets told what changed before they click.
+            // The in-waveform hint bar still carries the same rules at the point
+            // of use once this is dismissed.
+            if (helpOverlayComponent != nullptr)
+                helpOverlayComponent->setVisible (false);
+
+            warpHelpOverlayComponent->setBounds (getLocalBounds());
+            warpHelpOverlayComponent->toFront (true);
+            warpHelpOverlayComponent->setVisible (true);
+        }
+        else
+        {
+            // Leaving warp mode closes it so it can never outlive the mode it
+            // describes.
             warpHelpOverlayComponent->setVisible (false);
+        }
     };
 
     headerComponent->onHelpRequested = [this]
