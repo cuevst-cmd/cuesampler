@@ -3662,9 +3662,21 @@ void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData
         state.addChild (analysisTree, -1, nullptr);
     }
 
-    if (const auto currentChopState = std::atomic_load (&chopState); currentChopState != nullptr)
+    // Which chop layer is live, so a project reopens on the layer it was saved on.
+    state.setProperty ("manualChopModeActive",
+                       manualChopModeActive.load (std::memory_order_acquire), nullptr);
+
+    // Both chop layers are written: "ChopState" is the live one, and
+    // "StashedChopState" is the inactive one. Without the second, saving while
+    // in manual mode would silently discard the automatic chops (and vice versa).
+    const auto writeChopStateTree = [&state] (const juce::String& treeType,
+                                              const std::shared_ptr<ChopState>& source)
     {
-        juce::ValueTree chopStateTree ("ChopState");
+        if (source == nullptr)
+            return;
+
+        juce::ValueTree chopStateTree (treeType);
+        const auto& currentChopState = source;
         chopStateTree.setProperty ("selectedChopId", currentChopState->selectedChopId, nullptr);
         chopStateTree.setProperty ("nextChopId", currentChopState->nextChopId, nullptr);
 
@@ -3699,7 +3711,10 @@ void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData
         }
 
         state.addChild (chopStateTree, -1, nullptr);
-    }
+    };
+
+    writeChopStateTree ("ChopState", std::atomic_load (&chopState));
+    writeChopStateTree ("StashedChopState", std::atomic_load (&stashedChopState));
 
     juce::MemoryOutputStream output (destData, false);
     output.write (cueSamplerStateMagic, 4);
@@ -3801,16 +3816,21 @@ AudioPluginAudioProcessor::parseDeferredRestoreState (const juce::ValueTree& sta
     }
 
     restoreState.chopState = std::make_shared<ChopState>();
-    if (const auto chopStateTree = state.getChildWithName ("ChopState"); chopStateTree.isValid())
+    // Shared by both chop layers so the live and stashed sets are parsed and
+    // validated identically.
+    const auto parseChopStateTree = [] (const juce::ValueTree& chopStateTree, ChopState& target)
     {
-        restoreState.chopState->selectedChopId = (int) chopStateTree.getProperty ("selectedChopId", -1);
-        restoreState.chopState->nextChopId = (int) chopStateTree.getProperty ("nextChopId", 1);
+        if (! chopStateTree.isValid())
+            return;
+
+        target.selectedChopId = (int) chopStateTree.getProperty ("selectedChopId", -1);
+        target.nextChopId = (int) chopStateTree.getProperty ("nextChopId", 1);
 
         int highestChopId = 0;
 
         for (const auto chopTree : chopStateTree)
         {
-            if ((int) restoreState.chopState->chops.size() >= maximumRestoredChops)
+            if ((int) target.chops.size() >= maximumRestoredChops)
                 break;
 
             if (! chopTree.hasType ("Chop"))
@@ -3868,11 +3888,11 @@ AudioPluginAudioProcessor::parseDeferredRestoreState (const juce::ValueTree& sta
             if (chop.id > 0 && chop.endSample > chop.startSample)
             {
                 highestChopId = juce::jmax (highestChopId, chop.id);
-                restoreState.chopState->chops.push_back (chop);
+                target.chops.push_back (chop);
             }
         }
 
-        std::sort (restoreState.chopState->chops.begin(), restoreState.chopState->chops.end(),
+        std::sort (target.chops.begin(), target.chops.end(),
                    [] (const ChopDefinition& lhs, const ChopDefinition& rhs)
                    {
                        if (lhs.startSample != rhs.startSample)
@@ -3881,9 +3901,22 @@ AudioPluginAudioProcessor::parseDeferredRestoreState (const juce::ValueTree& sta
                        return lhs.id < rhs.id;
                    });
 
-        if (restoreState.chopState->nextChopId <= highestChopId)
-            restoreState.chopState->nextChopId = highestChopId + 1;
-    }
+        if (target.nextChopId <= highestChopId)
+            target.nextChopId = highestChopId + 1;
+    };
+
+    parseChopStateTree (state.getChildWithName ("ChopState"), *restoreState.chopState);
+
+    restoreState.stashedChopState = std::make_shared<ChopState>();
+    parseChopStateTree (state.getChildWithName ("StashedChopState"), *restoreState.stashedChopState);
+    restoreState.restoredManualChopMode = (bool) state.getProperty ("manualChopModeActive", false);
+
+    // Ids are unique across both layers (see swapChopLayers), so both sets must
+    // continue from the same high-water mark after a restore.
+    const int sharedNextChopId = juce::jmax (restoreState.chopState->nextChopId,
+                                             restoreState.stashedChopState->nextChopId);
+    restoreState.chopState->nextChopId = sharedNextChopId;
+    restoreState.stashedChopState->nextChopId = sharedNextChopId;
 
     restoreState.restoredGridBpmTrim = juce::jlimit (-10.0f, 10.0f,
                                                      (float) (double) state.getProperty ("gridBpmTrim", 0.0));
@@ -4097,6 +4130,16 @@ void AudioPluginAudioProcessor::completeDeferredSampleRestore (const DeferredRes
     std::atomic_store (&tempoEditState, restoredEditState);
     std::atomic_store (&tempoAnalysis, restoredAnalysis);
     std::atomic_store (&chopState, restoredChopState);
+
+    // The inactive chop layer and which layer was live when the project was
+    // saved. Restored verbatim — the stashed set is not re-validated against
+    // the sample here because it is not playable until swapped in, and
+    // swapChopLayers()/the next edit will clamp it if the sample differs.
+    std::atomic_store (&stashedChopState,
+                       restoreState.stashedChopState != nullptr
+                           ? std::make_shared<ChopState> (*restoreState.stashedChopState)
+                           : std::make_shared<ChopState>());
+    manualChopModeActive.store (restoreState.restoredManualChopMode, std::memory_order_release);
 
     loadedFileName = restoredSample->fileName;
     sampleSampleRate = restoredSample->sampleRate;
@@ -5291,15 +5334,18 @@ void AudioPluginAudioProcessor::setChopBounds (int chopId, int newStartSample, i
 
     pushEditUndoSnapshot ("chopBounds:" + juce::String (chopId));
 
-    const auto oldStart = chopIt->startSample;
-    const auto oldCueSample = oldStart + chopIt->cueOffsetSamples;
-
     chopIt->startSample = clampedStart;
     chopIt->endSample = clampedEnd;
 
+    // The cue is an offset INTO the chop, so it travels with the start marker:
+    // dragging the start earlier or later moves the cue by the same amount and
+    // keeps it in the same relative place. Previously this recomputed the
+    // offset from the cue's absolute source position, which pinned the cue to
+    // the audio and left it stranded while the marker moved out from under it.
+    // Only clamping is applied here, for the case where shrinking the chop
+    // would otherwise leave the cue past the new end.
     const int newLength = juce::jmax (1, clampedEnd - clampedStart - 1);
-    const int clampedCueSample = juce::jlimit (clampedStart, juce::jmax (clampedStart, clampedEnd - 1), oldCueSample);
-    chopIt->cueOffsetSamples = juce::jlimit (0, newLength, clampedCueSample - clampedStart);
+    chopIt->cueOffsetSamples = juce::jlimit (0, newLength, chopIt->cueOffsetSamples);
 
     chopIt->warpMarkers.erase (std::remove_if (chopIt->warpMarkers.begin(), chopIt->warpMarkers.end(),
                                                [clampedStart, clampedEnd] (const ChopWarpMarker& marker)
@@ -6281,11 +6327,61 @@ bool AudioPluginAudioProcessor::clearChopWarpMarkers (int chopId)
     return true;
 }
 
-void AudioPluginAudioProcessor::setManualChopModeActive (bool active) noexcept
+void AudioPluginAudioProcessor::setManualChopModeActive (bool active)
 {
+    if (manualChopModeActive.load (std::memory_order_acquire) == active)
+        return;
+
+    cancelManualChopCapture();
+    swapChopLayers();
     manualChopModeActive.store (active, std::memory_order_release);
-    if (! active)
-        cancelManualChopCapture();
+}
+
+// Exchanges the live chop set with the stashed one. Called only when the mode
+// actually changes, so the two sets simply trade places and neither is lost.
+void AudioPluginAudioProcessor::swapChopLayers()
+{
+    auto outgoing = std::atomic_load (&chopState);
+    if (outgoing == nullptr)
+        outgoing = std::make_shared<ChopState>();
+
+    auto incoming = std::atomic_load (&stashedChopState);
+    if (incoming == nullptr)
+        incoming = std::make_shared<ChopState>();
+
+    // Deliberately NOT undoable, and the history is dropped rather than kept.
+    // Two reasons. First, the swap is its own undo: pressing the button again
+    // puts everything back, so an undo entry would only add a confusing
+    // half-state where the layers had traded places but the mode flag had not.
+    // Second, existing snapshots describe the layer we are leaving — applying
+    // one after the swap would paste the old layer's chops over the incoming
+    // set. Undo history is per-layer, so it starts fresh here.
+    clearEditUndoHistory();
+
+    // Chop ids must stay unique across BOTH layers: chopAudioCache and the
+    // warp render jobs are keyed by id, so a reused id on the other layer
+    // would resolve to the wrong cached audio. Advance both sets to a shared
+    // high-water mark rather than letting each count independently.
+    const int sharedNextId = juce::jmax (outgoing->nextChopId, incoming->nextChopId);
+
+    // Copy rather than mutate: the audio thread may be reading `outgoing`
+    // through its own shared_ptr right now.
+    auto nextStash = std::make_shared<ChopState> (*outgoing);
+    nextStash->nextChopId = sharedNextId;
+
+    auto nextLive = std::make_shared<ChopState> (*incoming);
+    nextLive->nextChopId = sharedNextId;
+
+    std::atomic_store (&stashedChopState, nextStash);
+    std::atomic_store (&chopState, nextLive);
+
+    // The chop the voice was playing may not exist on the incoming layer, and
+    // cached/warped audio is keyed to the outgoing one.
+    warpRenderThreadPool.removeAllJobs (false, 0);
+    chopAudioCache.clear();
+    stopPlayback();
+    touchTempoUiRevision();
+    notifyEditStateChanged();
 }
 
 bool AudioPluginAudioProcessor::isManualChopModeActive() const noexcept

@@ -84,6 +84,50 @@ prefixed `StemSeparator:`.
       any note already taken.
 - [ ] Load an older project saved before this change. Its chops still map from C2 as before.
 
+## WARP discoverability
+- [ ] Press **WARP**. No full-screen guide appears. A purple hint bar sits at the top of the
+      waveform reading "CLICK INSIDE A CHOP TO DROP A MARKER ...".
+- [ ] Start dragging a marker. The hint changes to the dragging text and says it is snapping.
+      Hold **Shift** mid-drag without moving the mouse — the hint updates to "DRAGGING FREELY".
+- [ ] Press the **?** button while in WARP mode. The warp guide opens (not the general guide).
+      Press it again to close. Escape also closes it.
+- [ ] Press **?** outside WARP mode. The normal quick-start guide opens, as before.
+- [ ] Leave WARP mode while the warp guide is open. The guide closes with the mode.
+- [ ] Add warp markers to a chop, then leave WARP mode. A small purple wave glyph appears on
+      that chop's header tab. Chops with no markers show no glyph.
+- [ ] Clear the markers with CLEAR ALL — the glyph disappears.
+- [ ] Zoom until chops are very narrow. The glyph hides rather than colliding with the chop
+      number (headers under ~34 px wide).
+
+## Two chop layers (automatic <-> manual)
+- [ ] With automatic chops on screen, press **CHOP MANUALLY**. The waveform clears to a blank
+      slate and there is no confirmation prompt (nothing is being destroyed).
+- [ ] Build several manual chops, then press the button again. All the original automatic
+      chops come back exactly as they were.
+- [ ] Press it a third time. The manual chops return exactly as you left them, including their
+      MIDI assignments, ADSR values, cue points, and which one was selected.
+- [ ] Toggle back and forth several times. Neither set degrades or leaks chops into the other.
+- [ ] Save the project while on the manual layer, close and reopen it. It reopens on the
+      manual layer with the button lit, and toggling still brings the automatic set back.
+- [ ] Repeat saving while on the automatic layer — the manual set must survive too.
+- [ ] Close the plugin window while in manual mode and reopen it. The chop list is unchanged
+      and the window comes back up in manual mode.
+- [ ] Create a chop on each layer and confirm their numbers never collide (ids are shared
+      across layers, so exported/cached audio must never come back as the wrong chop).
+- [ ] Undo is cleared by a layer switch: switch layers and confirm undo does not paste the
+      previous layer's chops over the current set.
+- [ ] Enter manual mode while warp mode is on. Warp switches off, as before.
+
+## Cue point follows the start marker
+- [ ] Set a chop's cue part-way in, then drag the chop's **start** edge earlier. The cue keeps
+      its position relative to the start rather than staying glued to the original audio.
+- [ ] Drag the same start edge later. The cue still travels with it and does not collapse
+      onto the chop start.
+- [ ] Drag only the **end** edge. The cue must not move at all.
+- [ ] Shrink a chop until it is shorter than its cue offset. The cue clamps to just inside the
+      new end instead of pointing past it, and playback still starts cleanly.
+- [ ] Repeat all of the above outside manual mode — behaviour is intentionally identical now.
+
 ## Happy path
 - [ ] Load a short song (≤ a few minutes). The STEMS panel shows **SEPARATING n%** with
       the three buttons disabled/dimmed; progress climbs.

@@ -330,7 +330,9 @@ public:
     // Manual chopping. The editor arms a start point, then the audio thread
     // auditions from there while a MIDI note is held and publishes the exact
     // source position reached on note-off. All communication is atomic.
-    void setManualChopModeActive (bool active) noexcept;
+    // Swaps the live chop set with the stashed one. Both sets persist, so this
+    // is non-destructive and can be toggled freely. No-op if already there.
+    void setManualChopModeActive (bool active);
     bool isManualChopModeActive() const noexcept;
     void clearAllChops();
     int  addManualChop (int startSample, int endSample, int assignedMidiNote);
@@ -417,6 +419,10 @@ private:
         std::shared_ptr<TempoEditState> editState;
         std::shared_ptr<TempoAnalysisData> analysis;
         std::shared_ptr<ChopState> chopState;
+        // The inactive chop layer (see stashedChopState). Persisted so that
+        // saving while on one layer does not discard the other.
+        std::shared_ptr<ChopState> stashedChopState;
+        bool restoredManualChopMode = false;
         float restoredGridBpmTrim = 0.0f;
         float restoredGridStartOffset = 0.0f;
         float restoredWaveformZoom = 0.25f;
@@ -634,6 +640,13 @@ private:
     std::shared_ptr<TempoAnalysisData> tempoAnalysis;
     std::shared_ptr<TempoEditState> tempoEditState;
     std::shared_ptr<ChopState> chopState;
+
+    // The inactive chop layer. CUE SAMPLER keeps two independent chop sets —
+    // the automatic/tempo-derived one and the hand-made one — and the
+    // CHOP MANUALLY button swaps between them. Whichever is not live sits
+    // here, so switching modes never destroys either set.
+    std::shared_ptr<ChopState> stashedChopState;
+    void swapChopLayers();
 
     // Undo history for chop/grid edits. Each snapshot is the full editable
     // state captured *before* a destructive edit. Guarded by editUndoLock so

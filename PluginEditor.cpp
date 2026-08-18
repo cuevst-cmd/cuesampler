@@ -1979,7 +1979,7 @@ public:
 
         configureButton (helpButton, "?", textPrimary);
         helpButton.getProperties().set ("cueStyle", "helpButton");
-        helpButton.setTooltip ("Open the quick-start reference guide.");
+        helpButton.setTooltip ("Open the quick-start reference guide. In WARP mode this opens the warp guide instead.");
         helpButton.onClick = [this] { if (onHelpRequested) onHelpRequested(); };
         addAndMakeVisible (helpButton);
 
@@ -2238,8 +2238,11 @@ public:
     ~WaveformDisplayComponent() override
     {
         stopTimer();
+        // Cancel any in-flight capture, but deliberately do NOT leave manual
+        // mode here. Closing the plugin window is not an edit, and exiting the
+        // mode now swaps the chop layers — that would silently rewrite the
+        // project's chop list just because the user shut the editor.
         processor.cancelManualChopCapture();
-        processor.setManualChopModeActive (false);
         processor.sampleChangeBroadcaster.removeChangeListener (this);
         processor.editChangeBroadcaster.removeChangeListener (this);
         horizontalScrollBar.removeListener (this);
@@ -3489,6 +3492,7 @@ public:
         paintChops (g, waveformBounds);
         paintManualChopMarkers (g, waveformBounds);
         paintWarpMarkers (g, waveformBounds);
+        paintWarpHintBar (g, waveformBounds);
         paintTempoGrid (g, waveformBounds);
         paintHoverGuide (g, waveformBounds);
         paintEdgeDragGhost (g, waveformBounds);
@@ -4250,6 +4254,10 @@ private:
                                 || lastTempoUiRevision != processor.getTempoUiRevision()
                                 || isScanning
                                 || (manualChopMode && processor.getManualChopCaptureHeldNote() >= 0)
+                                // Warp hint bar changes on drag start/end and
+                                // when Shift is pressed mid-drag, which can
+                                // happen without any mouse movement.
+                                || (processor.isWarpModeActive() && warpDragChopId >= 0)
                                 || exportDragReady
                                 || (holdChopId >= 0 && ! exportDragReady && holdTickCount > 0)
                                 || ! getExportButtonBounds().isEmpty() || exportButtonAppear > 0.01f
@@ -4755,9 +4763,65 @@ private:
                 g.drawText (juce::String (displayNumber),
                             header.reduced (5.0f, 1.0f).toNearestInt(),
                             juce::Justification::centredLeft, false);
+
+                // Warp indicator. Outside warp mode a warped chop looks almost
+                // identical to an unwarped one, so users forget warping is
+                // applied — and people who have never opened warp mode get no
+                // hint the feature exists. A small wave glyph on the header
+                // marks any chop carrying markers.
+                if (! chop.warpMarkers.empty() && header.getWidth() >= 34.0f)
+                {
+                    const auto warpAccent = isLight ? juce::Colour (0xff6d28d9)
+                                                    : juce::Colour (0xffc084fc);
+                    const float gy = header.getCentreY();
+                    const float gx = header.getRight() - 12.0f;
+
+                    juce::Path wave;
+                    wave.startNewSubPath (gx - 6.0f, gy + 1.6f);
+                    wave.quadraticTo (gx - 3.0f, gy - 4.0f, gx, gy + 1.6f);
+                    wave.quadraticTo (gx + 3.0f, gy + 6.0f, gx + 6.0f, gy + 1.6f);
+
+                    g.setColour (juce::Colours::black.withAlpha (0.40f));
+                    g.strokePath (wave, juce::PathStrokeType (2.1f, juce::PathStrokeType::curved,
+                                                                     juce::PathStrokeType::rounded));
+                    g.setColour (warpAccent.withAlpha (isSelected ? 1.0f : 0.85f));
+                    g.strokePath (wave, juce::PathStrokeType (1.4f, juce::PathStrokeType::curved,
+                                                                     juce::PathStrokeType::rounded));
+                }
             }
         }
 
+    }
+
+    // Persistent in-waveform hint for warp mode, replacing the full-screen
+    // guide that used to appear on every entry. The overlay taught five
+    // bullets at the moment the user had nothing to apply them to, then
+    // vanished; this stays put and changes with what the user is doing. The
+    // full guide is still reachable with ? while warp mode is active.
+    void paintWarpHintBar (juce::Graphics& g, juce::Rectangle<float> displayBounds)
+    {
+        if (! processor.isWarpModeActive())
+            return;
+
+        const auto accent = currentTheme == Theme::light ? juce::Colour (0xff6d28d9)
+                                                         : juce::Colour (0xffc084fc);
+
+        juce::String hint;
+        if (warpDragChopId >= 0 && warpDragMarkerIndex >= 0)
+            hint = warpDragSnap ? "DRAGGING  |  SNAPPING TO GRID  |  HOLD SHIFT FOR FREE"
+                                : "DRAGGING FREELY  |  RELEASE SHIFT TO SNAP";
+        else
+            hint = "CLICK INSIDE A CHOP TO DROP A MARKER  |  DRAG TO SHIFT TIMING"
+                   "  |  RIGHT-CLICK A MARKER FOR OPTIONS  |  ? BUTTON FOR FULL GUIDE";
+
+        auto bar = displayBounds.withHeight (22.0f).reduced (8.0f, 2.0f);
+        g.setColour (juce::Colours::black.withAlpha (0.58f));
+        g.fillRoundedRectangle (bar, 3.0f);
+        g.setColour (accent.withAlpha (0.30f));
+        g.drawRoundedRectangle (bar.reduced (0.5f), 3.0f, 1.0f);
+        g.setColour (accent.withAlpha (0.96f));
+        g.setFont (monoFont (9.5f).boldened().withExtraKerningFactor (0.05f));
+        g.drawText (hint, bar.toNearestInt(), juce::Justification::centred, false);
     }
 
     void paintManualChopMarkers (juce::Graphics& g, juce::Rectangle<float> displayBounds)
@@ -5714,55 +5778,15 @@ public:
         };
         manualChopButton.getProperties().set ("cueStyle", "flatAction");
         manualChopButton.setClickingTogglesState (true);
+        // Manual mode is part of saved project state now, so reflect whichever
+        // chop layer is live rather than always starting in the off position.
+        manualChopButton.setToggleState (processor.isManualChopModeActive(),
+                                         juce::dontSendNotification);
+        // Switching layers is non-destructive — both chop sets are kept — so
+        // this needs no confirmation.
         manualChopButton.onClick = [this]
         {
-            const bool active = manualChopButton.getToggleState();
-
-            if (! active)
-            {
-                enterManualChopMode (false);
-                return;
-            }
-
-            // Entering manual mode wipes the chop list. That is a lot to lose
-            // to a single click, so confirm first when there is anything to
-            // lose. An empty list enters silently.
-            const auto state = processor.getChopState();
-            const int existingChops = state != nullptr ? (int) state->chops.size() : 0;
-
-            if (existingChops == 0)
-            {
-                enterManualChopMode (true);
-                return;
-            }
-
-            juce::Component::SafePointer<TransportSectionComponent> safeThis (this);
-            juce::AlertWindow::showOkCancelBox (
-                juce::MessageBoxIconType::WarningIcon,
-                "Start manual chopping?",
-                "This clears all " + juce::String (existingChops)
-                    + (existingChops == 1 ? " existing chop" : " existing chops")
-                    + " so you can build a new set by hand.\n\n"
-                      "You can undo this afterwards with the undo control.",
-                "Clear and start",
-                "Cancel",
-                nullptr,
-                juce::ModalCallbackFunction::create ([safeThis] (int result)
-                {
-                    if (safeThis == nullptr)
-                        return;
-
-                    if (result == 1)
-                    {
-                        safeThis->enterManualChopMode (true);
-                    }
-                    else
-                    {
-                        // Put the toggle back — the click already flipped it.
-                        safeThis->manualChopButton.setToggleState (false, juce::dontSendNotification);
-                        safeThis->repaint();
-                    }
-                }));
+            enterManualChopMode (manualChopButton.getToggleState());
         };
         barsButton.getProperties().set ("cueStyle", "flatAction");
         loadButton.getProperties().set ("cueStyle", "flatAction");
@@ -6382,12 +6406,11 @@ private:
         return juce::String (names[((noteNumber % 12) + 12) % 12]) + juce::String (octave);
     }
 
-    // Single entry point for entering/leaving manual chop mode, so the
-    // confirmed and unconfirmed paths cannot drift apart.
+    // Single entry point for switching chop layers, so the button, the warp
+    // button's override, and editor start-up cannot drift apart.
     void enterManualChopMode (bool active)
     {
         manualChopButton.setToggleState (active, juce::dontSendNotification);
-        processor.setManualChopModeActive (active);
 
         if (active)
         {
@@ -6396,8 +6419,11 @@ private:
             processor.setWarpModeActive (false);
             warpButton.setToggleState (false, juce::dontSendNotification);
             cue::isWarpModeActive = false;
-            processor.clearAllChops();
         }
+
+        // Swaps the live and stashed chop sets. No-op if already on this
+        // layer, which is what makes it safe to call from start-up sync.
+        processor.setManualChopModeActive (active);
 
         if (onManualChopToggled)
             onManualChopToggled (active);
@@ -7054,6 +7080,10 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
         waveformDisplayComponent->setManualChopMode (active);
         waveformDisplayComponent->repaint();
     };
+    // Reopening the editor on a project saved in manual mode must come back up
+    // in manual mode, otherwise the waveform would take normal-mode clicks
+    // while the processor is still on the hand-made chop layer.
+    waveformDisplayComponent->setManualChopMode (processorRef.isManualChopModeActive());
     transportSectionComponent->getLoadButton().onClick = [this] { loadSampleFromFile(); };
     transportSectionComponent->getPlayButton().onClick = [this] { processorRef.startPlayback(); };
     transportSectionComponent->getPauseButton().onClick = [this] { processorRef.pausePlayback(); };
@@ -7189,23 +7219,32 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
 
     transportSectionComponent->onWarpToggled = [this] (bool active)
     {
-        if (warpHelpOverlayComponent != nullptr)
-        {
-            if (active)
-            {
-                warpHelpOverlayComponent->setBounds (getLocalBounds());
-                warpHelpOverlayComponent->setVisible (true);
-                warpHelpOverlayComponent->toFront (true);
-            }
-            else
-            {
-                warpHelpOverlayComponent->setVisible (false);
-            }
-        }
+        // The guide no longer opens automatically on entering warp mode — the
+        // waveform now carries a persistent hint bar instead, which teaches the
+        // same things at the point of use. The guide is still available on
+        // demand via ? (see onHelpRequested). Leaving warp mode still closes it
+        // so it can never outlive the mode it describes.
+        if (warpHelpOverlayComponent != nullptr && ! active)
+            warpHelpOverlayComponent->setVisible (false);
     };
 
     headerComponent->onHelpRequested = [this]
     {
+        // Contextual help: in warp mode ? opens the warp guide rather than the
+        // general one, which is what the hint bar tells the user to expect.
+        if (processorRef.isWarpModeActive() && warpHelpOverlayComponent != nullptr)
+        {
+            const bool nowVisible = ! warpHelpOverlayComponent->isVisible();
+            if (nowVisible)
+            {
+                helpOverlayComponent->setVisible (false);
+                warpHelpOverlayComponent->setBounds (getLocalBounds());
+                warpHelpOverlayComponent->toFront (true);
+            }
+            warpHelpOverlayComponent->setVisible (nowVisible);
+            return;
+        }
+
         const bool nowVisible = ! helpOverlayComponent->isVisible();
         helpOverlayComponent->setVisible (nowVisible);
     };
