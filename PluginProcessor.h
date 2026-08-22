@@ -468,6 +468,21 @@ private:
         int activeChopId = -1;
         bool playbackActive = false;
         bool bungeeResetPending = true;
+        // Bungee::Stream is a streaming API with two properties the render
+        // loop has to respect. Its input must be fed *contiguously* — deriving
+        // the read pointer from playbackSamplePosition re-reads or skips a
+        // sample at every chunk boundary — and the frame it emits corresponds
+        // to an input position Stream::latency() frames behind what has been
+        // fed. So the feed cursor is tracked separately and deliberately runs
+        // bungeeLatencyFrames ahead of the audible position.
+        //
+        // Frame index of the next sample to push into Bungee, in the coordinate
+        // space of whichever buffer feeds it (the source sample, or the warp
+        // buffer for a warped chop).
+        double bungeeFeedPosition = 0.0;
+        // Pipeline delay measured from Stream::latency() during the note-on
+        // prime, in input frames. Zero until the first prime completes.
+        int bungeeLatencyFrames = 0;
         float midiVelocity = 1.0f;
         bool playbackTriggeredByMidi = false;
         bool midiOneShot = false;
@@ -520,6 +535,8 @@ private:
             envelopeReleaseSeconds = 0.005f;
             releaseWatchdogSamples = -1.0;
             bungeeResetPending = true;
+            bungeeFeedPosition = 0.0;
+            bungeeLatencyFrames = 0;
             fadeGain = 1.0f;
             fadeTarget = 1.0f;
             fadeStep = 0.0f;

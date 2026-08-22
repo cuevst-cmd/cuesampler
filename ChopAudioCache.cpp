@@ -133,6 +133,17 @@ bool renderPreparedWithInterpolation (const juce::AudioBuffer<float>& base,
     return true;
 }
 
+// Renders `base` through Bungee at the given pitch/stretch into `prepared`.
+//
+// base[] is laid out as [preRollSourceFrames of lead-in | chop | tail], and
+// `prepared` receives only the chop. Bungee::Stream emits, at any moment, the
+// input position Stream::latency() frames BEHIND what has been fed (roughly
+// maxInputFrameCount/2 plus a grain hop — about 4200 frames, ~95 ms, at
+// 44.1 kHz), so the feed cursor is kept that far ahead of the output timeline.
+// Skipping the pre-roll in output-frame space alone, as this used to do, left
+// that delay uncompensated: every prepared chop started ~95 ms of pre-chop
+// audio early (silence when the chop sat near the start of the sample) and
+// lost the same amount off its tail.
 bool renderPreparedWithBungee (const juce::AudioBuffer<float>& base,
                                juce::AudioBuffer<float>& prepared,
                                double sourceSampleRate,
@@ -176,63 +187,128 @@ bool renderPreparedWithBungee (const juce::AudioBuffer<float>& base,
         (sourceSampleRate / outputSampleRate) / (double) stretchRatio;
     const auto pitchFactor = std::pow (2.0, (double) pitchSemitones / 12.0);
 
-    // base[] starts with preRollSourceFrames of pre-chop lead-in. We render the
-    // matching pre-roll OUTPUT first and discard it: that warms the stretcher's
-    // look-ahead so the captured chop window begins at full amplitude instead of
-    // Bungee's startup silence/ramp. The capture window in output-frame space is
-    // [preRollOutputFrames, preRollOutputFrames + targetFrames).
+    // Feeds `frameCount` base frames starting at `fromBase` (zero-padded past
+    // the end of base) and pulls `outputFrames` of output into outputChunk.
+    // Returns the frames Bungee emitted, or -1 on a buffer-pointer failure.
+    auto feedBlock = [&] (double fromBase, int frameCount, double outputFrames) -> int
+    {
+        const int copyStart = juce::jlimit (0, sourceLength, (int) std::floor (fromBase));
+        const int copyLen   = juce::jlimit (0, frameCount, sourceLength - copyStart);
+
+        for (int ch = 0; ch < channels; ++ch)
+        {
+            auto* input  = inputBuffer.getWritePointer (ch);
+            auto* output = outputChunk.getWritePointer (ch);
+            if (input == nullptr || output == nullptr)
+                return -1;
+
+            if (copyLen > 0)
+            {
+                const auto* sourceData = base.getReadPointer (ch);
+                if (sourceData == nullptr)
+                    return -1;
+                std::copy (sourceData + copyStart, sourceData + copyStart + copyLen, input);
+            }
+            if (copyLen < frameCount)
+                std::fill (input + copyLen, input + frameCount, 0.0f);
+
+            inPtrs[(size_t) ch] = input;
+            outPtrs[(size_t) ch] = output;
+        }
+
+        outputChunk.clear();
+        return stream.process (inPtrs.data(), outPtrs.data(),
+                               frameCount, outputFrames, pitchFactor);
+    };
+
+    // ---- Prime -----------------------------------------------------------
+    // Push the feed cursor to `latency` frames into base with all output
+    // discarded, so the first kept output frame lands on base[0]... which is
+    // the start of the pre-roll lead-in, not the chop. The lead-in is then
+    // skipped in output-frame space by preRollOutputFrames below, exactly as
+    // before — the prime is purely about removing the pipeline delay.
+    double feedCursor    = 0.0;
+    int    latencyFrames = juce::jmax (1, stretcher.maxInputFrameCount() / 2);
+    bool   latencyKnown  = false;
+
+    const int primeFrameBudget = 6 * stretcher.maxInputFrameCount() + 16;
+    int       primeFed         = 0;
+
+    // Capping the input per call at (block * ratio) keeps process()'s in/out
+    // ratio — which IS request.speed — at the render's ratio; feeding more than
+    // the output request supports would ask Bungee for a wildly wrong speed.
+    const int primeFeedCap = juce::jmax (1,
+        (int) std::ceil ((double) kBungeeBlockSize
+                         * juce::jlimit (0.05, 20.0, sourceFramesPerOutputFrame)));
+
+    while (feedCursor < (double) latencyFrames && primeFed < primeFrameBudget)
+    {
+        const double remaining = (double) latencyFrames - feedCursor;
+        const int feedNow = juce::jlimit (1,
+                                          juce::jmin (juce::jmin (maxInputFrames, primeFeedCap),
+                                                      primeFrameBudget - primeFed),
+                                          (int) std::ceil (remaining));
+        const double outWanted = juce::jlimit (1.0,
+                                               (double) kBungeeBlockSize,
+                                               std::ceil ((double) feedNow
+                                                          / juce::jmax (1.0e-3, sourceFramesPerOutputFrame)));
+
+        if (feedBlock (feedCursor, feedNow, outWanted) < 0)
+            return false;
+
+        feedCursor += (double) feedNow;
+        primeFed   += feedNow;
+
+        // Re-read every pass, not just the first: latency() is only valid once
+        // a grain exists, and the value it reports climbs to its steady state
+        // as the pipeline fills.
+        const int measured = juce::jlimit (0,
+                                           2 * stretcher.maxInputFrameCount(),
+                                           (int) std::ceil (stream.latency()));
+        latencyFrames = latencyKnown ? juce::jmax (latencyFrames, measured) : measured;
+        latencyKnown  = true;
+    }
+
+    // Whatever the prime actually reached is the delay the render must assume,
+    // so a short probe block or the budget guard can never desynchronise the
+    // feed cursor from the output timeline.
+    const double effectiveLatency = juce::jmax (0.0, feedCursor);
+
+    // ---- Render ----------------------------------------------------------
+    // Output frame o corresponds to base position o * sourceFramesPerOutputFrame;
+    // the feed cursor tracks that plus the pipeline latency. Deriving the feed
+    // amount from an absolute target each block keeps the walk self-correcting
+    // rather than accumulating per-block rounding.
     const int preRollOutputFrames = juce::jmax (0,
         (int) std::llround ((double) preRollSourceFrames / sourceFramesPerOutputFrame));
     const int totalOutputWanted = preRollOutputFrames + targetFrames;
 
     int outputRendered = 0; // total output produced so far, including discarded pre-roll
     int zeroRenderStreak = 0;
-    double sourcePosition = 0.0;
 
     while (outputRendered < totalOutputWanted)
     {
         const int segmentOutputFrames =
             juce::jmin (kBungeeBlockSize, totalOutputWanted - outputRendered);
+
+        const double desiredFeedEnd =
+            (double) (outputRendered + segmentOutputFrames) * sourceFramesPerOutputFrame
+            + effectiveLatency;
+
         const int inputFramesRequested = juce::jlimit (
-            1, maxInputFrames,
-            (int) std::ceil ((double) segmentOutputFrames * sourceFramesPerOutputFrame));
-        const int sourceStart = juce::jlimit (0, juce::jmax (0, sourceLength - 1),
-                                              (int) std::floor (sourcePosition));
-        const int availableFrames = juce::jmax (0, sourceLength - sourceStart);
-        const int copiedFrames = juce::jmin (availableFrames, inputFramesRequested);
+            1, maxInputFrames, (int) std::llround (desiredFeedEnd - feedCursor));
 
-        outputChunk.clear();
+        const int renderedFrames = feedBlock (feedCursor, inputFramesRequested,
+                                              (double) segmentOutputFrames);
+        if (renderedFrames < 0)
+            return false;
 
-        for (int ch = 0; ch < channels; ++ch)
-        {
-            auto* input = inputBuffer.getWritePointer (ch);
-            auto* output = outputChunk.getWritePointer (ch);
-            if (input == nullptr || output == nullptr)
-                return false;
-
-            std::fill (input, input + inputFramesRequested, 0.0f);
-            if (copiedFrames > 0)
-            {
-                const auto* sourceData = base.getReadPointer (ch, sourceStart);
-                if (sourceData == nullptr)
-                    return false;
-                std::copy (sourceData, sourceData + copiedFrames, input);
-            }
-
-            inPtrs[(size_t) ch] = input;
-            outPtrs[(size_t) ch] = output;
-        }
-
-        const int renderedFrames = stream.process (inPtrs.data(),
-                                                   outPtrs.data(),
-                                                   inputFramesRequested,
-                                                   (double) segmentOutputFrames,
-                                                   pitchFactor);
+        feedCursor += (double) inputFramesRequested;
 
         if (renderedFrames > 0)
         {
             // Keep only the part of this output block inside the capture window;
-            // everything before preRollOutputFrames is primed-away startup latency.
+            // everything before preRollOutputFrames is the lead-in.
             const int winStart = juce::jmax (outputRendered, preRollOutputFrames);
             const int winEnd   = juce::jmin (outputRendered + renderedFrames, totalOutputWanted);
             if (winEnd > winStart)
@@ -253,18 +329,10 @@ bool renderPreparedWithBungee (const juce::AudioBuffer<float>& base,
             outputRendered += renderedFrames;
             zeroRenderStreak = 0;
         }
-        else
+        else if (++zeroRenderStreak >= 8)
         {
-            ++zeroRenderStreak;
-        }
-
-        sourcePosition += (double) inputFramesRequested;
-
-        if (sourcePosition >= (double) sourceLength)
-            break;
-
-        if (zeroRenderStreak >= 8)
             return false;
+        }
     }
 
     // Need at least some real (post-pre-roll) chop output to count as a success.
@@ -275,17 +343,28 @@ bool renderPreparedWithBungee (const juce::AudioBuffer<float>& base,
     return true;
 }
 
-// Per-segment Bungee-driven render. Walks WarpMap segments, feeds source
-// samples at each segment's speed ratio, and writes pitch-preserved output
-// into the target buffer. Returns true on success; false if rendering aborted
-// (e.g., Bungee produced no frames for many consecutive process calls).
+// Bungee-driven warp render. Walks the chop's output timeline and feeds source
+// samples so that the input consumed per output block matches the WarpMap's
+// local speed, writing pitch-preserved output into the target buffer. Returns
+// true on success; false if rendering aborted (e.g., Bungee produced no frames
+// for many consecutive process calls).
 //
 // pitchFactor is fixed at 1.0 because per-chop pitchSemitones is applied
 // live on top of the cache, not baked into it.
-bool renderWarpedChopBungee (const WarpMap&                 warpMap,
-                                              const juce::AudioBuffer<float>& source,
-                                              juce::AudioBuffer<float>&       target,
-                                              double                          sampleRate)
+//
+// Bungee::Stream is a pipeline: the frame it emits corresponds to an input
+// position Stream::latency() frames BEHIND the input already fed (roughly
+// maxInputFrameCount/2 plus a grain hop — about 4200 frames, ~95 ms, at
+// 44.1 kHz). The renderer therefore feeds past the chop start by that latency
+// before keeping any output, and past the chop end by the same amount to flush
+// the tail. Priming only with the audio *before* the chop, as this used to do,
+// left the delay uncompensated: every baked warp buffer began ~95 ms early
+// (silence for a chop near the start of the file) and lost 95 ms off its end,
+// so warp markers never lined up with the audio they were placed on.
+bool renderWarpedChopBungee (const WarpMap&                  warpMap,
+                             const juce::AudioBuffer<float>& source,
+                             juce::AudioBuffer<float>&       target,
+                             double                          sampleRate)
 {
     const int channels      = source.getNumChannels();
     const int sourceLength  = source.getNumSamples();
@@ -322,189 +401,189 @@ bool renderWarpedChopBungee (const WarpMap&                 warpMap,
 
     const float pitchFactor = 1.0f;
 
+    // Output block size for the warp walk. Small blocks keep the in/out ratio
+    // tracking the WarpMap closely, so a marker's speed change lands within a
+    // few milliseconds of where the user placed it. Bungee's synthesis hop is
+    // 256 frames, so going finer than this buys nothing.
+    const int kWarpOutBlock = 256;
+
     std::vector<const float*> inPtrs  ((size_t) channels, nullptr);
     std::vector<float*>       outPtrs ((size_t) channels, nullptr);
 
-    // Output side capacity must cover the worst-case Bungee output for any
-    // segment at the lower speed clamp (kMinSpeed = 0.25 → 4x the input).
-    // Without this, Bungee can write past the chunk/discard buffers during
-    // preroll on segments with extreme stretch and corrupt adjacent heap.
-    const int maxStretchOutputFrames = (int) std::ceil ((double) kBungeeBlockSize
-                                                        / WarpMap::kMinSpeed) + 16;
-
-    juce::AudioBuffer<float> chunkBuffer (channels,
-                                          juce::jmax (kBungeeBlockSize, maxStretchOutputFrames));
+    juce::AudioBuffer<float> chunkBuffer (channels, kWarpOutBlock + 16);
     juce::AudioBuffer<float> inputBuffer (channels, maxProcessInputFrames);
     inputBuffer.clear();
 
-    // ---- Preroll ---------------------------------------------------------
-    // Feed up to maxInputFrameCount samples from before the first node so
-    // Bungee's grain history is populated before the first real output frame.
-    // Use the first segment's speed for the preroll.
-    const auto& firstA = nodes[0];
-    const auto& firstB = nodes[1];
-    const double firstLocalDur = firstB.localTimeSeconds - firstA.localTimeSeconds;
-    const double firstSourceDurFrames = firstB.sourceSample - firstA.sourceSample;
+    const double startSrc = nodes.front().sourceSample;
+    const double endSrc   = nodes.back().sourceSample;
+    if (endSrc <= startSrc)
+        return false;
+
+    // Feeds `frameCount` source frames starting at `fromSource` (zero-padded
+    // where that runs outside the source buffer) and pulls `outputFrames` of
+    // output into chunkBuffer. Returns the number of frames Bungee emitted, or
+    // -1 on a buffer-pointer failure.
+    auto feedBlock = [&] (double fromSource, int frameCount, double outputFrames) -> int
+    {
+        const int copyStart = juce::jlimit (0, sourceLength, (int) std::floor (fromSource));
+        const int copyLen   = juce::jlimit (0, frameCount, sourceLength - copyStart);
+
+        for (int ch = 0; ch < channels; ++ch)
+        {
+            auto* tempInput = inputBuffer.getWritePointer (ch);
+            auto* chunkOut  = chunkBuffer.getWritePointer (ch);
+            if (tempInput == nullptr || chunkOut == nullptr)
+                return -1;
+
+            if (copyLen > 0)
+            {
+                const auto* srcChan = source.getReadPointer (ch);
+                if (srcChan == nullptr)
+                    return -1;
+                std::copy (srcChan + copyStart, srcChan + copyStart + copyLen, tempInput);
+            }
+            if (copyLen < frameCount)
+                std::fill (tempInput + copyLen, tempInput + frameCount, 0.0f);
+
+            inPtrs[(size_t) ch]  = tempInput;
+            outPtrs[(size_t) ch] = chunkOut;
+        }
+
+        chunkBuffer.clear();
+        return stream.process (inPtrs.data(), outPtrs.data(),
+                               frameCount, outputFrames, pitchFactor);
+    };
+
+    // ---- Prime -----------------------------------------------------------
+    // Feed [startSrc - leadIn, startSrc + latency) with the output discarded.
+    // The lead-in gives the first kept grain real history to analyse; the
+    // latency portion is what pushes Bungee's emit point up to startSrc.
+    const double firstLocalDur        = nodes[1].localTimeSeconds - nodes[0].localTimeSeconds;
+    const double firstSourceDurFrames = nodes[1].sourceSample - nodes[0].sourceSample;
     if (firstLocalDur <= 0.0 || firstSourceDurFrames <= 0.0)
         return false;
     const double firstSpeed = firstSourceDurFrames / (firstLocalDur * sampleRate);
 
-    const int firstSrc        = (int) std::round (firstA.sourceSample);
-    const int maxPreroll      = stretcher.maxInputFrameCount();
-    const int prerollFrames   = juce::jmin (firstSrc, maxPreroll);
+    const int leadInWanted = juce::jmax (1, stretcher.maxInputFrameCount() / 2);
+    const int leadIn       = juce::jmin ((int) std::floor (juce::jmax (0.0, startSrc)), leadInWanted);
 
-    if (prerollFrames > 0)
+    double feedCursor = startSrc - (double) leadIn;
+
+    // Provisional until the first process() call makes Stream::latency()
+    // readable (it dereferences the last synthesised grain, so it must not be
+    // called before one exists).
+    int  latencyFrames = leadInWanted;
+    bool latencyKnown  = false;
+
+    // Never let a bad latency reading turn the prime into an unbounded loop.
+    const int primeFrameBudget = 6 * stretcher.maxInputFrameCount() + 16;
+    int       primeFed         = 0;
+
+    // Prime at the first segment's speed. Capping the input per call at
+    // (block * speed) keeps process()'s in/out ratio — which IS request.speed —
+    // at that value; feeding more than the output request supports would ask
+    // Bungee for a speed far outside its range and poison the grain history.
+    const double primeSpeed = juce::jlimit (WarpMap::kMinSpeed, WarpMap::kMaxSpeed, firstSpeed);
+    const int    primeFeedCap = juce::jmax (1, (int) std::ceil ((double) kWarpOutBlock * primeSpeed));
+
+    while (feedCursor < startSrc + (double) latencyFrames && primeFed < primeFrameBudget)
     {
-        // Discard buffer must accommodate Bungee's worst-case output for any
-        // input chunk at the smallest allowed speed. See note above.
-        juce::AudioBuffer<float> discard (channels, maxStretchOutputFrames);
-        int prerollRead = firstSrc - prerollFrames;
+        const double remaining = startSrc + (double) latencyFrames - feedCursor;
+        const int feedNow = juce::jlimit (1,
+                                          juce::jmin (juce::jmin (maxProcessInputFrames, primeFeedCap),
+                                                      primeFrameBudget - primeFed),
+                                          (int) std::ceil (remaining));
+        const double outWanted = juce::jlimit (1.0,
+                                               (double) kWarpOutBlock,
+                                               std::ceil ((double) feedNow / primeSpeed));
 
-        while (prerollRead < firstSrc)
+        if (feedBlock (feedCursor, feedNow, outWanted) < 0)
+            return false;
+
+        feedCursor += (double) feedNow;
+        primeFed   += feedNow;
+
+        // Re-read every pass, not just the first: latency() is only valid once
+        // a grain exists, and the value it reports climbs to its steady state
+        // as the pipeline fills.
+        const int measured = juce::jlimit (0,
+                                           2 * stretcher.maxInputFrameCount(),
+                                           (int) std::ceil (stream.latency()));
+        latencyFrames = latencyKnown ? juce::jmax (latencyFrames, measured) : measured;
+        latencyKnown  = true;
+    }
+
+    // Whatever the prime actually reached is the delay the render must assume,
+    // so a short first block (or the budget guard) can never desynchronise the
+    // feed cursor from the output timeline.
+    const double effectiveLatency = juce::jmax (0.0, feedCursor - startSrc);
+
+    // ---- Output-driven render -------------------------------------------
+    // For output frame o the chop should be sounding source position
+    // warpMap.sourceSampleAtLocalTime(o / sampleRate); the feed cursor has to
+    // sit `effectiveLatency` frames ahead of that. Deriving the feed amount
+    // from that target each block makes the walk self-correcting: rounding
+    // never accumulates, and the in/out ratio automatically becomes the local
+    // warp speed, including across marker boundaries.
+    int outWritten       = 0;
+    int zeroRenderStreak = 0;
+
+    // Bungee's pipeline delay shifts with the speed it is running at, so a
+    // marker that changes speed also changes the delay — holding it fixed
+    // leaves a constant ~16 ms step on the far side of every marker. Track it
+    // instead, heavily smoothed: the raw reading is grain-quantised, and
+    // feeding to chase it block-by-block oscillates, but a slow tracker
+    // converges and keeps the whole chop within about a millisecond.
+    double smoothedLatency = effectiveLatency;
+
+    while (outWritten < targetFrames)
+    {
+        const int blockOut = juce::jmin (kWarpOutBlock, targetFrames - outWritten);
+
+        smoothedLatency += 0.02 * (juce::jmax (0.0, stream.latency()) - smoothedLatency);
+
+        const double srcAtBlockEnd =
+            warpMap.sourceSampleAtLocalTime ((double) (outWritten + blockOut) / sampleRate);
+
+        // Clamp to the WarpMap's own speed limits so a self-correction can
+        // never ask Bungee for a ratio it does not support.
+        const int minIn = juce::jmax (1, (int) std::floor ((double) blockOut * WarpMap::kMinSpeed));
+        const int maxIn = juce::jmin (maxProcessInputFrames,
+                                      (int) std::ceil ((double) blockOut * WarpMap::kMaxSpeed) + 8);
+
+        const int inFrames = juce::jlimit (juce::jmin (minIn, maxIn),
+                                           maxIn,
+                                           (int) std::llround (srcAtBlockEnd + smoothedLatency - feedCursor));
+
+        const int rendered = feedBlock (feedCursor, inFrames, (double) blockOut);
+        if (rendered < 0)
+            return false;
+
+        feedCursor += (double) inFrames;
+
+        if (rendered > 0)
         {
-            const int inFrames = juce::jmin (kBungeeBlockSize, firstSrc - prerollRead);
-            // Cap the output request so it cannot exceed the discard buffer
-            // even for pathological speed ratios that slipped past clamps.
-            const double rawOut = std::ceil ((double) inFrames / firstSpeed);
-            const double outFrames = juce::jlimit (1.0,
-                                                    (double) maxStretchOutputFrames,
-                                                    juce::jmax (1.0, rawOut));
-            discard.clear();
-
+            const int writable = juce::jmin (rendered,
+                                             juce::jmin (chunkBuffer.getNumSamples(),
+                                                         targetFrames - outWritten));
             for (int ch = 0; ch < channels; ++ch)
             {
-                const auto* srcChan = source.getReadPointer (ch);
-                if (srcChan == nullptr)
+                const auto* src     = chunkBuffer.getReadPointer (ch);
+                auto*       dstChan = target.getWritePointer (ch);
+                if (src == nullptr || dstChan == nullptr)
                     return false;
-                auto* discardOut = discard.getWritePointer (ch);
-                if (discardOut == nullptr)
-                    return false;
-                inPtrs[(size_t) ch]  = srcChan + prerollRead;
-                outPtrs[(size_t) ch] = discardOut;
+                std::copy (src, src + writable, dstChan + outWritten);
             }
-
-            stream.process (inPtrs.data(), outPtrs.data(),
-                            inFrames, outFrames, pitchFactor);
-            prerollRead += inFrames;
+            outWritten += writable;
+            zeroRenderStreak = 0;
+        }
+        else if (++zeroRenderStreak >= 8)
+        {
+            return false;
         }
     }
 
-    // ---- Per-segment render ---------------------------------------------
-    int outputWriteOffset = 0;
-
-    for (size_t segIdx = 0; segIdx + 1 < nodes.size(); ++segIdx)
-    {
-        const auto& a = nodes[segIdx];
-        const auto& b = nodes[segIdx + 1];
-
-        const int segOutStart = (int) std::llround (a.localTimeSeconds * sampleRate);
-        const int segOutEnd   = (int) std::llround (b.localTimeSeconds * sampleRate);
-        const int segOutFrames = segOutEnd - segOutStart;
-        if (segOutFrames <= 0)
-            continue;
-
-        const double segLocalDur = b.localTimeSeconds - a.localTimeSeconds;
-        const double segSourceDurFrames = b.sourceSample - a.sourceSample;
-        if (segLocalDur <= 0.0 || segSourceDurFrames <= 0.0)
-            continue;
-
-        const double segSpeed = segSourceDurFrames / (segLocalDur * sampleRate);
-
-        double sourcePosition = a.sourceSample;
-        const double segStopSource = b.sourceSample;
-
-        int segWritten        = 0;
-        int zeroRenderStreak  = 0;
-
-        while (segWritten < segOutFrames)
-        {
-            const int remaining = segOutFrames - segWritten;
-            const int blockOutFrames = juce::jmin (kBungeeBlockSize, remaining);
-
-            const int inputFramesRequested = juce::jlimit (
-                1,
-                juce::jmax (kBungeeBlockSize, stretcher.maxInputFrameCount()),
-                (int) std::ceil ((double) blockOutFrames * segSpeed));
-
-            const int sourceStart = juce::jlimit (0,
-                                                  juce::jmax (0, sourceLength - 1),
-                                                  (int) std::floor (sourcePosition));
-            const int availableFrames = juce::jmax (0, sourceLength - sourceStart);
-            const int copiedFrames    = juce::jmin (availableFrames, inputFramesRequested);
-
-            chunkBuffer.clear();
-
-            for (int ch = 0; ch < channels; ++ch)
-            {
-                auto* tempInput = inputBuffer.getWritePointer (ch);
-                if (tempInput == nullptr)
-                    return false;
-                std::fill (tempInput, tempInput + inputFramesRequested, 0.0f);
-                if (copiedFrames > 0)
-                {
-                    const auto* srcChan = source.getReadPointer (ch);
-                    if (srcChan == nullptr)
-                        return false;
-                    const auto* srcData = srcChan + sourceStart;
-                    std::copy (srcData, srcData + copiedFrames, tempInput);
-                }
-
-                inPtrs[(size_t) ch]  = tempInput;
-                auto* chunkOut = chunkBuffer.getWritePointer (ch);
-                if (chunkOut == nullptr)
-                    return false;
-                outPtrs[(size_t) ch] = chunkOut;
-            }
-
-            const int rendered = stream.process (inPtrs.data(), outPtrs.data(),
-                                                 inputFramesRequested,
-                                                 (double) blockOutFrames,
-                                                 pitchFactor);
-
-            if (rendered > 0)
-            {
-                const int remainingTargetFrames = targetFrames - outputWriteOffset;
-                if (remainingTargetFrames <= 0)
-                    return true;
-
-                const int writable = juce::jmin (rendered,
-                                                 juce::jmin (chunkBuffer.getNumSamples(),
-                                                             remainingTargetFrames));
-                if (writable > 0)
-                {
-                    for (int ch = 0; ch < channels; ++ch)
-                    {
-                        const auto* src = chunkBuffer.getReadPointer (ch);
-                        auto* dstChan = target.getWritePointer (ch);
-                        if (src == nullptr || dstChan == nullptr)
-                            return false;
-                        auto* dst = dstChan + outputWriteOffset;
-                        std::copy (src, src + writable, dst);
-                    }
-                    outputWriteOffset += writable;
-                    segWritten        += writable;
-                }
-                zeroRenderStreak = 0;
-            }
-            else
-            {
-                ++zeroRenderStreak;
-            }
-
-            sourcePosition += (double) inputFramesRequested;
-
-            if (sourcePosition >= segStopSource)
-                break;
-
-            if (zeroRenderStreak >= 8)
-                return false;
-
-            if (outputWriteOffset >= targetFrames)
-                return true;
-        }
-    }
-
-    return outputWriteOffset > 0;
+    return outWritten > 0;
 }
 } // namespace
 
@@ -780,13 +859,16 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
     // time (the streamed chops are exactly the non-warp ones) and makes the result
     // match the live fallback exactly, since that path also stretches straight from
     // the source. Warped chops still bake their marker timing first.
-    // Pre-chop lead-in (source frames) baked into the FRONT of `base` so the Bungee
-    // pass can prime its look-ahead and the captured chop starts at full amplitude
-    // instead of Bungee's startup silence/ramp. Mirrors the live note-on prime.
-    // 0 for warp chops (their base is a pre-rendered warped buffer — no source
-    // lead-in available). chopBaseFrames is the chop length WITHOUT the lead-in.
+    // `base` is laid out as [preRollFrames of lead-in | chop | tail]. The lead-in
+    // gives the Bungee pass real audio to warm its grain history on, and the tail
+    // gives it enough look-ahead to flush the chop's final frames instead of
+    // fading them into the zero-padding. chopBaseFrames is the chop length only.
     int preRollFrames  = 0;
     int chopBaseFrames = 0;
+
+    // ~0.37 s each side, comfortably beyond Bungee's look-ahead (about 0.1 s).
+    // Chops at the very start or end of the sample get whatever is available.
+    const int kContextWanted = 16384;
 
     std::shared_ptr<const juce::AudioBuffer<float>> baseHolder;
     if (markers.empty())
@@ -797,11 +879,9 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
         if (chopLen <= 0)
             return entry;
 
-        // Grab up to ~0.37s of audio before the chop (>= Bungee's look-ahead) when
-        // it exists; chops at the very start of the sample get whatever is available.
-        const int preRollWanted = 16384;
-        const int preRoll  = juce::jmin (sliceStart, preRollWanted);
-        const int sliceLen = preRoll + chopLen;
+        const int preRoll  = juce::jmin (sliceStart, kContextWanted);
+        const int postRoll = juce::jmin (source.getNumSamples() - sliceEnd, kContextWanted);
+        const int sliceLen = preRoll + chopLen + postRoll;
 
         auto slice = std::make_shared<juce::AudioBuffer<float>> (source.getNumChannels(), sliceLen);
         for (int ch = 0; ch < source.getNumChannels(); ++ch)
@@ -826,17 +906,46 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
             return entry;
         }
 
-        baseHolder = warpedEntry->warpedBuffer;
-        chopBaseFrames = warpedEntry->warpedBuffer->getNumSamples(); // no lead-in
+        const auto& warped = *warpedEntry->warpedBuffer;
+        const int warpedFrames = warped.getNumSamples();
+        const int chanCount = juce::jmax (warped.getNumChannels(), source.getNumChannels());
+
+        // Splice raw source context either side of the warped chop. Its only job
+        // is to give the pitch/stretch pass grain history and flush room; both
+        // regions are discarded, so the seam at the chop edges is never heard.
+        const int sliceStart = juce::jlimit (0, juce::jmax (0, source.getNumSamples() - 1), chopStartSample);
+        const int sliceEnd   = juce::jlimit (sliceStart, source.getNumSamples(), chopEndSample);
+        const int preRoll    = juce::jmin (sliceStart, kContextWanted);
+        const int postRoll   = juce::jmin (source.getNumSamples() - sliceEnd, kContextWanted);
+
+        auto padded = std::make_shared<juce::AudioBuffer<float>> (chanCount,
+                                                                  preRoll + warpedFrames + postRoll);
+        padded->clear();
+        for (int ch = 0; ch < chanCount; ++ch)
+        {
+            if (preRoll > 0)
+                padded->copyFrom (ch, 0, source, juce::jmin (ch, source.getNumChannels() - 1),
+                                  sliceStart - preRoll, preRoll);
+            padded->copyFrom (ch, preRoll, warped, juce::jmin (ch, warped.getNumChannels() - 1),
+                              0, warpedFrames);
+            if (postRoll > 0)
+                padded->copyFrom (ch, preRoll + warpedFrames, source,
+                                  juce::jmin (ch, source.getNumChannels() - 1),
+                                  sliceEnd, postRoll);
+        }
+
+        baseHolder     = std::move (padded);
+        preRollFrames  = preRoll;
+        chopBaseFrames = warpedFrames;
     }
 
     const auto& base = *baseHolder;
-    const int baseFrames = base.getNumSamples();
     const int channels = base.getNumChannels();
     const auto clampedStretch = juce::jlimit (0.25f, 4.0f, stretchRatio);
     const auto sourceFramesPerOutputFrame =
         (sourceSampleRate / outputSampleRate) / (double) clampedStretch;
-    // Output length is the CHOP only — base may carry pre-roll lead-in at the front.
+    // Output length is the CHOP only — base carries lead-in at the front and a
+    // flush tail at the back, neither of which reaches the prepared buffer.
     const int outputFrames = juce::jmax (
         1, (int) std::llround ((double) chopBaseFrames / sourceFramesPerOutputFrame));
 
@@ -847,8 +956,9 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
                                          juce::jmax (chopStartSample, chopEndSample - 1),
                                          chopStartSample + cueOffsetSamples);
     const auto cueLocalSeconds = warpMap.localTimeAtSourceSample ((double) cueSource);
+    // Chop-relative (local time 0 == chop start), so the lead-in never enters it.
     const auto cueBaseFrame = juce::jlimit (0.0,
-                                            (double) juce::jmax (0, baseFrames - 1),
+                                            (double) juce::jmax (0, chopBaseFrames - 1),
                                             cueLocalSeconds * sourceSampleRate);
 
     auto prepared = std::make_shared<juce::AudioBuffer<float>> (channels, outputFrames);

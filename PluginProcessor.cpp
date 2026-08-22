@@ -2102,11 +2102,12 @@ public:
                 || processor.prepareWarmGeneration.load (std::memory_order_acquire) != generation)
                 return false;
 
-            // Forward warp chops stay on their dedicated cache/live path. A
-            // reversed warp chop needs a prepared buffer when pitch or stretch
-            // is active because Bungee only consumes forward input.
-            if (! chop.warpMarkers.empty() && ! chop.reversed)
-                return true;
+            // Warped chops are baked too (warp first, then pitch/stretch on
+            // top — see renderPreparedChopSync). They used to be excluded and
+            // left on the live Bungee path, which meant every loop turn
+            // re-primed the stretcher on the audio thread: a burst of several
+            // thousand frames of synthesis inside one callback, and the single
+            // biggest source of overload crackle when warp was engaged.
 
             const float effPitch = juce::jlimit (-24.0f, 24.0f,
                                                  globalPitchSemitones + chop.pitchSemitones);
@@ -3016,9 +3017,12 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             // when the host downclocks the audio thread with the UI closed). Any miss
             // (settings just changed, not baked yet) simply falls through to the live
             // Bungee path below, so playback is never interrupted.
+            // Warped chops are included: their prepared buffer bakes the warp
+            // and the pitch/stretch together, which keeps the live stretcher —
+            // and the re-prime it needs at every loop turn — off the audio
+            // thread. Until the bake lands, the live paths below still cover it.
             bool handledByPrepared = false;
             if (activeChop != nullptr
-                && (! chopHasWarp || chopIsReversed)
                 && (! pitchIsUnity || ! stretchIsUnity))
             {
                 const auto preparedKey = cuesampler::ChopAudioCache::makePreparedKey (
@@ -3092,90 +3096,162 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                 {
                     stream.reset();
 
-                    const int leadInWanted = stretcher.maxInputFrameCount();
+                    // Bungee's output lags its input by Stream::latency() frames
+                    // — roughly maxInputFrameCount/2 plus a grain hop, about
+                    // 4200 frames (~95 ms) at 44.1 kHz. Priming only with the
+                    // audio *before* bungeeSrcStart leaves that delay in place:
+                    // playback then begins ~95 ms early, which is audible as
+                    // pre-chop bleed when lead-in exists and as a hole of dead
+                    // air when it does not. Warped chops always hit the second
+                    // case, because their Bungee source is the warp buffer,
+                    // which begins at the chop — and since a loop turn sets
+                    // bungeeResetPending, that hole reappeared on every pass.
+                    //
+                    // So prime in two parts: lead-in *before* the start to give
+                    // the first kept grain real history, then far enough *past*
+                    // the start to push Bungee's emit point onto bungeeSrcStart.
+                    const int leadInWanted = juce::jmax (1, stretcher.maxInputFrameCount() / 2);
                     const int leadInAvail  = juce::jmin (bungeeSrcStart, leadInWanted);
 
-                    // The synchronous note-on prime synthesises roughly
-                    // (leadInAvail / primeInPerOut) discarded grains to warm Bungee's
-                    // look-ahead. Slow-down host-sync stretch and half-time push
-                    // bungeeInPerOut below 1.0, which would multiply that grain count
-                    // (e.g. ~2x at half-time) — a per-note CPU burst large enough to
-                    // overrun the audio buffer when the host has downclocked the core
-                    // (commonly with the UI closed), causing audible spikes.
+                    // The prime synthesises (and discards) roughly one output
+                    // frame per primeInPerOut input frames. Slow-down host-sync
+                    // stretch and half-time push bungeeInPerOut below 1.0, which
+                    // would multiply that grain count (e.g. ~2x at half-time) —
+                    // a per-note CPU burst large enough to overrun the audio
+                    // buffer when the host has downclocked the core (commonly
+                    // with the UI closed), causing audible spikes.
                     //
-                    // Warming the look-ahead only depends on how much INPUT we feed:
-                    // Bungee centres its final grain on inputBuffer.endPosition(), not on
-                    // the discarded output count (see Stream.h). So priming at an
-                    // effective speed of >= 1.0 reaches the same warmed state and the same
-                    // playback start position, while capping note-on cost at that of a
-                    // normal unity-stretch note for every pitch/stretch/half-time setting.
-                    // The actual (stretched/half-time) render below is left untouched.
+                    // Warming the look-ahead only depends on how much INPUT we
+                    // feed: Bungee centres its grains on inputBuffer.endPosition(),
+                    // not on the discarded output count (see Stream.h). So priming
+                    // at an effective speed of >= 1.0 reaches the same warmed state
+                    // and the same start position, while capping note-on cost at
+                    // that of a normal unity-stretch note for every pitch/stretch/
+                    // half-time setting. The actual render below is untouched.
                     const double primeInPerOut = juce::jmax (1.0, bungeeInPerOut);
 
-                    if (leadInAvail > 0)
+                    // Cap per-call input so output (input / primeInPerOut) can
+                    // never exceed the discard buffer at extreme stretch.
+                    const double safeOutputPerInput = juce::jmax (0.25, 1.0 / juce::jmax (1.0e-3, primeInPerOut));
+                    const int    perCallInputCap    = juce::jmax (1,
+                        juce::jmin (maxScratchInFrames,
+                                     (int) std::floor ((double) (maxScratchOutFrames - 4) / safeOutputPerInput)));
+
+                    int cursor = bungeeSrcStart - leadInAvail;
+
+                    // Stream::latency() dereferences the last synthesised grain,
+                    // so it cannot be read until one process() call has run. Use
+                    // a provisional target, probe with a short first block, then
+                    // settle on the measured value.
+                    int  latencyFrames = leadInWanted;
+                    bool latencyKnown  = false;
+
+                    // Hard bound: a pathological latency reading must never turn
+                    // the prime into an unbounded loop on the audio thread.
+                    const int primeFrameBudget = 4 * stretcher.maxInputFrameCount() + 16;
+                    int       primeFed         = 0;
+
+                    while (cursor < bungeeSrcStart + latencyFrames && primeFed < primeFrameBudget)
                     {
-                        // Cap per-call input so output (input / primeInPerOut)
-                        // can never exceed the discard buffer at extreme stretch.
-                        const double safeOutputPerInput = juce::jmax (0.25, 1.0 / juce::jmax (1.0e-3, primeInPerOut));
-                        const int    perCallInputCap   = juce::jmax (1,
-                            juce::jmin (maxScratchInFrames,
-                                         (int) std::floor ((double) (maxScratchOutFrames - 4) / safeOutputPerInput)));
-                        const int    primeBlock        = juce::jmin (perCallInputCap, leadInAvail);
+                        const int remaining = bungeeSrcStart + latencyFrames - cursor;
+                        const int feedNow   = juce::jlimit (1,
+                                                            juce::jmin (perCallInputCap,
+                                                                        primeFrameBudget - primeFed),
+                                                            latencyKnown ? remaining
+                                                                         : juce::jmin (256, remaining));
+                        const double primeOut = juce::jlimit (1.0,
+                                                               (double) maxScratchOutFrames,
+                                                               juce::jmax (1.0,
+                                                                           std::ceil ((double) feedNow / juce::jmax (1.0e-3, primeInPerOut))));
 
-                        int fed = 0;
-                        while (fed < leadInAvail)
+                        // The prime can run past the end of the Bungee source on
+                        // a short chop; zero-pad rather than read out of bounds.
+                        const int copyStart = juce::jlimit (0, juce::jmax (0, bungeeSrcLen), cursor);
+                        const int copyLen   = juce::jlimit (0, feedNow, bungeeSrcLen - copyStart);
+
+                        for (int ch = 0; ch < channels; ++ch)
                         {
-                            const int feedNow      = juce::jmin (primeBlock, leadInAvail - fed);
-                            const int readStart    = bungeeSrcStart - leadInAvail + fed;
-                            const double primeOut  = juce::jlimit (1.0,
-                                                                    (double) maxScratchOutFrames,
-                                                                    juce::jmax (1.0,
-                                                                                std::ceil ((double) feedNow / juce::jmax (1.0e-3, primeInPerOut))));
-
-                            for (int ch = 0; ch < channels; ++ch)
+                            const auto srcCh = juce::jmin (ch, bungeeSource->getNumChannels() - 1);
+                            auto* dst = engine.scratchInput.getWritePointer (ch);
+                            if (copyLen > 0)
                             {
-                                const auto srcCh = juce::jmin (ch, bungeeSource->getNumChannels() - 1);
-                                const auto* srcData = bungeeSource->getReadPointer (srcCh, readStart);
-                                auto* dst = engine.scratchInput.getWritePointer (ch);
-                                std::copy (srcData, srcData + feedNow, dst);
+                                const auto* srcData = bungeeSource->getReadPointer (srcCh, copyStart);
+                                std::copy (srcData, srcData + copyLen, dst);
                             }
-
-                            const float* inPtrs[8]  = {};
-                            float*       outPtrs[8] = {};
-                            for (int ch = 0; ch < juce::jmin (channels, 8); ++ch)
-                            {
-                                inPtrs[ch]  = engine.scratchInput.getReadPointer (ch);
-                                outPtrs[ch] = engine.discardOutput.getWritePointer (ch);
-                            }
-                            stream.process (inPtrs, outPtrs, feedNow, primeOut, livePitchFactor);
-                            fed += feedNow;
+                            if (copyLen < feedNow)
+                                std::fill (dst + copyLen, dst + feedNow, 0.0f);
                         }
+
+                        const float* inPtrs[8]  = {};
+                        float*       outPtrs[8] = {};
+                        for (int ch = 0; ch < juce::jmin (channels, 8); ++ch)
+                        {
+                            inPtrs[ch]  = engine.scratchInput.getReadPointer (ch);
+                            outPtrs[ch] = engine.discardOutput.getWritePointer (ch);
+                        }
+                        stream.process (inPtrs, outPtrs, feedNow, primeOut, livePitchFactor);
+
+                        cursor   += feedNow;
+                        primeFed += feedNow;
+
+                        // Re-read every pass, not just the first: latency()
+                        // is only valid once a grain exists, and the value it
+                        // reports climbs to its steady state as the pipeline
+                        // fills. Stopping at the first reading left ~5-12 ms of
+                        // the hole behind at some stretch ratios.
+                        const int measured = juce::jlimit (0,
+                                                            2 * stretcher.maxInputFrameCount(),
+                                                            (int) std::ceil (stream.latency()));
+                        latencyFrames = latencyKnown ? juce::jmax (latencyFrames, measured)
+                                                     : measured;
+                        latencyKnown  = true;
                     }
 
-                    v.bungeeResetPending = false;
+                    // Whatever the prime actually reached is the delay the render
+                    // must assume, so a short probe block (or the budget guard)
+                    // can never desynchronise the feed cursor from the audible
+                    // position.
+                    v.bungeeLatencyFrames = juce::jmax (0, cursor - bungeeSrcStart);
+                    v.bungeeFeedPosition  = (double) cursor;
+                    v.bungeeResetPending  = false;
                 }
 
-                // Compute how many source frames to feed for this output chunk.
-                int inputFrames = juce::jmax (1,
-                                               (int) std::round ((double) chunk * bungeeInPerOut));
-                inputFrames = juce::jmin (inputFrames, maxScratchInFrames);
-                const int sourceAvailable = juce::jmax (0, bungeeSrcLen - bungeeSrcStart);
-                const int inputCopy       = juce::jmin (inputFrames, sourceAvailable);
+                // Bungee consumes a stream, so the input has to stay contiguous
+                // across calls. Derive the feed amount from where the cursor
+                // should be once this chunk has been emitted — the conceptual
+                // output position plus the pipeline delay — rather than from
+                // this chunk's length: rounding then self-corrects each block
+                // instead of accumulating into chunk-boundary discontinuities.
+                const double conceptualNow = bungeeUsesWarpBuf
+                                                 ? v.playbackSamplePosition - (double) activeChop->startSample
+                                                 : v.playbackSamplePosition;
+                const double desiredFeedEnd = conceptualNow
+                                            + (double) chunk * bungeePosStep
+                                            + (double) v.bungeeLatencyFrames;
+
+                int inputFrames = juce::jlimit (1, maxScratchInFrames,
+                                                 (int) std::llround (desiredFeedEnd - v.bungeeFeedPosition));
 
                 // Feed scratchInput from the source buffer, zero-pad if we ran
                 // off the end (chop boundary or end-of-sample).
+                const int feedStart = juce::jlimit (0, juce::jmax (0, bungeeSrcLen),
+                                                     (int) std::llround (v.bungeeFeedPosition));
+                const int inputCopy = juce::jlimit (0, inputFrames, bungeeSrcLen - feedStart);
+
                 for (int ch = 0; ch < channels; ++ch)
                 {
                     const auto srcCh = juce::jmin (ch, bungeeSource->getNumChannels() - 1);
-                    const auto* srcData = inputCopy > 0
-                                            ? bungeeSource->getReadPointer (srcCh, bungeeSrcStart)
-                                            : nullptr;
                     auto* dst = engine.scratchInput.getWritePointer (ch);
                     if (inputCopy > 0)
+                    {
+                        const auto* srcData = bungeeSource->getReadPointer (srcCh, feedStart);
                         std::copy (srcData, srcData + inputCopy, dst);
+                    }
                     if (inputCopy < inputFrames)
                         std::fill (dst + inputCopy, dst + inputFrames, 0.0f);
                 }
+
+                v.bungeeFeedPosition += (double) inputFrames;
 
                 const float* inPtrs[8]  = {};
                 float*       outPtrs[8] = {};
