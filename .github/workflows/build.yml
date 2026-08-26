@@ -35,6 +35,27 @@ jobs:
         with:
           arch: x64
 
+      # The stem-separation model is gitignored (316 MB, far over GitHub's 100 MB
+      # file limit), so a clean CI checkout has no assets/htdemucs/htdemucs.onnx.
+      # Without it the Windows installer still builds, but silently ships with
+      # stem separation disabled (see make-installer-windows.ps1). Restore it
+      # from cache when we can; the download script verifies the pinned SHA-256
+      # either way and is a no-op when the file is already correct.
+      - name: Cache HTDemucs model (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: assets/htdemucs/htdemucs.onnx
+          key: htdemucs-68d0bf16428ef66e692cdff8a9ccf28f1ef3f69440d57e58605a4cc55fcc5e74
+
+      # Must run BEFORE Configure: CMakeLists.txt tests EXISTS on the model at
+      # configure time to wire up its LINK_DEPENDS staging rule, so fetching it
+      # after configuring would leave the bundle model-less.
+      - name: Fetch HTDemucs model (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\download-htdemucs-model.ps1
+
       - name: Configure
         run: >
           cmake -B build -G Ninja
@@ -43,6 +64,24 @@ jobs:
 
       - name: Build
         run: cmake --build build --config Release --parallel
+
+      # CI cannot use make-installer-windows.ps1 -CommercialRelease (that mode
+      # also demands an Authenticode cert, which no runner has), so assert the
+      # staging result directly. This is what keeps "installer quietly loses
+      # stem separation" from regressing unnoticed.
+      - name: Verify stem model staged into VST3 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $model = "build\CueSampler_artefacts\Release\VST3\CUE SAMPLER.vst3\Contents\x86_64-win\htdemucs\htdemucs.onnx"
+          if (-not (Test-Path $model -PathType Leaf)) {
+            Write-Error "Stem model was not staged into the VST3 bundle: $model"
+          }
+          $size = (Get-Item $model).Length
+          if ($size -ne 316446953) {
+            Write-Error "Staged stem model is $size bytes; expected 316446953."
+          }
+          Write-Host "Stem model staged and sized correctly: $size bytes"
 
       - name: Install NSIS (Windows)
         if: runner.os == 'Windows'
@@ -66,6 +105,7 @@ jobs:
           if-no-files-found: error
           path: |
             build/CueSampler_artefacts/Release/VST3/**
+            !build/CueSampler_artefacts/Release/VST3/**/htdemucs/**
             build/CueSampler_artefacts/Release/AU/**
             build/CueSampler_artefacts/Release/Standalone/**
             dist/**
