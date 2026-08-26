@@ -38,8 +38,30 @@ The full-screen guide is gone. WARP mode now shows an inline purple hint bar tha
 updates as you drag, the **?** button opens the warp-specific guide while the mode
 is active, and chops carrying warp markers get a small purple wave glyph.
 
+## Downloads
+
+| Platform | File |
+|---|---|
+| macOS | `CUESAMPLER-1.0.8.pkg` |
+| Windows | `CUESAMPLER-Setup-1.0.8-UNSIGNED.exe` |
+
+Each installer ships with a `.sha256` sidecar you can check against the download.
+
 ## Compatibility
 
-- **macOS 11 (Big Sur) or newer**, Intel and Apple Silicon (universal binary).
-- Formats: **VST3** and **Audio Unit**, installed to the system plug-in folders.
-- Signed with a Developer ID certificate, notarized by Apple, and stapled.
+**macOS 11 (Big Sur) or newer**, Intel and Apple Silicon (universal binary).
+Installs **VST3** and **Audio Unit** into the system plug-in folders. Signed with
+a Developer ID certificate, notarized by Apple, and stapled — it opens without a
+Gatekeeper warning.
+
+**Windows 10/11, 64-bit.** Installs **VST3**. Stem separation runs on any DX12
+GPU via DirectML.
+
+> **Windows installer is not code-signed yet.** SmartScreen will show
+> *"Windows protected your PC"* when you run it. Click **More info**, then
+> **Run anyway**. If you want to confirm you have the real file first, compare it
+> against `CUESAMPLER-Setup-1.0.8-UNSIGNED.exe.sha256` in PowerShell:
+>
+> ```
+> Get-FileHash .\CUESAMPLER-Setup-1.0.8-UNSIGNED.exe -Algorithm SHA256
+> ```
