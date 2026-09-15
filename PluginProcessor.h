@@ -10,6 +10,8 @@
 #include "ChopAudioCache.h"
 #include "WarpMap.h"
 
+#include <array>
+#include <bitset>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -94,11 +96,46 @@ public:
         float releaseMilliseconds = 5.0f;
     };
 
+    // The single authority on which MIDI note plays which chop.
+    //
+    // There used to be two answers to that question: the audio thread resolved
+    // explicit `assignedMidiNote` pins first and fell back to a positional
+    // `note - root` map, while the UI only ever did the positional maths and
+    // never checked for a collision. When a pinned chop and a positional chop
+    // wanted the same note, the pinned one played and the UI still reported the
+    // positional one as live — so a chop could be silently unreachable while
+    // every readout insisted it was fine.
+    //
+    // This resolves both rules once, at publish time, so the two can no longer
+    // drift. It also turns the audio thread's per-note linear scan into an
+    // array read, and makes "this chop has no pad at all" a first-class state
+    // the UI can draw instead of an invisible failure.
+    struct ChopMidiMap
+    {
+        // note -> index into ChopState::chops, or -1 for a note with no chop.
+        std::array<int, 128> noteToChopIndex {};
+        // Parallel to ChopState::chops. -1 means UNREACHABLE: the chop exists
+        // and is selectable by mouse, but no note will ever trigger it.
+        std::vector<int>     noteForChopIndex;
+        // The root the positional half of the map was resolved against. Cached
+        // so a stale map is detectable, and because the octave shift moves it.
+        int                  rootNote = 0;
+    };
+
     struct ChopState
     {
         int selectedChopId = -1;
         int nextChopId = 1;
         std::vector<ChopDefinition> chops;
+        // Derived, never edited by hand, never serialized. Rebuilt by
+        // publishChopState() on the way in — that is the only correct way to
+        // install a new chop set.
+        ChopMidiMap midiMap;
+        // Set by publishChopState once this object has been handed to the audio
+        // thread. From that moment it is immutable: anything wanting to publish
+        // it again (undo replays the exact shared_ptr it captured) must copy
+        // first, or it would be writing into a state that is still being read.
+        bool published = false;
     };
 
     //==============================================================================
@@ -171,17 +208,27 @@ public:
     // MIDI octave shift, in octaves, applied to the chop note mapping so users
     // whose keyboard lacks octave buttons can reach all chops. 0 = default
     // (C2 -> chop 1). Clamped to [midiOctaveOffsetMin, midiOctaveOffsetMax].
-    void setMidiOctaveOffset (int octaves) noexcept;
+    void setMidiOctaveOffset (int octaves);
     int  getMidiOctaveOffset() const noexcept;
 
     // Lowest MIDI note that triggers chop 1 with the current octave shift.
     int  getMidiRootNote() const noexcept;
 
-    // MIDI note that triggers the given chop id (root + its list index) under
-    // the current octave shift, or -1 if no such chop. Lets the editor light
-    // the matching key on the on-screen keyboard when a chop is previewed.
+    // MIDI note that actually triggers the given chop under the current octave
+    // shift, or -1 when nothing will ever trigger it (see ChopMidiMap). Both
+    // answers come from the resolved map, so they always agree with what the
+    // audio thread does.
     int  getMidiNoteForChopId (int chopId) const noexcept;
     int  getSelectedChopMidiNote() const noexcept;
+
+    // Every note that will trigger something, for lighting the on-screen
+    // keyboard. Bit n set == note n plays a chop.
+    std::bitset<128> getMappedMidiNotes() const noexcept;
+
+    // How many chops no note can reach. Non-zero means pins and the positional
+    // map are fighting and some chops are silently dead — worth telling the
+    // user about rather than hiding.
+    int  getUnreachableChopCount() const noexcept;
 
     // Mirrors the incoming MIDI stream for the editor's on-screen keyboard,
     // and injects notes played by clicking it back into processBlock.
@@ -548,7 +595,7 @@ private:
         {
             envelopeSampleRate = juce::jmax (1.0, sampleRate);
             // Even R=0 retains the existing 32-sample MIDI de-click tail.
-            envelopeReleaseSeconds = juce::jmax ((float) (32.0 / envelopeSampleRate),
+            envelopeReleaseSeconds = juce::jmax (`(float) (32.0 / envelopeSampleRate),
                                                   chop.releaseMilliseconds * 0.001f);
             envelope.reset();
             envelope.setSampleRate (envelopeSampleRate);
@@ -656,6 +703,14 @@ private:
     std::shared_ptr<const StemSet> stemSet;
     std::shared_ptr<TempoAnalysisData> tempoAnalysis;
     std::shared_ptr<TempoEditState> tempoEditState;
+
+    // The ONLY correct way to install a new chop set. Resolves the note map
+    // against the current root before publishing, so the audio thread and the
+    // UI can never see a chop list whose mapping has not caught up. Assigning
+    // to chopState directly is what let the two drift apart in the first place.
+    void publishChopState (std::shared_ptr<ChopState> next);
+    static void rebuildChopMidiMap (ChopState& state, int rootNote);
+
     std::shared_ptr<ChopState> chopState;
 
     // The inactive chop layer. CUE SAMPLER keeps two independent chop sets —

@@ -99,6 +99,49 @@ prefixed `StemSeparator:`.
 - [ ] Zoom until chops are very narrow. The glyph hides rather than colliding with the chop
       number (headers under ~34 px wide).
 
+## MIDI mapping is visible (note names, lit keys, unreachable chops)
+- [ ] Load a sample. Every chop header wide enough to show it carries the key that
+      fires it, on the right of its number. Narrow the zoom until headers are under
+      ~52 px — the note name drops, the number stays.
+- [ ] Every header name matches the key that actually triggers that chop. Check at
+      several **OCT +/-** positions; names and lit keys update immediately.
+- [ ] The on-screen keyboard shades every key that triggers a chop. Three states must
+      be tellable apart at a glance: unmapped, mapped-but-silent, and sounding.
+      Verify in both light and dark themes.
+- [ ] Enter manual mode and pin a chop to a key that a positional chop already
+      resolves to (e.g. capture on C2 with the root at C2). The displaced chop's
+      header shows a dimmed `-`, and the status line under CHOP/BARS reads
+      `n CHOPS UNREACHABLE`. Before this change that chop was silently dead.
+- [ ] The unreachable chop is still selectable, previewable and exportable by mouse.
+- [ ] Clear the collision (delete or reassign the pinned chop). The dash disappears,
+      the status line returns to `ROOT <note> | KEY SHOWN ON EACH CHOP`.
+- [ ] A chop carrying warp markers shows both the wave glyph and its note name without
+      the two overlapping; below ~72 px the glyph gives way.
+
+## BARS is a direct selector
+- [ ] The BARS control shows four segments — 1 / 2 / 4 / 8 — with the active one lit.
+      One click reaches any value; there is no cycling.
+- [ ] Click the already-lit segment. Nothing rebuilds, the chop list is untouched, and
+      no undo step is consumed (press UNDO — it must step past this click, not onto it).
+- [ ] Save a project on 4 BARS, reopen: the 4 segment comes back lit.
+- [ ] Undo a bars change — the segments follow the restored value.
+
+## Chop edits follow the audio across a rebuild
+- [ ] At 1 BAR, give chop 7 a distinctive envelope, gain, cue point and a warp marker.
+      Switch to 2 BARS. Those edits must land on the chop covering the **same audio**
+      (bars 7-8), not on the chop that happens to be 7th in the list.
+- [ ] Switch 1 -> 2 -> 4 -> 8 -> 1 and back. No chop ever ends up sharing a key with
+      another (watch the status line for UNREACHABLE, which must stay at zero).
+- [ ] Pin two adjacent chops to different pads at 2 BARS, then switch to 1 BAR. Each
+      pad stays on one chop; the split twins fall back to the positional map rather
+      than going permanently unassigned.
+- [ ] Set a cue part-way into a chop, then nudge TEMPO trim / grid offset. The cue
+      keeps pointing at the same moment of audio rather than the same offset.
+- [ ] Shrink a chop until the old cue would fall outside it — it falls back to the
+      auto-detected cue and playback still starts cleanly.
+- [ ] Nudge the grid hard (a large offset). Edits re-home sensibly; nothing is
+      duplicated onto two chops.
+
 ## Two chop layers (automatic <-> manual)
 - [ ] With automatic chops on screen, press **CHOP MANUALLY**. The waveform clears to a blank
       slate and there is no confirmation prompt (nothing is being destroyed).

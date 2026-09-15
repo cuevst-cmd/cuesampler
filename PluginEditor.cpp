@@ -1,5 +1,8 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+
+#include <array>
+#include <bitset>
 #include "VisualizerOrb.h"
 
 #include <BinaryData.h>
@@ -15,6 +18,17 @@ namespace
 {
 // One continuous chassis: content spans the full design width inside a
 // slim 10px margin (the CUERACK kMargin), no side rails.
+// Note 36 reads "C2", matching GlassKeyboard's setOctaveForMiddleC(4) and the
+// chop mapping root. Lived inside TransportSectionComponent until the waveform
+// painter needed to label chops with the key that plays them.
+inline juce::String midiNoteName (int noteNumber)
+{
+    static const char* const names[12] = { "C", "C#", "D", "D#", "E", "F",
+                                           "F#", "G", "G#", "A", "A#", "B" };
+    const int octave = noteNumber / 12 - 1;
+    return juce::String (names[((noteNumber % 12) + 12) % 12]) + juce::String (octave);
+}
+
 constexpr int editorWidth = 1266;
 constexpr int editorHeight = 660; // chassis + keyboard
 constexpr float minEditorScale = 0.85f;
@@ -1061,6 +1075,28 @@ public:
     {
         const auto style = getCueStyle (button);
 
+        // One cell of a joined 1|2|4|8 selector. Same keycap chassis as the rest
+        // of the family, with the latched treatment flatAction already uses for
+        // CHOP MANUALLY and WARP — so "this one is active" looks the same here
+        // as everywhere else in the plugin.
+        if (style == "segment")
+        {
+            auto bounds = button.getLocalBounds().toFloat().reduced (0.5f);
+            drawKeycap (g, bounds, 2.5f,
+                        button.isEnabled() ? getHoverAlpha (button, isMouseOverButton) : 0.0f,
+                        isButtonDown);
+
+            if (button.getToggleState())
+            {
+                const auto accent = themedTitleColour (accentOrange);
+                g.setColour (accent.withAlpha (0.18f));
+                g.fillRoundedRectangle (bounds.reduced (1.0f), 2.0f);
+                g.setColour (accent.withAlpha (0.80f));
+                g.drawRoundedRectangle (bounds.reduced (1.0f), 2.0f, 1.0f);
+            }
+            return;
+        }
+
         if (style == "transportSquare" || style == "halfTime"
             || style == "flatAction" || style == "separateAction" || style == "utilitySync" || style == "effectSwitch")
         {
@@ -1159,6 +1195,26 @@ public:
 
         if (style == "effectSwitch")
             return; // Handled entirely in drawButtonBackground
+
+        if (style == "segment")
+        {
+            const float hover = getHoverAlpha (button, false);
+            const auto accent = themedTitleColour (accentOrange);
+            auto ink = button.getToggleState() ? accent
+                                               : textMuted.interpolatedWith (textPrimary, hover);
+
+            // The octave buttons use this style and do hit their limits. Nothing
+            // in this LookAndFeel dimmed a disabled button, so "you cannot go
+            // any further" looked identical to "press me".
+            if (! button.isEnabled())
+                ink = ink.withMultipliedAlpha (0.35f);
+
+            g.setColour (ink);
+            g.setFont (monoFont (14.0f));
+            g.drawFittedText (button.getButtonText(), button.getLocalBounds(),
+                              juce::Justification::centred, 1);
+            return;
+        }
 
         // Lay everything out against the keycap's top face so labels sit on
         // the plateau and ride the key as it travels down.
@@ -1525,6 +1581,18 @@ public:
         repaint();
     }
 
+    // The notes that will actually trigger a chop. The keyboard spans C1..B7 —
+    // 84 keys — and a typical chop set maps eight of them, so without this the
+    // bed of dead keys is indistinguishable from the live ones. Cheap to call
+    // repeatedly: unchanged input is a no-op, so this never churns repaints.
+    void setMappedNotes (const std::bitset<128>& notes)
+    {
+        if (notes == mappedNotes)
+            return;
+        mappedNotes = notes;
+        repaint();
+    }
+
     void paint (juce::Graphics& g) override
     {
         // Refreshed per paint so mode changes recolour the overlays. setColour
@@ -1537,21 +1605,44 @@ public:
     void drawWhiteNote (int midiNoteNumber, juce::Graphics& g, juce::Rectangle<float> area,
                         bool isDown, bool isOver, juce::Colour lineColour, juce::Colour textColour) override
     {
-        juce::MidiKeyboardComponent::drawWhiteNote (midiNoteNumber, g, area,
-                                                    isDown || midiNoteNumber == highlightedNote,
+        const bool lit = isDown || midiNoteNumber == highlightedNote;
+        juce::MidiKeyboardComponent::drawWhiteNote (midiNoteNumber, g, area, lit,
                                                     isOver, lineColour, textColour);
+        paintMappedWash (g, area, midiNoteNumber, lit, 0.22f);
     }
 
     void drawBlackNote (int midiNoteNumber, juce::Graphics& g, juce::Rectangle<float> area,
                         bool isDown, bool isOver, juce::Colour noteFillColour) override
     {
-        juce::MidiKeyboardComponent::drawBlackNote (midiNoteNumber, g, area,
-                                                    isDown || midiNoteNumber == highlightedNote,
+        const bool lit = isDown || midiNoteNumber == highlightedNote;
+        juce::MidiKeyboardComponent::drawBlackNote (midiNoteNumber, g, area, lit,
                                                     isOver, noteFillColour);
+        // Sharps start from near-black, so the same alpha that reads clearly on
+        // cream would be invisible here.
+        paintMappedWash (g, area, midiNoteNumber, lit, 0.42f);
     }
 
 private:
+    // Three tiers have to stay tellable apart at a glance:
+    //   unmapped      — untouched cream / near-black
+    //   mapped, silent— this wash
+    //   sounding      — the full-strength keyDownOverlay the base class paints
+    // The wash is skipped while a key is lit so it can never dull the loudest
+    // state, which is the one the eye should catch first.
+    void paintMappedWash (juce::Graphics& g, juce::Rectangle<float> area,
+                          int midiNoteNumber, bool lit, float alpha) const
+    {
+        if (lit || midiNoteNumber < 0 || midiNoteNumber > 127)
+            return;
+        if (! mappedNotes.test ((size_t) midiNoteNumber))
+            return;
+
+        g.setColour (accentOrange.withAlpha (alpha));
+        g.fillRect (area.reduced (0.5f, 0.0f));
+    }
+
     int highlightedNote = -1;
+    std::bitset<128> mappedNotes;
 };
 
 class DisplayBox final : public juce::Component,
@@ -4873,24 +4964,64 @@ private:
                 g.setColour (tabColour.withAlpha (0.60f + 0.35f * selectVal));
                 g.drawLine (header.getX(), header.getBottom(), header.getRight(), header.getBottom(), 1.0f);
 
-                g.setColour ((isLight ? juce::Colour (0xff2b2318) : juce::Colour (0xfff2e7da))
-                                 .withAlpha (isSelected ? 1.0f : 0.78f + 0.2f * hoverVal));
+                const auto inkColour = (isLight ? juce::Colour (0xff2b2318) : juce::Colour (0xfff2e7da))
+                                           .withAlpha (isSelected ? 1.0f : 0.78f + 0.2f * hoverVal);
+                g.setColour (inkColour);
                 g.setFont (monoFont (9.5f).withExtraKerningFactor (0.05f));
                 g.drawText (juce::String (displayNumber),
                             header.reduced (5.0f, 1.0f).toNearestInt(),
                             juce::Justification::centredLeft, false);
+
+                // The key that actually fires this chop. Until now the only
+                // statement of the mapping anywhere in the UI was a single
+                // 8.5pt line reading "C2 = chop 1, C#2 = chop 2 ..." — which
+                // silently stopped being true the moment a pinned chop and a
+                // positional one collided. This reads from the resolved map, so
+                // it says what will really happen, including the case where the
+                // honest answer is "nothing will ever play this chop".
+                const bool showNoteName = header.getWidth() >= 52.0f;
+                const bool hasWarpGlyph = ! chop.warpMarkers.empty() && header.getWidth() >= 34.0f;
+
+                if (showNoteName)
+                {
+                    // Read from the snapshot paintChops already holds rather than
+                    // re-loading the shared state per chop per frame: cheaper, and
+                    // it cannot tear if a publish lands mid-paint.
+                    const auto& noteForChop = chopState->midiMap.noteForChopIndex;
+                    const size_t idx = (size_t) (chopIndex - 1);
+                    const int mappedNote = idx < noteForChop.size() ? noteForChop[idx] : -1;
+                    const auto noteArea = header.reduced (5.0f, 1.0f);
+
+                    if (mappedNote >= 0)
+                    {
+                        g.setColour (inkColour);
+                        g.drawText (midiNoteName (mappedNote), noteArea.toNearestInt(),
+                                    juce::Justification::centredRight, false);
+                    }
+                    else
+                    {
+                        // UNREACHABLE: the chop is still selectable, previewable
+                        // and exportable by mouse, but no note maps to it. Drawn
+                        // dimmed rather than hidden — an absent label would look
+                        // identical to a narrow header.
+                        g.setColour (inkColour.withMultipliedAlpha (0.45f));
+                        g.drawText ("-", noteArea.toNearestInt(),
+                                    juce::Justification::centredRight, false);
+                    }
+                }
 
                 // Warp indicator. Outside warp mode a warped chop looks almost
                 // identical to an unwarped one, so users forget warping is
                 // applied — and people who have never opened warp mode get no
                 // hint the feature exists. A small wave glyph on the header
                 // marks any chop carrying markers.
-                if (! chop.warpMarkers.empty() && header.getWidth() >= 34.0f)
+                if (hasWarpGlyph)
                 {
                     const auto warpAccent = isLight ? juce::Colour (0xff6d28d9)
                                                     : juce::Colour (0xffc084fc);
                     const float gy = header.getCentreY();
-                    const float gx = header.getRight() - 12.0f;
+                    // Slide inboard of the note name when both are present.
+                    const float gx = header.getRight() - (showNoteName ? 34.0f : 12.0f);
 
                     juce::Path wave;
                     wave.startNewSubPath (gx - 6.0f, gy + 1.6f);
@@ -5822,9 +5953,28 @@ public:
 
     // Knob size for the condensed band's chop row (label + knob fit ~70px).
     static constexpr int bandKnobDiameter = 48;
+    // Left-bay geometry. These used to be duplicated between resized() and
+    // paint() (which hard-coded `34 + 122 + 24`), so moving anything here meant
+    // remembering to move it twice. Single definitions now.
+    static constexpr int sideMargin          = 34;
+    static constexpr int chopBadgeWidth      = 122;
+    static constexpr int badgeToToolsGap     = 10;
     static constexpr int chopToolButtonWidth = 128;
-    static constexpr int barsToolButtonWidth = 104;
-    static constexpr int chopToolButtonGap = 12;
+    static constexpr int chopToolButtonGap   = 8;
+    static constexpr int barsToolButtonWidth = 92;   // four 23px segments
+    static constexpr int barsToOctGap        = 10;
+    static constexpr int octStepWidth        = 20;   // two of these, side by side
+    static constexpr int octGroupWidth       = octStepWidth * 2;
+    static constexpr int toolButtonH         = 40;
+    // Caption strip above the tool row. "1 2 4 8" and a bare -/+ pair mean
+    // nothing unlabelled, and this band was empty.
+    static constexpr int toolCaptionH        = 12;
+
+    static constexpr int chopToolsX()  { return sideMargin + chopBadgeWidth + badgeToToolsGap; }
+    static constexpr int barsX()       { return chopToolsX() + chopToolButtonWidth + chopToolButtonGap; }
+    static constexpr int octGroupX()   { return barsX() + barsToolButtonWidth + barsToOctGap; }
+    // Everything the mapping status line sits under: CHOP MANUALLY | BARS | OCT.
+    static constexpr int mappingGroupWidth() { return octGroupX() + octGroupWidth - chopToolsX(); }
 
     explicit TransportSectionComponent (AudioPluginAudioProcessor& p)
         : processor (p),
@@ -5845,7 +5995,26 @@ public:
         configureButton (playbackModeButton, "GATE", textPrimary.withAlpha (0.90f));
         configureButton (halfSpeedButton, "HALF\nTIME", textPrimary.withAlpha (0.90f));
         configureButton (manualChopButton, "CHOP MANUALLY", textPrimary.withAlpha (0.75f));
-        configureButton (barsButton, "# OF BARS", textPrimary.withAlpha (0.75f));
+        for (size_t i = 0; i < barsChoices.size(); ++i)
+        {
+            configureButton (barsSegments[i], juce::String (barsChoices[i]),
+                             textPrimary.withAlpha (0.75f));
+            barsSegments[i].getProperties().set ("cueStyle", "segment");
+            barsSegments[i].setTooltip ("Bars per chop. Larger = fewer, longer chops.");
+
+            // Deliberately NOT setClickingTogglesState: the lit segment is
+            // whatever the processor actually holds, pushed back by
+            // refreshBarsSegments(). Letting the click flip the state locally
+            // would let the control disagree with the chop list it describes.
+            barsSegments[i].onClick = [this, i]
+            {
+                const int chosen = barsChoices[i];
+                if (chosen != processor.getChopBarsCount())
+                    processor.setChopBarsCount (chosen);
+
+                refreshBarsSegments();
+            };
+        }
         configureButton (loadButton, "LOAD SAMPLE", textPrimary.withAlpha (0.75f));
         playButton.getProperties().set ("cueStyle", "transportSquare");
         pauseButton.getProperties().set ("cueStyle", "transportSquare");
@@ -5904,7 +6073,6 @@ public:
         {
             enterManualChopMode (manualChopButton.getToggleState());
         };
-        barsButton.getProperties().set ("cueStyle", "flatAction");
         loadButton.getProperties().set ("cueStyle", "flatAction");
 
         playButton.setTooltip ("Play the selected chop from its cue point. Click a chop on the waveform first to pick which one plays.");
@@ -5913,7 +6081,6 @@ public:
         reverseButton.setTooltip ("Reverse playback for the currently selected chop. Active when lit.");
         halfSpeedButton.setTooltip ("Half-Time: plays at half speed while preserving pitch. Active when lit.");
         manualChopButton.setTooltip ("Start manual chopping from a clean slate. Double-click the waveform for a start marker, then hold and release a MIDI pad to set the end and assignment, or double-click the end manually.");
-        barsButton.setTooltip ("Sets how many bars each chop covers - cycles 1 / 2 / 4 / 8. Larger = fewer, longer chops.");
         loadButton.setTooltip ("Open a file browser to load a new audio sample (WAV, AIFF, MP3, FLAC, OGG). You can also drag a file onto the waveform.");
 
         for (juce::TextButton* button : { static_cast<juce::TextButton*> (&playButton),
@@ -5923,9 +6090,13 @@ public:
                                           static_cast<juce::TextButton*> (&playbackModeButton),
                                           static_cast<juce::TextButton*> (&halfSpeedButton),
                                           static_cast<juce::TextButton*> (&manualChopButton),
-                                          static_cast<juce::TextButton*> (&barsButton),
                                           static_cast<juce::TextButton*> (&loadButton) })
             addAndMakeVisible (*button);
+
+        for (auto& segment : barsSegments)
+            addAndMakeVisible (segment);
+
+        refreshBarsSegments();
 
         halfSpeedButton.setToggleState (processor.getHalfTimeEnabled(), juce::dontSendNotification);
         cue::isHalfTimeActive = processor.getHalfTimeEnabled();
@@ -5985,12 +6156,29 @@ public:
         };
         addAndMakeVisible (clearWarpButton);
 
-        configureButton (octDownButton, "OCT -", textPrimary.withAlpha (0.85f));
-        configureButton (octUpButton,   "OCT +", textPrimary.withAlpha (0.85f));
-        octDownButton.getProperties().set ("cueStyle", "flatAction");
-        octUpButton.getProperties().set ("cueStyle", "flatAction");
-        octDownButton.setTooltip ("Shift the MIDI note mapping down one octave. Use this to reach the chops if your keyboard has no octave buttons.");
-        octUpButton.setTooltip ("Shift the MIDI note mapping up one octave. Use this to reach the chops if your keyboard has no octave buttons.");
+        // The faces are glyphs now (the "OCT" caption above the pair carries the
+        // name), and the group is narrow, so the words would not have fit.
+        //
+        // DIRECTION IS DELIBERATE — DO NOT "FIX" IT.
+        //
+        // "-" raises the root and "+" lowers it, which looks backwards until you
+        // think in terms of the key under your finger rather than the root note.
+        // Chop 1 sits AT the root and the rest run upward from there, so lowering
+        // the root slides the whole mapping DOWN the keyboard — and any key you
+        // are already holding then lands on a LATER chop, i.e. further forward in
+        // the song. Pressing "-" must move you BACK through the song, so "-" has
+        // to raise the root.
+        //
+        // These buttons navigate the chop layout; they are not a transpose. An
+        // earlier comment here recorded only that the functions were "reversed"
+        // without saying why, which is precisely what got the wiring inverted
+        // once already.
+        configureButton (octDownButton, "-", textPrimary.withAlpha (0.85f));
+        configureButton (octUpButton, "+", textPrimary.withAlpha (0.85f));
+        octDownButton.getProperties().set ("cueStyle", "segment");
+        octUpButton.getProperties().set ("cueStyle", "segment");
+        octDownButton.setTooltip ("Step the chop mapping back one octave: the keys you are playing move to earlier chops in the song. (ROOT rises, because chop 1 sits on the root.)");
+        octUpButton.setTooltip ("Step the chop mapping forward one octave: the keys you are playing move to later chops in the song. (ROOT falls, because chop 1 sits on the root.)");
         octDownButton.onClick = [this]
         {
             processor.setMidiOctaveOffset (processor.getMidiOctaveOffset() + 1);
@@ -6092,18 +6280,32 @@ public:
                     badgeBounds.toNearestInt().withY ((int) std::round (badgeBounds.getY() - 1.0f)),
                     juce::Justification::centred, false);
 
+        // Captions for the two controls whose faces carry no words of their own:
+        // "1 2 4 8" and a bare -/+ pair are meaningless unlabelled. The strip
+        // above the tool row was empty, so nothing had to move to fit them.
+        {
+            const auto chopPanelBounds = getChopPanelBounds();
+            const int captionY = chopPanelBounds.getY() + 2;
+
+            g.setColour (glassTextMuted.withAlpha (0.9f));
+            g.setFont (monoFont (8.5f).withExtraKerningFactor (0.10f));
+            g.drawText ("BARS",
+                        juce::Rectangle<int> (barsX(), captionY, barsToolButtonWidth, toolCaptionH),
+                        juce::Justification::centred, false);
+            g.drawText ("OCT",
+                        juce::Rectangle<int> (octGroupX(), captionY, octGroupWidth, toolCaptionH),
+                        juce::Justification::centred, false);
+        }
+
         g.setColour (glassTextMuted.withAlpha (0.85f));
         g.setFont (monoFont (8.5f).withExtraKerningFactor (0.06f));
         {
-            // Centre the mapping hint under the CHOP/BARS pair on the left.
-            constexpr int centerBlockWidth = chopToolButtonWidth
-                                           + chopToolButtonGap
-                                           + barsToolButtonWidth;
-            constexpr int centerBlockX = 34 + 122 + 24;
+            // Centred under the whole mapping group — CHOP MANUALLY | BARS | OCT
+            // — since the ROOT readout is what the octave buttons change.
             g.drawText (getMidiMappingText(),
-                        juce::Rectangle<int> (centerBlockX,
+                        juce::Rectangle<int> (chopToolsX(),
                                               getChopPanelBounds().getBottom() - 13,
-                                              centerBlockWidth, 13),
+                                              mappingGroupWidth(), 13),
                         juce::Justification::centred, false);
         }
 
@@ -6130,30 +6332,33 @@ public:
         // Keep clear of the corner rivets (drawn at x = 13 +- 6 in paint()).
         const int sideMargin = 34;
 
-        constexpr int toolButtonH = 40;
         const int toolButtonY = chopPanel.getY() + (chopPanel.getHeight() - toolButtonH) / 2;
         constexpr int warpButtonH = 44;
         const int warpButtonY = chopPanel.getY() + (chopPanel.getHeight() - warpButtonH) / 2;
 
         // Chop-generation tools occupy the left bay, leaving the centred
         // global-knob bank unobstructed.
-        constexpr int chopBadgeWidth = 122;
-        constexpr int badgeToToolsGap = 24;
-        const int centerBlockX = sideMargin + chopBadgeWidth + badgeToToolsGap;
-        manualChopButton.setBounds (centerBlockX, toolButtonY,
+        manualChopButton.setBounds (chopToolsX(), toolButtonY,
                                         chopToolButtonWidth, toolButtonH);
-        barsButton.setBounds (centerBlockX + chopToolButtonWidth + chopToolButtonGap,
-                              toolButtonY, barsToolButtonWidth, toolButtonH);
 
-        // Warp cluster, right-aligned, with stacked octave buttons at the edge.
+        constexpr int segmentW = barsToolButtonWidth / 4;
+        for (size_t i = 0; i < barsSegments.size(); ++i)
+            barsSegments[i].setBounds (barsX() + (int) i * segmentW, toolButtonY,
+                                       segmentW, toolButtonH);
+
+        // The octave shift moves the same note map the BARS segments and the
+        // ROOT readout describe, so it belongs with them rather than orphaned
+        // against the far right edge, where it sat as two 20px slivers. Full
+        // tool-row height puts it on equal footing with its neighbours.
+        octDownButton.setBounds (octGroupX(), toolButtonY, octStepWidth, toolButtonH);
+        octUpButton.setBounds   (octGroupX() + octStepWidth, toolButtonY, octStepWidth, toolButtonH);
+
+        // Warp cluster, right-aligned. It reclaims the strip the octave buttons
+        // used to occupy at the edge.
         const auto warp = warpClusterBounds();
         warpButton.setBounds (warp.getX(), warpButtonY, 88, warpButtonH);
         clearWarpButton.setBounds (warp.getX() + 96, warpButtonY, 88, warpButtonH);
         warpDivisionCombo.setBounds (warp.getX() + 192, warpButtonY, 84, warpButtonH);
-
-        const int octX = getWidth() - sideMargin - 44;
-        octDownButton.setBounds (octX, warpButtonY, 44, 20);
-        octUpButton.setBounds (octX, warpButtonY + 24, 44, 20);
 
         // ---- Row 2: playback | centred chop knobs | modes + readouts -------
         const auto transportPanel = getTransportPanelBounds();
@@ -6212,7 +6417,16 @@ public:
     juce::TextButton& getPlayButton() noexcept { return playButton; }
     juce::TextButton& getPauseButton() noexcept { return pauseButton; }
     juce::TextButton& getStopButton() noexcept { return stopButton; }
-    juce::TextButton& getBarsButton() noexcept { return barsButton; }
+    // Pushes the processor's bars count back onto the segments. Call after
+    // anything that can change it behind the UI's back — state restore, undo,
+    // a layer swap.
+    void refreshBarsSegments()
+    {
+        const int current = processor.getChopBarsCount();
+        for (size_t i = 0; i < barsChoices.size(); ++i)
+            barsSegments[i].setToggleState (barsChoices[i] == current,
+                                            juce::dontSendNotification);
+    }
     juce::Slider& getCueSlider() noexcept { return cueKnob.getSlider(); }
     juce::Slider& getGainSlider() noexcept { return gainKnob.getSlider(); }
     juce::Slider& getPitchSlider() noexcept { return pitchKnob.getSlider(); }
@@ -6514,15 +6728,6 @@ private:
         keyDisplay.setTooltip ("Detected key: " + displayText);
     }
 
-    // Note name in the plugin's convention (MIDI 36 = C2, i.e. octave = note / 12 - 1).
-    static juce::String midiNoteName (int noteNumber)
-    {
-        static const char* names[12] = { "C", "C#", "D", "D#", "E", "F",
-                                         "F#", "G", "G#", "A", "A#", "B" };
-        const int octave = noteNumber / 12 - 1;
-        return juce::String (names[((noteNumber % 12) + 12) % 12]) + juce::String (octave);
-    }
-
     // Single entry point for switching chop layers, so the button, the warp
     // button's override, and editor start-up cannot drift apart.
     void enterManualChopMode (bool active)
@@ -6558,17 +6763,26 @@ private:
         if (processor.isManualChopModeActive())
             return "DOUBLE-CLICK START  |  HOLD/RELEASE PAD OR DOUBLE-CLICK END";
 
-        // One semitone per chop, matching getMidiNoteForChopId(). This
-        // previously advertised root+2 for chop 2, which was simply wrong.
+        // Every chop now carries its own key name on its header tab, so this
+        // line no longer has to recite the mapping — and reciting it was how it
+        // came to be wrong twice. It reports the root and, when pinned chops
+        // and the positional map collide, how many chops nothing can reach.
+        // That last case used to be completely silent.
         const int root = processor.getMidiRootNote();
-        return "MIDI: " + midiNoteName (root) + " = chop 1,  "
-                        + midiNoteName (root + 1) + " = chop 2 ...";
+        const int unreachable = processor.getUnreachableChopCount();
+
+        if (unreachable > 0)
+            return "ROOT " + midiNoteName (root) + "  |  " + juce::String (unreachable)
+                 + (unreachable == 1 ? " CHOP UNREACHABLE" : " CHOPS UNREACHABLE");
+
+        return "ROOT " + midiNoteName (root) + "  |  KEY SHOWN ON EACH CHOP";
     }
 
     void updateOctaveControls()
     {
-        // Functions are reversed: "OCT -" raises the offset, "OCT +" lowers it,
-        // so each button greys out at the opposite limit.
+        // Each button greys out at the limit IT can reach. "-" raises the offset
+        // (see the direction note where these are wired up), so it stops at the
+        // maximum; "+" lowers it and stops at the minimum.
         octDownButton.setEnabled (processor.getMidiOctaveOffset() < AudioPluginAudioProcessor::midiOctaveOffsetMax);
         octUpButton.setEnabled   (processor.getMidiOctaveOffset() > AudioPluginAudioProcessor::midiOctaveOffsetMin);
     }
@@ -6592,7 +6806,7 @@ private:
         constexpr int clusterW = 88 + 8 + 88 + 8 + 84; // 276
         constexpr int buttonH = 44;
         const int y = chopPanel.getY() + (chopPanel.getHeight() - buttonH) / 2;
-        return { getWidth() - 34 - 44 - 16 - clusterW, y, clusterW, buttonH };
+        return { getWidth() - sideMargin - clusterW, y, clusterW, buttonH };
     }
 
     AudioPluginAudioProcessor& processor;
@@ -6604,7 +6818,12 @@ private:
     SmoothAnimatedSwitchButton playbackModeButton;
     SmoothAnimatedSwitchButton halfSpeedButton;
     SmoothHoverButton manualChopButton;
-    SmoothHoverButton barsButton;
+    // BARS was a single button that cycled 1 -> 2 -> 4 -> 8 -> 1. Reaching 8
+    // took three clicks, and because every change rebuilds the chop list from
+    // the analysis, two of those three were destructive rebuilds the user never
+    // asked for. Four segments make it one click to any value.
+    static constexpr std::array<int, 4> barsChoices { 1, 2, 4, 8 };
+    std::array<SmoothHoverButton, 4> barsSegments;
     SmoothHoverButton loadButton;
     SmoothHoverButton warpButton;
     SmoothHoverButton clearWarpButton;
@@ -7210,14 +7429,6 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     transportSectionComponent->getPlayButton().onClick = [this] { processorRef.startPlayback(); };
     transportSectionComponent->getPauseButton().onClick = [this] { processorRef.pausePlayback(); };
     transportSectionComponent->getStopButton().onClick = [this] { processorRef.stopPlayback(); };
-    transportSectionComponent->getBarsButton().onClick = [this]
-    {
-        const int current = processorRef.getChopBarsCount();
-        const int next = (current == 1) ? 2 : (current == 2) ? 4 : (current == 4) ? 8 : 1;
-        processorRef.setChopBarsCount (next);
-        const auto label = juce::String (next) + (next == 1 ? " BAR" : " BARS");
-        transportSectionComponent->getBarsButton().setButtonText (label);
-    };
     transportSectionComponent->onTempoEntered = [this] (double requestedBpm)
     {
         const auto analysis = processorRef.getTempoAnalysis();
@@ -7305,8 +7516,7 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
                                                               juce::dontSendNotification);
     waveformFooterComponent->getGlobalGainSlider().setValue ((double) processorRef.getGlobalGainDecibels(),
                                                              juce::dontSendNotification);
-    transportSectionComponent->getBarsButton().setButtonText (juce::String (processorRef.getChopBarsCount())
-                                                              + (processorRef.getChopBarsCount() == 1 ? " BAR" : " BARS"));
+    transportSectionComponent->refreshBarsSegments();
 
     juce::Component* sections[] = { headerComponent.get(),
                                     waveformDisplayComponent.get(),
@@ -7591,7 +7801,13 @@ void AudioPluginAudioProcessorEditor::changeListenerCallback (juce::ChangeBroadc
         // Light the on-screen keyboard key that maps to the previewed
         // (selected) chop; -1 clears it when nothing is selected.
         if (editor->midiKeyboardComponent != nullptr)
+        {
             editor->midiKeyboardComponent->setHighlightedNote (processor.getSelectedChopMidiNote());
+            // ...and shade every key that triggers anything at all. Driven from
+            // the same broadcast so it stays correct for chop edits, layer
+            // swaps, undo and the octave shift alike.
+            editor->midiKeyboardComponent->setMappedNotes (processor.getMappedMidiNotes());
+        }
     });
 }
 

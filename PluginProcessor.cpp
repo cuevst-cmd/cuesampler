@@ -2208,7 +2208,7 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
                        )
 {
     std::atomic_store (&tempoEditState, std::make_shared<TempoEditState>());
-    std::atomic_store (&chopState, std::make_shared<ChopState>());
+    publishChopState (std::make_shared<ChopState>());
 
     removeLegacyDataSharingFiles();
 
@@ -3593,32 +3593,19 @@ void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg,
         return;
 
     const auto noteNumber = msg.getNoteNumber();
-    const ChopDefinition* targetChop = nullptr;
-
-    // Explicit manual assignments take priority over legacy positional maps.
-    for (const auto& candidate : currentChopState->chops)
-    {
-        if (candidate.assignedMidiNote == noteNumber)
-        {
-            targetChop = &candidate;
-            break;
-        }
-    }
-
-    if (targetChop == nullptr)
-    {
-        const auto effectiveRootNote = midiRootNote + midiOctaveOffset.load (std::memory_order_acquire) * 12;
-        const auto chopIdx = noteNumber - effectiveRootNote;
-        if (chopIdx >= 0 && chopIdx < (int) currentChopState->chops.size())
-        {
-            const auto& positional = currentChopState->chops[(size_t) chopIdx];
-            if (positional.assignedMidiNote == -1)
-                targetChop = &positional;
-        }
-    }
-
-    if (targetChop == nullptr)
+    if (noteNumber < 0 || noteNumber > 127)
         return;
+
+    // One array read. Both mapping rules — explicit pins and the legacy
+    // positional map — were resolved into this table at publish time, so there
+    // is no scan here any more and no chance of disagreeing with what the UI
+    // shows. See rebuildChopMidiMap.
+    const auto& midiMap = currentChopState->midiMap;
+    const int chopIndex = midiMap.noteToChopIndex[(size_t) noteNumber];
+    if (chopIndex < 0 || chopIndex >= (int) currentChopState->chops.size())
+        return;
+
+    const ChopDefinition* targetChop = &currentChopState->chops[(size_t) chopIndex];
 
     const auto& chop = *targetChop;
 
@@ -4042,7 +4029,7 @@ void AudioPluginAudioProcessor::applyParsedRestoreState (const DeferredRestoreSt
     std::atomic_store (&tempoAnalysis, restoreState.analysis != nullptr
                                            ? std::make_shared<TempoAnalysisData> (*restoreState.analysis)
                                            : std::shared_ptr<TempoAnalysisData> {});
-    std::atomic_store (&chopState, std::make_shared<ChopState> ());
+    publishChopState (std::make_shared<ChopState> ());
 
     loadedFileName = restoreState.sampleFileName.isNotEmpty()
         ? restoreState.sampleFileName
@@ -4205,7 +4192,7 @@ void AudioPluginAudioProcessor::completeDeferredSampleRestore (const DeferredRes
     std::atomic_store (&loadedSample, restoredSample);
     std::atomic_store (&tempoEditState, restoredEditState);
     std::atomic_store (&tempoAnalysis, restoredAnalysis);
-    std::atomic_store (&chopState, restoredChopState);
+    publishChopState (restoredChopState);
 
     // The inactive chop layer and which layer was live when the project was
     // saved. Restored verbatim — the stashed set is not re-validated against
@@ -4437,7 +4424,7 @@ AudioPluginAudioProcessor::loadAudioFile (const juce::File& file)
         std::atomic_store (&loadedSample, sampleData);
         std::atomic_store (&tempoAnalysis, std::shared_ptr<TempoAnalysisData> {});
         std::atomic_store (&tempoEditState, std::make_shared<TempoEditState> ());
-        std::atomic_store (&chopState, std::make_shared<ChopState> ());
+        publishChopState (std::make_shared<ChopState> ());
         clearEditUndoHistory(); // a fresh sample starts with no edit history
         loadedFileName = sampleData->fileName;
         sampleSampleRate = sampleData->sampleRate;
@@ -5154,14 +5141,20 @@ AudioPluginAudioProcessor::getChopPlaybackMode() const noexcept
                : ChopPlaybackMode::Gate;
 }
 
-void AudioPluginAudioProcessor::setMidiOctaveOffset (int octaves) noexcept
+void AudioPluginAudioProcessor::setMidiOctaveOffset (int octaves)
 {
     const int clamped = juce::jlimit (midiOctaveOffsetMin, midiOctaveOffsetMax, octaves);
     if (clamped == midiOctaveOffset.exchange (clamped, std::memory_order_acq_rel))
         return; // no change → don't churn the UI / host state
 
-    // The note→chop mapping just moved, so refresh the editor (re-lights the
-    // on-screen keyboard key for the selected chop) and persist the new offset.
+    // The positional half of the note map is resolved against the root, and the
+    // root just moved — so the map is now stale even though the chop list did
+    // not change. Republish to rebuild it. Easy to overlook: this is the one
+    // path that invalidates the mapping without touching a single chop.
+    if (const auto current = std::atomic_load (&chopState))
+        publishChopState (std::make_shared<ChopState> (*current));
+
+    // Refresh the editor (chop note names, lit keys) and persist the offset.
     notifyEditStateChanged();
 }
 
@@ -5173,6 +5166,73 @@ int AudioPluginAudioProcessor::getMidiOctaveOffset() const noexcept
 int AudioPluginAudioProcessor::getMidiRootNote() const noexcept
 {
     return midiRootNote + midiOctaveOffset.load (std::memory_order_acquire) * 12;
+}
+
+// Resolves both mapping rules into one table. Order matters and mirrors what
+// the audio thread used to do inline, so behaviour is unchanged for every chop
+// set that was not already ambiguous:
+//
+//   1. An explicit pin (assignedMidiNote 0..127) claims its note. On a
+//      collision the lowest chop index wins — that is what the old first-match
+//      `break` in handleMidiEvent amounted to.
+//   2. A legacy positional chop (-1) claims root + its index, but only if that
+//      note is still free. A pin always outranks it.
+//   3. -2 is deliberately unassigned and never claims anything.
+//
+// Anything that fails to claim a note is left at -1: UNREACHABLE. That case
+// always existed, it just had no name and no way to be displayed.
+void AudioPluginAudioProcessor::rebuildChopMidiMap (ChopState& state, int rootNote)
+{
+    auto& map = state.midiMap;
+    map.rootNote = rootNote;
+    map.noteToChopIndex.fill (-1);
+    map.noteForChopIndex.assign (state.chops.size(), -1);
+
+    const int numChops = (int) state.chops.size();
+
+    for (int i = 0; i < numChops; ++i)
+    {
+        const int note = state.chops[(size_t) i].assignedMidiNote;
+        if (note < 0 || note > 127)
+            continue;
+        if (map.noteToChopIndex[(size_t) note] >= 0)
+            continue; // an earlier pin owns this note; this chop is unreachable
+        map.noteToChopIndex[(size_t) note] = i;
+        map.noteForChopIndex[(size_t) i]   = note;
+    }
+
+    for (int i = 0; i < numChops; ++i)
+    {
+        if (state.chops[(size_t) i].assignedMidiNote != -1)
+            continue;
+        const int note = rootNote + i;
+        if (note < 0 || note > 127)
+            continue;
+        if (map.noteToChopIndex[(size_t) note] >= 0)
+            continue; // a pin already claimed it; this chop is unreachable
+        map.noteToChopIndex[(size_t) note] = i;
+        map.noteForChopIndex[(size_t) i]   = note;
+    }
+}
+
+void AudioPluginAudioProcessor::publishChopState (std::shared_ptr<ChopState> next)
+{
+    if (next != nullptr)
+    {
+        // Rebuilding the map writes into `next`. A state that has already been
+        // published may still be held by the audio thread or be sitting in the
+        // undo stack, so replaying one has to work on a copy. Every other
+        // caller hands over a state it just built, which copies nothing.
+        if (next->published)
+            next = std::make_shared<ChopState> (*next);
+
+        rebuildChopMidiMap (*next, getMidiRootNote());
+        next->published = true;
+    }
+
+    // Release-store: the map is fully built before the pointer is visible, so
+    // the audio thread can never observe a chop list with a half-built map.
+    std::atomic_store (&chopState, std::move (next));
 }
 
 int AudioPluginAudioProcessor::getMidiNoteForChopId (int chopId) const noexcept
@@ -5189,14 +5249,40 @@ int AudioPluginAudioProcessor::getMidiNoteForChopId (int chopId) const noexcept
         if (state->chops[i].id != chopId)
             continue;
 
-        if (state->chops[i].assignedMidiNote >= 0)
-            return state->chops[i].assignedMidiNote;
-        if (state->chops[i].assignedMidiNote == -1)
-            return getMidiRootNote() + (int) i;
-        return -1;
+        return i < state->midiMap.noteForChopIndex.size()
+             ? state->midiMap.noteForChopIndex[i]
+             : -1;
     }
 
     return -1;
+}
+
+std::bitset<128> AudioPluginAudioProcessor::getMappedMidiNotes() const noexcept
+{
+    std::bitset<128> mapped;
+    const auto state = std::atomic_load (&chopState);
+    if (state == nullptr)
+        return mapped;
+
+    for (int note = 0; note < 128; ++note)
+        if (state->midiMap.noteToChopIndex[(size_t) note] >= 0)
+            mapped.set ((size_t) note);
+
+    return mapped;
+}
+
+int AudioPluginAudioProcessor::getUnreachableChopCount() const noexcept
+{
+    const auto state = std::atomic_load (&chopState);
+    if (state == nullptr)
+        return 0;
+
+    int count = 0;
+    for (const int note : state->midiMap.noteForChopIndex)
+        if (note < 0)
+            ++count;
+
+    return count;
 }
 
 int AudioPluginAudioProcessor::getSelectedChopMidiNote() const noexcept
@@ -5370,7 +5456,7 @@ void AudioPluginAudioProcessor::resizeChopBoundaryAndTempo (int chopId, int newS
         {
             auto updated = std::make_shared<ChopState> (*rebuilt);
             updated->selectedChopId = matchedId;
-            std::atomic_store (&chopState, updated);
+            publishChopState (updated);
         }
     }
 
@@ -5441,7 +5527,7 @@ void AudioPluginAudioProcessor::setChopBounds (int chopId, int newStartSample, i
                    return left.startSample < right.startSample;
                });
     nextState->selectedChopId = chopId;
-    std::atomic_store (&chopState, nextState);
+    publishChopState (nextState);
 
     chopAudioCache.evict (chopId);
     if (hasWarpMarkers)
@@ -5807,7 +5893,41 @@ void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData&
     }
 
     auto newChopState = std::make_shared<ChopState>();
-    int chopIndex = 0;
+
+    // Per-chop edits follow the AUDIO, not the list position.
+    //
+    // This used to carry edits across by array index, which is only correct
+    // when the boundaries do not move. They almost always do. The grid anchor
+    // and bar period stay fixed when the bars-per-chop count changes — only the
+    // chop length scales — so the boundaries at 1 bar are a superset of those
+    // at 2, which are a superset of 4, and so on. Going 1 -> 2 bars, new chop k
+    // spans old chops 2k and 2k+1, but index matching handed it old chop k:
+    // chop 3's envelope, cue point and warp markers landed on bar 3 when they
+    // had been authored against bar 6, and the error grew with k. The same
+    // drift hit every other caller that slides the grid — the tempo trim, the
+    // start offset and shift-resize all rebuild through here.
+    //
+    // Both lists are sorted by startSample and the new ones are generated in
+    // order, so a forward-only cursor matches them in one pass. It naturally
+    // handles both directions: several new chops inside one old chop (8 -> 1
+    // bar) leave the cursor parked, and several old chops inside one new chop
+    // (1 -> 8) skip past on the following iteration.
+    const std::vector<ChopDefinition> noOldChops;
+    const auto& oldChops = existingState != nullptr ? existingState->chops : noOldChops;
+    size_t oldCursor = 0;
+
+    // A chop whose start lands in no old chop at all still takes the nearest
+    // one if it is close — a small grid nudge should not orphan every edit.
+    const int matchToleranceSamples =
+        juce::jmax (1, (int) std::llround (chopPeriodSeconds * sampleRate * 0.5));
+
+    // No two chops may end up on the same pad. Splitting one old chop into two
+    // new ones would otherwise hand both the same note, and the loser would be
+    // silently unreachable — exactly the collision the resolved note map exists
+    // to expose. The first claimant keeps it; the rest fall back to -1
+    // (positional), never -2, which would leave them permanently dead.
+    std::array<bool, 128> noteClaimed {};
+
     while (chopStart < totalDuration)
     {
         const auto chopEnd = chopStart + chopPeriodSeconds;
@@ -5824,21 +5944,81 @@ void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData&
             ChopDefinition def { newChopState->nextChopId++, startSample, endSample,
                                  autoCueOffset, 0.0f, 0.0f, false, false, {} };
 
-            // Preserve any per-chop edits from the old chop at the same grid index.
-            if (existingState != nullptr && chopIndex < (int) existingState->chops.size())
+            // Walk the cursor up to the first old chop that could still overlap
+            // this new one. Never rewinds, so the whole rebuild stays O(n + m).
+            while (oldCursor < oldChops.size()
+                   && oldChops[oldCursor].endSample <= def.startSample)
+                ++oldCursor;
+
+            // Inherit from whichever old chop shares the most audio with this
+            // one. "The old chop containing the new start" is not enough: when
+            // the grid slides, a new chop's start lands in the tail of the
+            // previous old chop while nearly all of its body belongs to the
+            // next — and it would inherit from the wrong one. Ties go to the
+            // earlier chop, which is what makes a bars change inherit from the
+            // old chop that begins at the same place.
+            const ChopDefinition* match = nullptr;
+            int bestOverlap = 0;
+            for (size_t j = oldCursor;
+                 j < oldChops.size() && oldChops[j].startSample < def.endSample;
+                 ++j)
             {
-                const auto& old = existingState->chops[(size_t) chopIndex];
-                if (old.cueOffsetSamples > 0)
-                    def.cueOffsetSamples = old.cueOffsetSamples;
+                const int overlap = juce::jmin (def.endSample, oldChops[j].endSample)
+                                  - juce::jmax (def.startSample, oldChops[j].startSample);
+                if (overlap > bestOverlap)
+                {
+                    bestOverlap = overlap;
+                    match = &oldChops[j];
+                }
+            }
+
+            // No shared audio at all — a gap in the old set, or a nudge that
+            // moved every boundary clear of this chop. Fall back to the nearest
+            // old start so a small shift does not orphan every edit.
+            if (match == nullptr && oldCursor < oldChops.size()
+                && std::abs (oldChops[oldCursor].startSample - def.startSample) <= matchToleranceSamples)
+                match = &oldChops[oldCursor];
+
+            if (match != nullptr)
+            {
+                const auto& old = *match;
+
+                // cueOffsetSamples is relative to the chop start, so it only
+                // transfers verbatim when the start has not moved. Re-basing it
+                // onto the new start keeps the cue pointing at the same moment
+                // of audio; if that now falls outside the chop, the auto-cue
+                // computed above stands. The old code copied the raw offset
+                // whenever it was non-zero, which silently moved the cue to a
+                // different moment every time a boundary shifted.
+                const int rebasedCue = (old.startSample + old.cueOffsetSamples) - def.startSample;
+                if (rebasedCue > 0 && rebasedCue < def.endSample - def.startSample)
+                    def.cueOffsetSamples = rebasedCue;
+
                 def.gainDecibels     = old.gainDecibels;
                 def.pitchSemitones   = old.pitchSemitones;
                 def.favorite         = old.favorite;
                 def.reversed         = old.reversed;
-                def.assignedMidiNote = old.assignedMidiNote;
                 def.attackMilliseconds = old.attackMilliseconds;
                 def.decayMilliseconds = old.decayMilliseconds;
                 def.sustainLevel = old.sustainLevel;
                 def.releaseMilliseconds = old.releaseMilliseconds;
+
+                if (old.assignedMidiNote >= 0 && old.assignedMidiNote <= 127)
+                {
+                    if (! noteClaimed[(size_t) old.assignedMidiNote])
+                    {
+                        def.assignedMidiNote = old.assignedMidiNote;
+                        noteClaimed[(size_t) old.assignedMidiNote] = true;
+                    }
+                    else
+                    {
+                        def.assignedMidiNote = -1; // another chop already took this pad
+                    }
+                }
+                else
+                {
+                    def.assignedMidiNote = old.assignedMidiNote; // -1 or -2, carried as-is
+                }
 
                 // Carry warp markers across the rebuild, dropping any that no longer
                 // fall inside the new chop bounds.
@@ -5850,7 +6030,6 @@ void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData&
             }
 
             newChopState->chops.push_back (def);
-            ++chopIndex;
         }
         chopStart = chopEnd;
     }
@@ -5861,7 +6040,7 @@ void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData&
         newChopState->selectedChopId = newChopState->chops[(size_t) clampedIndex].id;
     }
 
-    std::atomic_store (&chopState, newChopState);
+    publishChopState (newChopState);
 
     // Old chop ids no longer exist after a rebuild — drop the entire warp
     // cache, then re-bake any chops that carried markers across.
@@ -5940,8 +6119,16 @@ void AudioPluginAudioProcessor::updateHostSyncStretchRatio (const TempoAnalysisD
 void AudioPluginAudioProcessor::setChopBarsCount (int bars)
 {
     const int clamped = (bars <= 1) ? 1 : (bars <= 2) ? 2 : (bars <= 4) ? 4 : 8;
-    if (clamped != chopBarsCount.load (std::memory_order_acquire))
-        pushEditUndoSnapshot ({});
+
+    // Re-selecting the value that is already set must do nothing. With the old
+    // cycling button this was unreachable, so the early-out below only skipped
+    // the undo snapshot and still rebuilt every chop from the analysis. Picking
+    // the lit segment is an ordinary gesture on a direct selector, and it would
+    // otherwise throw away cue points and warp markers for no reason.
+    if (clamped == chopBarsCount.load (std::memory_order_acquire))
+        return;
+
+    pushEditUndoSnapshot ({});
     chopBarsCount.store (clamped, std::memory_order_release);
 
     const auto analysis = std::atomic_load (&tempoAnalysis);
@@ -6174,7 +6361,7 @@ int AudioPluginAudioProcessor::addOrUpdateChopWarpMarker (int chopId, int source
 
     const int newIndex = sortMarkersAndLocate (targetChop->warpMarkers, clampedSource);
 
-    std::atomic_store (&chopState, next);
+    publishChopState (next);
     requestChopWarpRender (chopId);
     touchTempoUiRevision();
     notifyEditStateChanged();
@@ -6231,7 +6418,7 @@ bool AudioPluginAudioProcessor::setChopWarpMarkerLocalTime (int chopId, int mark
     markers[(size_t) markerIndex].snappedToGrid    = snappedToGrid;
     markers[(size_t) markerIndex].gridFingerprint  = snappedToGrid ? fingerprint : 0.0;
 
-    std::atomic_store (&chopState, next);
+    publishChopState (next);
     requestChopWarpRender (chopId);
     touchTempoUiRevision();
     notifyEditStateChanged();
@@ -6280,7 +6467,7 @@ bool AudioPluginAudioProcessor::setChopWarpMarkerSourceSample (int chopId, int m
 
     markers[(size_t) markerIndex].sourceSample = juce::jlimit (lower, upper, sourceSample);
 
-    std::atomic_store (&chopState, next);
+    publishChopState (next);
     requestChopWarpRender (chopId);
     touchTempoUiRevision();
     notifyEditStateChanged();
@@ -6362,7 +6549,7 @@ bool AudioPluginAudioProcessor::removeChopWarpMarker (int chopId, int markerInde
 
     targetChop->warpMarkers.erase (targetChop->warpMarkers.begin() + markerIndex);
 
-    std::atomic_store (&chopState, next);
+    publishChopState (next);
     requestChopWarpRender (chopId);
     touchTempoUiRevision();
     notifyEditStateChanged();
@@ -6396,7 +6583,7 @@ bool AudioPluginAudioProcessor::clearChopWarpMarkers (int chopId)
 
     targetChop->warpMarkers.clear();
 
-    std::atomic_store (&chopState, next);
+    publishChopState (next);
     requestChopWarpRender (chopId);
     touchTempoUiRevision();
     notifyEditStateChanged();
@@ -6449,7 +6636,7 @@ void AudioPluginAudioProcessor::swapChopLayers()
     nextLive->nextChopId = sharedNextId;
 
     std::atomic_store (&stashedChopState, nextStash);
-    std::atomic_store (&chopState, nextLive);
+    publishChopState (nextLive);
 
     // The chop the voice was playing may not exist on the incoming layer, and
     // cached/warped audio is keyed to the outgoing one.
@@ -6475,7 +6662,7 @@ void AudioPluginAudioProcessor::clearAllChops()
 
     auto next = std::make_shared<ChopState>();
     next->nextChopId = current->nextChopId;
-    std::atomic_store (&chopState, next);
+    publishChopState (next);
 
     warpRenderThreadPool.removeAllJobs (false, 0);
     chopAudioCache.clear();
@@ -6524,7 +6711,7 @@ int AudioPluginAudioProcessor::addManualChop (int startSample, int endSample, in
                });
 
     next->selectedChopId = newId;
-    std::atomic_store (&chopState, next);
+    publishChopState (next);
     touchTempoUiRevision();
     notifyEditStateChanged();
     return newId;
@@ -6616,7 +6803,7 @@ void AudioPluginAudioProcessor::addChop (int startSample, int endSample)
         if (existingChop.startSample == clampedStart && existingChop.endSample == clampedEnd)
         {
             nextState->selectedChopId = existingChop.id;
-            std::atomic_store (&chopState, nextState);
+            publishChopState (nextState);
             touchTempoUiRevision();
             notifyEditStateChanged();
             return;
@@ -6634,7 +6821,7 @@ void AudioPluginAudioProcessor::addChop (int startSample, int endSample)
                    return left.startSample < right.startSample;
                });
     nextState->selectedChopId = newChopId;
-    std::atomic_store (&chopState, nextState);
+    publishChopState (nextState);
     touchTempoUiRevision();
     notifyEditStateChanged();
 }
@@ -6778,7 +6965,7 @@ int AudioPluginAudioProcessor::chopAtTransients (TransientSensitivity sensitivit
     pushEditUndoSnapshot ({});
 
     newChopState->selectedChopId = newChopState->chops.front().id;
-    std::atomic_store (&chopState, newChopState);
+    publishChopState (newChopState);
 
     warpRenderThreadPool.removeAllJobs (false, 0);
     chopAudioCache.clear();
@@ -6804,7 +6991,7 @@ void AudioPluginAudioProcessor::selectChopById (int chopId)
 
     auto nextState = std::make_shared<ChopState> (*currentState);
     nextState->selectedChopId = chopId;
-    std::atomic_store (&chopState, nextState);
+    publishChopState (nextState);
     touchTempoUiRevision();
     notifyEditStateChanged();
 }
@@ -6818,7 +7005,7 @@ void AudioPluginAudioProcessor::selectChopAtSample (double samplePosition)
     auto nextState = std::make_shared<ChopState> (*currentState);
     const auto* chop = findChopAtSample (currentState.get(), samplePosition);
     nextState->selectedChopId = chop != nullptr ? chop->id : -1;
-    std::atomic_store (&chopState, nextState);
+    publishChopState (nextState);
     touchTempoUiRevision();
     notifyEditStateChanged();
 }
@@ -6831,7 +7018,7 @@ void AudioPluginAudioProcessor::clearSelectedChop()
 
     auto nextState = std::make_shared<ChopState> (*currentState);
     nextState->selectedChopId = -1;
-    std::atomic_store (&chopState, nextState);
+    publishChopState (nextState);
     clearVoiceStopRequest.store (true, std::memory_order_release);
     touchTempoUiRevision();
     notifyEditStateChanged();
@@ -6855,7 +7042,7 @@ void AudioPluginAudioProcessor::removeSelectedChop()
                                             }),
                             nextState->chops.end());
     nextState->selectedChopId = -1;
-    std::atomic_store (&chopState, nextState);
+    publishChopState (nextState);
     clearVoiceStopRequest.store (true, std::memory_order_release);
     chopAudioCache.evict (removedChopId);
     touchTempoUiRevision();
@@ -6882,7 +7069,7 @@ void AudioPluginAudioProcessor::setSelectedChopCueNormalized (float normalizedVa
         break;
     }
 
-    std::atomic_store (&chopState, nextState);
+    publishChopState (nextState);
     touchTempoUiRevision();
     notifyEditStateChanged();
 }
@@ -6905,7 +7092,7 @@ void AudioPluginAudioProcessor::setSelectedChopGainDecibels (float gainDecibels)
         }
     }
 
-    std::atomic_store (&chopState, nextState);
+    publishChopState (nextState);
     touchTempoUiRevision();
     notifyEditStateChanged();
 }
@@ -6928,7 +7115,7 @@ void AudioPluginAudioProcessor::setSelectedChopPitchSemitones (float newPitchSem
         }
     }
 
-    std::atomic_store (&chopState, nextState);
+    publishChopState (nextState);
     touchTempoUiRevision();
     notifyEditStateChanged();
 }
@@ -6966,7 +7153,7 @@ void AudioPluginAudioProcessor::setChopEnvelopeParameter (int chopId,
             break;
     }
 
-    std::atomic_store (&chopState, nextState);
+    publishChopState (nextState);
     touchTempoUiRevision();
     notifyEditStateChanged();
 }
@@ -7055,8 +7242,8 @@ void AudioPluginAudioProcessor::undoLastEdit()
     gridStartOffset.store (snap.gridStartOffset, std::memory_order_release);
     chopBarsCount.store (snap.chopBarsCount, std::memory_order_release);
 
-    std::atomic_store (&chopState, snap.chopState != nullptr ? snap.chopState
-                                                            : std::make_shared<ChopState>());
+    publishChopState (snap.chopState != nullptr ? snap.chopState
+                                                : std::make_shared<ChopState>());
 
     // Chop ids / bounds / markers may all differ now — drop the warp cache and
     // re-bake any chops that carry markers, mirroring the restore path.
@@ -7097,7 +7284,7 @@ void AudioPluginAudioProcessor::toggleSelectedChopFavorite()
         }
     }
 
-    std::atomic_store (&chopState, nextState);
+    publishChopState (nextState);
     touchTempoUiRevision();
     notifyEditStateChanged();
 }
@@ -7120,7 +7307,7 @@ void AudioPluginAudioProcessor::toggleSelectedChopReversed()
         }
     }
 
-    std::atomic_store (&chopState, nextState);
+    publishChopState (nextState);
     touchTempoUiRevision();
     notifyEditStateChanged();
 }
