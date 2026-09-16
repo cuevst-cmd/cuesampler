@@ -52,6 +52,10 @@ public:
     {
         std::shared_ptr<LoadedSampleData> source;   // pristine original to subtract from
         juce::AudioBuffer<float> drums, bass, vocals; // source rate/length/channels
+        // Key this set is stored under in the on-disk StemCache. Persisted in the
+        // project state so reopening can rehydrate these stems instead of running
+        // another separation pass. Empty when the cache write failed.
+        juce::String cacheKey;
     };
 
     struct TempoAnalysisData
@@ -304,6 +308,31 @@ public:
     // the sample exceeds kMaxStemSeparationSeconds.
     bool  areStemModelsAvailable() const noexcept;
     bool  wasStemSeparationSkipped() const noexcept { return stemSeparationSkipped.load (std::memory_order_acquire); }
+    // True while a cached separation is being looked up and decoded for the
+    // current sample. Short (well under a second for typical samples), but the UI
+    // must not offer SEPARATE during it or a redundant pass gets kicked off over
+    // audio that is already separated on disk.
+    bool  isLookingUpStemCache() const noexcept { return stemCacheLookupInProgress.load (std::memory_order_acquire); }
+    // True only for a lookup we EXPECT to hit: a restored project naming the key
+    // its stems were saved under. The speculative lookup on a fresh file load is
+    // deliberately excluded - it usually misses, and announcing it would flash a
+    // "loading" state on every single sample load.
+    bool  isRestoringSavedStems() const noexcept
+    {
+        return stemCacheLookupInProgress.load (std::memory_order_acquire)
+            && stemCacheLookupExpected.load (std::memory_order_acquire);
+    }
+    // True when mute flags are set but no stems are loaded to apply them to — a
+    // project restored without its cached stems. The mix the user hears is the
+    // unmuted original, so the UI must say so rather than showing the saved mutes
+    // as if they were in effect.
+    bool  hasPendingStemMutes() const noexcept
+    {
+        return ! stemsReady.load (std::memory_order_acquire)
+            && (muteDrums.load (std::memory_order_acquire)
+                || muteBass.load (std::memory_order_acquire)
+                || muteVocals.load (std::memory_order_acquire));
+    }
 
     // Apply a user key override (rootIndex 0..11 = C..B), replacing the
     // displayed detector result for the current sample.
@@ -438,6 +467,7 @@ private:
     class KeyDetectionJob;
     class PreparedWarmJob;
     class StemSeparationJob;
+    class StemCacheLookupJob;
     class RemixJob;
 
     // Background "pre-render" warm: bakes each non-warp chop's pitch+time-stretched
@@ -482,6 +512,11 @@ private:
         bool restoredMuteDrums = false;
         bool restoredMuteBass = false;
         bool restoredMuteVocals = false;
+        // StemCache key saved with the project. Non-empty means the session had
+        // stems; the restore tries to pull them back from disk under this exact
+        // key rather than re-deriving one (the restored buffer is decoded from
+        // the 16-bit embedded copy and would hash differently).
+        juce::String restoredStemCacheKey;
         int restoredBarsPerChop = 1;
         int restoredMidiOctaveOffset = 0;
         double restoredPlaybackPosition = 0.0;
@@ -595,7 +630,7 @@ private:
         {
             envelopeSampleRate = juce::jmax (1.0, sampleRate);
             // Even R=0 retains the existing 32-sample MIDI de-click tail.
-            envelopeReleaseSeconds = juce::jmax (`(float) (32.0 / envelopeSampleRate),
+            envelopeReleaseSeconds = juce::jmax ((float) (32.0 / envelopeSampleRate),
                                                   chop.releaseMilliseconds * 0.001f);
             envelope.reset();
             envelope.setSampleRate (envelopeSampleRate);
@@ -823,6 +858,12 @@ private:
     // (ensureStemSeparatorLoaded) without a lock. The StemSeparator/ONNX session
     // itself is built lazily from this path on the first separation request.
     juce::String       stemModelPath;
+    // Identity of the model file at stemModelPath, folded into every StemCache
+    // key so a model swap orphans stale entries. Resolved once in the constructor
+    // alongside stemModelPath and never mutated, so it is lock-free to read.
+    juce::String       stemModelId;
+    std::atomic<bool>  stemCacheLookupInProgress { false };
+    std::atomic<bool>  stemCacheLookupExpected { false };  // driven by a restored key, not speculation
     std::atomic<bool>  stemModelLoading { false };    // session being built on the stem thread
     std::atomic<bool>  stemModelLoadFailed { false }; // model file present but session build failed
     // Samples longer than this skip separation (avoids huge RAM/time on full songs).
@@ -881,6 +922,13 @@ private:
     // sample loads (separation is now user-initiated via requestStemSeparation).
     void resetStemState();
     void launchStemSeparation (std::shared_ptr<LoadedSampleData> sampleData);
+    // Tries to rehydrate stems for 'sampleData' from the on-disk StemCache instead
+    // of running a separation pass. A non-empty savedKey (from a restored project)
+    // is used verbatim; otherwise the key is derived from the sample's own audio,
+    // which is what lets reloading a file you already separated hit the cache. A
+    // miss is silent: stem state stays idle and the STEMS button reappears.
+    void launchStemCacheLookup (std::shared_ptr<LoadedSampleData> sampleData,
+                                juce::String savedKey);
     // Builds the StemSeparator/ONNX session on first use. MUST be called from the
     // stem thread (single-threaded pool): the model build + probe is the heavy,
     // deferred cost. Returns the ready separator, or nullptr if no model is

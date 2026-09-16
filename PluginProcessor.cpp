@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "StemCache.h"
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -1808,9 +1809,9 @@ public:
                 owner.stemProgress.store (juce::jlimit (0.0f, 1.0f, f), std::memory_order_release);
         };
 
-        const auto result = separator->separate (sampleData->buffer,
-                                                 sampleData->sampleRate,
-                                                 onProgress, stale);
+        auto result = separator->separate (sampleData->buffer,
+                                           sampleData->sampleRate,
+                                           onProgress, stale);
 
         if (stale())
             return jobHasFinished;
@@ -1823,9 +1824,42 @@ public:
 
         auto set = std::make_shared<StemSet>();
         set->source = sampleData;             // pristine original (shared, not copied)
-        set->drums  = result.drums;
-        set->bass   = result.bass;
-        set->vocals = result.vocals;
+
+        // Persist the result so this sample never has to be separated again —
+        // neither on the next project open nor the next time the file is loaded.
+        // Hashing + FLAC encoding run here on the stem thread, after the user
+        // already has their stems; a failed write just costs a future pass.
+        //
+        // The stems are moved through the cache Entry and on into the StemSet
+        // rather than copied into each: at a few tens of MB per stem, copying
+        // them twice is a RAM spike worth not taking.
+        cuesampler::StemCache::Entry entry;
+        entry.sampleRate = sampleData->sampleRate;
+        entry.drums      = std::move (result.drums);
+        entry.bass       = std::move (result.bass);
+        entry.vocals     = std::move (result.vocals);
+
+        set->cacheKey = cuesampler::StemCache::makeKey (sampleData->buffer,
+                                                        sampleData->sampleRate,
+                                                        owner.stemModelId);
+        if (set->cacheKey.isNotEmpty())
+        {
+            if (cuesampler::StemCache::store (set->cacheKey, entry))
+            {
+                cuesampler::StemCache::prune();
+            }
+            else
+            {
+                juce::Logger::writeToLog ("StemCache: failed to store stems for "
+                                          + sampleData->fileName);
+                set->cacheKey = {};
+            }
+        }
+
+        set->drums  = std::move (entry.drums);
+        set->bass   = std::move (entry.bass);
+        set->vocals = std::move (entry.vocals);
+
         owner.publishStems (std::move (set), generation);
         return jobHasFinished;
     }
@@ -1833,6 +1867,87 @@ public:
 private:
     AudioPluginAudioProcessor& owner;
     std::shared_ptr<LoadedSampleData> sampleData;
+    uint64_t generation = 0;
+};
+
+// Rehydrates a previously separated sample from the on-disk StemCache. Shares
+// stemGeneration with StemSeparationJob so the two can supersede each other, and
+// publishes through the same generation-guarded publishStems() — a miss simply
+// publishes null, leaving the original playing and the STEMS button offered.
+class AudioPluginAudioProcessor::StemCacheLookupJob final : public juce::ThreadPoolJob
+{
+public:
+    StemCacheLookupJob (AudioPluginAudioProcessor& ownerIn,
+                        std::shared_ptr<LoadedSampleData> sampleDataIn,
+                        juce::String savedKeyIn,
+                        uint64_t generationIn)
+        : juce::ThreadPoolJob ("Stem Cache Lookup"),
+          owner (ownerIn),
+          sampleData (std::move (sampleDataIn)),
+          savedKey (std::move (savedKeyIn)),
+          generation (generationIn)
+    {
+    }
+
+    JobStatus runJob() override
+    {
+        if (shouldExit() || sampleData == nullptr)
+        {
+            owner.publishStems (nullptr, generation);
+            return jobHasFinished;
+        }
+
+        // A restored project supplies its saved key: the sample it came back
+        // from is decoded from the 16-bit embedded copy, so re-deriving a key
+        // from that buffer would miss the entry the original session wrote.
+        // A fresh file load has no saved key and derives one from its own audio.
+        const auto key = savedKey.isNotEmpty()
+            ? savedKey
+            : cuesampler::StemCache::makeKey (sampleData->buffer,
+                                              sampleData->sampleRate,
+                                              owner.stemModelId);
+
+        if (shouldExit() || key.isEmpty())
+        {
+            owner.publishStems (nullptr, generation);
+            return jobHasFinished;
+        }
+
+        cuesampler::StemCache::Entry entry;
+        if (! cuesampler::StemCache::load (key, entry))
+        {
+            owner.publishStems (nullptr, generation);
+            return jobHasFinished;
+        }
+
+        // The cached stems are subtracted sample-for-sample from this buffer, so
+        // anything but an exact shape match is a stale entry (the source file
+        // changed under a saved key, say) and must be treated as a miss.
+        if (entry.drums.getNumChannels() != sampleData->buffer.getNumChannels()
+            || entry.drums.getNumSamples() != sampleData->buffer.getNumSamples())
+        {
+            juce::Logger::writeToLog ("StemCache: entry for " + sampleData->fileName
+                                      + " does not match the loaded sample - ignoring");
+            owner.publishStems (nullptr, generation);
+            return jobHasFinished;
+        }
+
+        auto set = std::make_shared<StemSet>();
+        set->source   = sampleData;
+        set->drums    = std::move (entry.drums);
+        set->bass     = std::move (entry.bass);
+        set->vocals   = std::move (entry.vocals);
+        set->cacheKey = key;
+
+        juce::Logger::writeToLog ("StemCache: restored stems for " + sampleData->fileName);
+        owner.publishStems (std::move (set), generation);
+        return jobHasFinished;
+    }
+
+private:
+    AudioPluginAudioProcessor& owner;
+    std::shared_ptr<LoadedSampleData> sampleData;
+    juce::String savedKey;
     uint64_t generation = 0;
 };
 
@@ -2292,6 +2407,10 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
         stemModelPath = stemModelFile.getFullPathName();
         juce::Logger::writeToLog ("StemSeparator: model found at " + stemModelPath
                                   + " (deferred — session built on first STEMS request)");
+
+        // Folded into every StemCache key so cached stems are only ever served
+        // back to the model build that produced them.
+        stemModelId = cuesampler::StemCache::makeModelId (stemModelPath);
     }
     else
     {
@@ -3668,7 +3787,7 @@ juce::AudioProcessorEditor* AudioPluginAudioProcessor::createEditor()
 void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     juce::ValueTree state ("CueSamplerState");
-    state.setProperty ("version", 5, nullptr);
+    state.setProperty ("version", 6, nullptr); // 6 adds stemCacheKey
     state.setProperty ("gridBpmTrim", (double) gridBpmTrim.load (std::memory_order_acquire), nullptr);
     state.setProperty ("gridStartOffset", (double) gridStartOffset.load (std::memory_order_acquire), nullptr);
     state.setProperty ("waveformZoom", (double) waveformZoom.load (std::memory_order_acquire), nullptr);
@@ -3681,6 +3800,17 @@ void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData
     state.setProperty ("muteDrums", muteDrums.load (std::memory_order_acquire), nullptr);
     state.setProperty ("muteBass", muteBass.load (std::memory_order_acquire), nullptr);
     state.setProperty ("muteVocals", muteVocals.load (std::memory_order_acquire), nullptr);
+
+    // Stem AUDIO is not embedded (three more FLAC streams would multiply project
+    // size against the 128 MB embed cap). Instead the separation lives in the
+    // on-disk StemCache and the project carries only its key, so reopening
+    // rehydrates the stems in well under a second. A key that is no longer in the
+    // cache just falls back to offering SEPARATE again.
+    if (const auto stems = std::atomic_load (&stemSet);
+        stems != nullptr && stems->cacheKey.isNotEmpty())
+    {
+        state.setProperty ("stemCacheKey", stems->cacheKey, nullptr);
+    }
     state.setProperty ("chopBarsCount", chopBarsCount.load (std::memory_order_acquire), nullptr);
     state.setProperty ("midiOctaveOffset", midiOctaveOffset.load (std::memory_order_acquire), nullptr);
     state.setProperty ("playbackSamplePosition", playbackSamplePosition.load (std::memory_order_acquire), nullptr);
@@ -4011,6 +4141,7 @@ AudioPluginAudioProcessor::parseDeferredRestoreState (const juce::ValueTree& sta
     restoreState.restoredMuteDrums = (bool) state.getProperty ("muteDrums", false);
     restoreState.restoredMuteBass = (bool) state.getProperty ("muteBass", false);
     restoreState.restoredMuteVocals = (bool) state.getProperty ("muteVocals", false);
+    restoreState.restoredStemCacheKey = state.getProperty ("stemCacheKey").toString();
     restoreState.restoredBarsPerChop = juce::jlimit (1, 8, (int) state.getProperty ("chopBarsCount", 1));
     restoreState.restoredMidiOctaveOffset = juce::jlimit (midiOctaveOffsetMin, midiOctaveOffsetMax,
                                                           (int) state.getProperty ("midiOctaveOffset", 0));
@@ -4046,8 +4177,12 @@ void AudioPluginAudioProcessor::applyParsedRestoreState (const DeferredRestoreSt
     halfTimeEnabled.store (restoreState.restoredHalfTime, std::memory_order_release);
     chopPlaybackMode.store ((int) restoreState.restoredChopPlaybackMode, std::memory_order_release);
 
-    // Restore the mute flags and clear stem state — the new sample re-separates
-    // (stem audio is never serialized), then these mutes apply on publish.
+    // Restore the mute flags and clear stem state. Stem audio is not embedded in
+    // the project; completeDeferredSampleRestore tries to pull it back from the
+    // on-disk StemCache once the sample itself is loaded, and these mutes are
+    // applied by publishStems if that succeeds. On a cache miss the flags stay
+    // set but nothing is muted — hasPendingStemMutes() is what the UI shows for
+    // that state instead of pretending the mutes are live.
     muteDrums.store (restoreState.restoredMuteDrums, std::memory_order_release);
     muteBass.store (restoreState.restoredMuteBass, std::memory_order_release);
     muteVocals.store (restoreState.restoredMuteVocals, std::memory_order_release);
@@ -4234,10 +4369,15 @@ void AudioPluginAudioProcessor::completeDeferredSampleRestore (const DeferredRes
     else
         touchTempoUiRevision();
 
-    // Stem audio is never serialized. Separation is user-initiated now (STEMS
-    // button), so just clear stem state — don't auto-run a pass on restore. The
-    // restored mute flags are preserved and take effect once the user re-separates.
-    resetStemState();
+    // Stem audio is not serialized into the project, but the separation it came
+    // from is on disk under the key we saved. Pull it back rather than making the
+    // user sit through another pass; the restored mute flags then apply on
+    // publish. A miss (cache pruned, different machine, changed model) leaves
+    // stem state idle with the STEMS button offered.
+    if (restoreState.restoredStemCacheKey.isNotEmpty())
+        launchStemCacheLookup (restoredSample, restoreState.restoredStemCacheKey);
+    else
+        resetStemState();
 
     // Restored chops may carry warp markers — re-bake those entries.
     if (const auto restoredState = std::atomic_load (&chopState); restoredState != nullptr)
@@ -4435,12 +4575,16 @@ AudioPluginAudioProcessor::loadAudioFile (const juce::File& file)
 
         launchTempoAnalysis (sampleData);
 
-        // A fresh sample starts unmuted. Separation is user-initiated (STEMS
-        // button) now, so just clear any prior stem state — don't auto-run a pass.
+        // A fresh sample starts unmuted. Separation stays user-initiated (STEMS
+        // button) — but if this exact audio was separated before, its stems are
+        // still on disk, so check the cache instead of making the user pay for the
+        // same pass twice. launchStemCacheLookup clears stem state either way; on
+        // a miss (or with no model installed) nothing is published and the STEMS
+        // button is offered exactly as before.
         muteDrums.store (false, std::memory_order_release);
         muteBass.store (false, std::memory_order_release);
         muteVocals.store (false, std::memory_order_release);
-        resetStemState();
+        launchStemCacheLookup (sampleData, {});
 
         const auto keyGeneration = keyDetectionGeneration.fetch_add (1, std::memory_order_acq_rel) + 1;
         keyDetectionThreadPool.removeAllJobs (false, 0);
@@ -5637,6 +5781,8 @@ void AudioPluginAudioProcessor::resetStemState()
     std::atomic_store (&stemSet, std::shared_ptr<const StemSet> {});
     stemsReady.store (false, std::memory_order_release);
     stemSeparationInProgress.store (false, std::memory_order_release);
+    stemCacheLookupInProgress.store (false, std::memory_order_release);
+    stemCacheLookupExpected.store (false, std::memory_order_release);
     stemProgress.store (0.0f, std::memory_order_release);
     stemSeparationSkipped.store (false, std::memory_order_release);
     appliedStemMask.store (-1, std::memory_order_release);
@@ -5717,16 +5863,39 @@ void AudioPluginAudioProcessor::launchStemSeparation (std::shared_ptr<LoadedSamp
     stemThreadPool.addJob (new StemSeparationJob (*this, std::move (sampleData), generation), true);
 }
 
+void AudioPluginAudioProcessor::launchStemCacheLookup (std::shared_ptr<LoadedSampleData> sampleData,
+                                                       juce::String savedKey)
+{
+    // Always leaves stem state reset, whether or not a lookup actually starts, so
+    // callers never have to pair this with their own reset.
+    resetStemState();
+
+    // No model means no key namespace to look in (and nothing that could have
+    // written an entry), so there is nothing to rehydrate.
+    if (stemModelId.isEmpty()
+        || sampleData == nullptr || sampleData->buffer.getNumSamples() <= 0)
+        return;
+
+    stemCacheLookupInProgress.store (true, std::memory_order_release);
+    stemCacheLookupExpected.store (savedKey.isNotEmpty(), std::memory_order_release);
+    const auto generation = stemGeneration.fetch_add (1, std::memory_order_acq_rel) + 1;
+    stemThreadPool.addJob (new StemCacheLookupJob (*this, std::move (sampleData),
+                                                   std::move (savedKey), generation), true);
+}
+
 void AudioPluginAudioProcessor::publishStems (std::shared_ptr<const StemSet> newStemSet, uint64_t generation)
 {
     if (generation != stemGeneration.load (std::memory_order_acquire))
         return; // superseded by a newer sample / separation
 
     stemSeparationInProgress.store (false, std::memory_order_release);
+    stemCacheLookupInProgress.store (false, std::memory_order_release);
+    stemCacheLookupExpected.store (false, std::memory_order_release);
 
     if (newStemSet == nullptr)
     {
-        // Separation unavailable or failed → keep the original buffer in place.
+        // Separation unavailable/failed, or a cache lookup missed -> keep the
+        // original buffer in place.
         stemsReady.store (false, std::memory_order_release);
         return;
     }

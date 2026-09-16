@@ -7015,19 +7015,48 @@ public:
         // not already running, and the sample wasn't rejected as too long). The
         // status line is empty in exactly this state, so the button replaces it.
         loadingModel = processorRef.isLoadingStemModel();
+        // A cache lookup is also "busy": it can publish stems a moment later, and
+        // offering SEPARATE during it invites a redundant pass over audio that is
+        // already separated on disk.
         const bool showSeparate = processorRef.areStemModelsAvailable()
                                && processorRef.getLoadedSample() != nullptr
                                && ! ready && ! separating
+                               && ! processorRef.isLookingUpStemCache()
                                && ! processorRef.wasStemSeparationSkipped();
         if (showSeparate != separateButton.isVisible())
             separateButton.setVisible (showSeparate);
 
+        // A project saved with stems muted comes back with those flags set but no
+        // stems to apply them to (its cached separation was pruned, or the project
+        // moved machines). The button covers the status line, so the message has to
+        // ride on the button itself: it names what the click restores rather than
+        // leaving the user to guess why their saved mutes aren't doing anything.
+        if (const bool pendingMutes = processorRef.hasPendingStemMutes();
+            pendingMutes != showingPendingMutes)
+        {
+            showingPendingMutes = pendingMutes;
+            separateButton.setButtonText (pendingMutes ? "RESTORE STEMS" : "SEPARATE");
+            separateButton.setTooltip (pendingMutes
+                ? "This project was saved with stems muted, but its separation isn't loaded - "
+                  "everything is playing right now. Split the sample again to bring the saved mutes back."
+                : "Split this sample into DRUMS / BASS / VOCALS stems so you can mute each one. "
+                  "Runs in the background - the first run takes a few extra seconds while the model loads.");
+        }
+
         // Keep toggles in sync with the processor (state restore, fresh-load reset)
         // without firing onClick. setToggleState no-ops when unchanged. Inverted:
         // lit = NOT muted (the stem is playing).
-        bassBtn.setToggleState (! processorRef.getMuteBass(),   juce::dontSendNotification);
-        drumsBtn.setToggleState (! processorRef.getMuteDrums(), juce::dontSendNotification);
-        vocalsBtn.setToggleState (! processorRef.getMuteVocals(), juce::dontSendNotification);
+        //
+        // The LEDs track what is AUDIBLE, not the stored flags. A project saved
+        // with stems muted restores those flags before the stems themselves are
+        // back, and during that window the mix really is unmuted - showing the
+        // saved flags there lit a "VOCALS muted" LED over audibly playing vocals,
+        // on a button too disabled to correct it. Until stems exist, every stem
+        // is playing, and the status line reports the pending mutes instead.
+        const bool mutesAreLive = ready;
+        bassBtn.setToggleState   (mutesAreLive ? ! processorRef.getMuteBass()   : true, juce::dontSendNotification);
+        drumsBtn.setToggleState  (mutesAreLive ? ! processorRef.getMuteDrums()  : true, juce::dontSendNotification);
+        vocalsBtn.setToggleState (mutesAreLive ? ! processorRef.getMuteVocals() : true, juce::dontSendNotification);
 
         if (ready != lastReady)
         {
@@ -7076,6 +7105,11 @@ public:
         {
             text = "READY";
             colour = juce::Colour (0xff6ad48a);
+        }
+        else if (processorRef.isRestoringSavedStems())
+        {
+            text   = "LOADING STEMS";
+            colour = accentOrange;
         }
         else if (processorRef.wasStemSeparationSkipped())
         {
@@ -7227,6 +7261,7 @@ private:
     juce::TextButton separateButton; // manual trigger; visibility managed in refresh()
     juce::String statusText;
     juce::Colour statusColour { glassTextMuted };
+    bool showingPendingMutes = false; // drives the SEPARATE button's label/tooltip
     bool lastReady = false;
     bool loadingModel = false; // ONNX session building on first request (indeterminate bar)
 

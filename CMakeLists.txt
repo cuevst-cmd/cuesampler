@@ -189,6 +189,7 @@ target_sources(CueSampler
         PluginProcessor.cpp
         BeatThisAnalyzer.cpp
         StemSeparator.cpp
+        StemCache.cpp
         VisualizerOrb.cpp
         WarpMap.cpp
         ChopAudioCache.cpp)
@@ -235,6 +236,7 @@ target_link_libraries(CueSampler
     PRIVATE
         CueSamplerBinaryAssets
         juce::juce_audio_utils
+        juce::juce_cryptography   # SHA256 for StemCache content keys
         juce::juce_dsp
         juce::juce_opengl
         bungee_library
@@ -389,6 +391,33 @@ elseif(WIN32)
         endif()
     endforeach()
 endif() # APPLE / WIN32 — platform-specific bundling
+
+# ── Optional offline StemCache test ──────────────────────────────────────────
+# OFF by default. Console app covering the on-disk stem cache that lets a saved
+# project reopen with its stems intact. Runs against a scratch directory via
+# CUE_STEM_CACHE_DIR, so it never touches the real user cache. No model needed.
+#   cmake -S . -B build -DCUE_BUILD_STEM_CACHE_TEST=ON
+#   cmake --build build --target test_stem_cache
+#   ./build/test_stem_cache_artefacts/test_stem_cache
+option(CUE_BUILD_STEM_CACHE_TEST "Build the offline StemCache test" OFF)
+if(CUE_BUILD_STEM_CACHE_TEST)
+    juce_add_console_app(test_stem_cache PRODUCT_NAME "test_stem_cache")
+    set_target_properties(test_stem_cache PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    target_sources(test_stem_cache PRIVATE
+        tools/test_stem_cache.cpp
+        StemCache.cpp)
+    target_compile_definitions(test_stem_cache PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CURL=0
+        JUCE_STANDALONE_APPLICATION=1)
+    target_include_directories(test_stem_cache PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(test_stem_cache PRIVATE
+        juce::juce_audio_formats
+        juce::juce_audio_basics
+        juce::juce_cryptography
+        juce::juce_core
+        juce::juce_recommended_config_flags)
+endif()
 
 # ── Optional offline StemSeparator test ───────────────────────────────────────
 # OFF by default. Builds a small console app that runs StemSeparator on a WAV. Needs the
