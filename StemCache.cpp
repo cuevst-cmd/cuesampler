@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cmath>
 #include <limits>
 #include <cstring>
 #include <memory>
@@ -19,15 +20,13 @@ namespace
 // Container magic + version. A version bump orphans every existing entry
 // instead of risking a misread of an older layout.
 constexpr char kMagic[4]   = { 'C', 'S', 'T', 'M' };
-constexpr juce::uint32 kContainerVersion = 1;
+constexpr juce::uint32 kContainerVersion = 2;
 
 constexpr const char* kEntryExtension = ".cuestems";
 
-// Stems are subtracted from the original to build the played mix, so their
-// quantization error lands directly in what the user hears. 24-bit puts that
-// at roughly -144 dBFS; 16-bit (what the embedded project sample uses, where
-// it is masked by the full mix) would not be quiet enough here.
-constexpr int kStemBitsPerSample = 24;
+// Integer audio clips floating-point overshoots and changes subtraction on
+// recall. Version 2 preserves every float, including peaks beyond full scale.
+constexpr int kStemBitsPerSample = 32;
 
 // Serializing a cache write against a concurrent prune keeps a store from
 // being deleted by the trim it just triggered.
@@ -103,14 +102,15 @@ bool encodeStem (const juce::AudioBuffer<float>& buffer, double sampleRate, juce
     if (numChannels <= 0 || numSamples <= 0 || sampleRate <= 0.0)
         return false;
 
-    juce::FlacAudioFormat flac;
+    juce::WavAudioFormat wav;
     std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::MemoryOutputStream> (out, false);
     const auto options = juce::AudioFormatWriterOptions()
                              .withSampleRate (sampleRate)
                              .withNumChannels (numChannels)
-                             .withBitsPerSample (kStemBitsPerSample);
+                             .withBitsPerSample (kStemBitsPerSample)
+                             .withSampleFormat (juce::AudioFormatWriterOptions::SampleFormat::floatingPoint);
 
-    auto writer = flac.createWriterFor (stream, options);
+    auto writer = wav.createWriterFor (stream, options);
     if (writer == nullptr)
         return false;
 
@@ -126,19 +126,27 @@ bool encodeStem (const juce::AudioBuffer<float>& buffer, double sampleRate, juce
 // us into an enormous buffer.
 bool decodeStem (const juce::MemoryBlock& data,
                  int expectedChannels,
-                 int expectedSamples,
+                 int expectedSamples, double expectedRate, bool legacy,
                  juce::AudioBuffer<float>& out)
 {
     if (data.getSize() == 0 || expectedChannels <= 0 || expectedSamples <= 0)
         return false;
 
     juce::FlacAudioFormat flac;
+    juce::WavAudioFormat wav;
+    juce::AudioFormat& format = legacy ? static_cast<juce::AudioFormat&> (flac)
+                                      : static_cast<juce::AudioFormat&> (wav);
+    // A float WAV must contain at least this many PCM bytes. Reject forged
+    // dimensions before allocation, even when its header claims to match.
+    if (! legacy && (juce::uint64) expectedChannels * (juce::uint64) expectedSamples * 4 > data.getSize())
+        return false;
     auto reader = std::unique_ptr<juce::AudioFormatReader> (
-        flac.createReaderFor (new juce::MemoryInputStream (data, false), true));
+        format.createReaderFor (new juce::MemoryInputStream (data, false), true));
 
     if (reader == nullptr
         || (int) reader->numChannels != expectedChannels
-        || reader->lengthInSamples != (juce::int64) expectedSamples)
+        || reader->lengthInSamples != (juce::int64) expectedSamples
+        || reader->sampleRate != expectedRate)
         return false;
 
     out.setSize (expectedChannels, expectedSamples, false, true, false);
@@ -210,7 +218,9 @@ juce::String StemCache::makeKey (const juce::AudioBuffer<float>& buffer,
 
     // Fold the buffer's shape in alongside the PCM hash: the same bytes read
     // as a different channel count or rate are a different separation.
-    const auto descriptor = audioHash
+    // New separations must not reuse stems produced by the delayed resampler.
+    // Existing embedded/cache-key project states still load their saved sound.
+    const auto descriptor = "aligned-float-v3|" + audioHash
                           + "|" + juce::String (buffer.getNumChannels())
                           + "|" + juce::String (buffer.getNumSamples())
                           + "|" + juce::String (sampleRate, 6)
@@ -229,124 +239,106 @@ bool StemCache::contains (const juce::String& key)
 bool StemCache::load (const juce::String& key, Entry& result)
 {
     const auto file = entryFileForKey (key);
-    if (file == juce::File() || ! file.existsAsFile())
+    if (file == juce::File() || file.getSize() <= 0
+        || file.getSize() > std::numeric_limits<int>::max())
         return false;
-
-    juce::FileInputStream input (file);
-    if (! input.openedOk())
+    juce::MemoryBlock data;
+    if (! file.loadFileAsData (data) || ! decode (data, result))
         return false;
+    file.setLastModificationTime (juce::Time::getCurrentTime());
+    return true;
+}
 
+bool StemCache::decode (const juce::MemoryBlock& data, Entry& result)
+{
+    juce::MemoryInputStream input (data, false);
     char magic[4] = {};
     if (input.read (magic, 4) != 4 || std::memcmp (magic, kMagic, 4) != 0)
         return false;
-
-    if ((juce::uint32) input.readInt() != kContainerVersion)
+    const auto version = (juce::uint32) input.readInt();
+    if (version != 1 && version != kContainerVersion)
         return false;
-
-    const auto sampleRate  = input.readDouble();
+    const auto sampleRate = input.readDouble();
     const auto numChannels = input.readInt();
-    const auto numSamples  = input.readInt();
-
-    if (sampleRate <= 0.0 || numChannels <= 0 || numSamples <= 0)
+    const auto numSamples = input.readInt();
+    if (! std::isfinite (sampleRate) || sampleRate < 8000.0 || sampleRate > 384000.0
+        || numChannels < 1 || numChannels > 2 || numSamples <= 0
+        || (double) numSamples > sampleRate * 900.0)
         return false;
 
-    juce::AudioBuffer<float>* const targets[3] { &result.drums, &result.bass, &result.vocals };
-
-    for (auto* target : targets)
+    Entry decoded;
+    for (auto* target : { &decoded.drums, &decoded.bass, &decoded.vocals })
     {
+        if (input.getNumBytesRemaining() < 8)
+            return false;
         const auto byteLength = input.readInt64();
-
-        // A stem cannot be longer than the file containing it, and one read is
-        // capped at INT_MAX regardless. Anything outside that is a truncated or
-        // mangled entry.
-        if (byteLength <= 0 || byteLength > file.getSize()
-            || byteLength > (juce::int64) std::numeric_limits<int>::max())
+        if (byteLength <= 0 || byteLength > input.getNumBytesRemaining()
+            || byteLength > std::numeric_limits<int>::max())
             return false;
-
         juce::MemoryBlock encoded ((size_t) byteLength);
-        if (input.read (encoded.getData(), (int) byteLength) != (int) byteLength)
-            return false;
-
-        // decodeStem enforces the container header's shape, so a stem that does
-        // not match makes the whole entry a miss rather than handing the
-        // processor buffers it would silently misalign against the source.
-        if (! decodeStem (encoded, numChannels, numSamples, *target))
+        if (input.read (encoded.getData(), (int) byteLength) != byteLength
+            || ! decodeStem (encoded, numChannels, numSamples, sampleRate, version == 1, *target))
             return false;
     }
+    if (! input.isExhausted())
+        return false;
+    decoded.sampleRate = sampleRate;
+    result = std::move (decoded);
+    return true;
+}
 
-    result.sampleRate = sampleRate;
+bool StemCache::encode (const Entry& entry, juce::MemoryBlock& result)
+{
+    result.reset();
+    const auto channels = entry.drums.getNumChannels();
+    const auto samples = entry.drums.getNumSamples();
+    if (! std::isfinite (entry.sampleRate) || entry.sampleRate < 8000.0 || entry.sampleRate > 384000.0
+        || channels < 1 || channels > 2 || samples <= 0 || samples > entry.sampleRate * 900.0)
+        return false;
+    for (const auto* stem : { &entry.bass, &entry.vocals })
+        if (stem->getNumChannels() != channels || stem->getNumSamples() != samples)
+            return false;
 
-    // A successful read is a use: keep prune()'s LRU ordering honest.
-    file.setLastModificationTime (juce::Time::getCurrentTime());
+    juce::MemoryOutputStream output (result, false);
+    output.write (kMagic, 4);
+    output.writeInt ((int) kContainerVersion);
+    output.writeDouble (entry.sampleRate);
+    output.writeInt (channels);
+    output.writeInt (samples);
+    for (const auto* stem : { &entry.drums, &entry.bass, &entry.vocals })
+    {
+        juce::MemoryBlock encoded;
+        if (! encodeStem (*stem, entry.sampleRate, encoded))
+            return false;
+        output.writeInt64 ((juce::int64) encoded.getSize());
+        output.write (encoded.getData(), encoded.getSize());
+    }
+    output.flush();
     return true;
 }
 
 bool StemCache::store (const juce::String& key, const Entry& entry)
 {
+    juce::MemoryBlock encoded;
+    return encode (entry, encoded) && storeEncoded (key, encoded);
+}
+
+bool StemCache::storeEncoded (const juce::String& key, const juce::MemoryBlock& data)
+{
     const auto file = entryFileForKey (key);
-    if (file == juce::File())
+    if (file == juce::File() || data.isEmpty())
         return false;
-
-    const auto numChannels = entry.drums.getNumChannels();
-    const auto numSamples  = entry.drums.getNumSamples();
-
-    if (entry.sampleRate <= 0.0 || numChannels <= 0 || numSamples <= 0)
-        return false;
-
-    for (const auto* stem : { &entry.bass, &entry.vocals })
-        if (stem->getNumChannels() != numChannels || stem->getNumSamples() != numSamples)
-            return false;
-
-    juce::MemoryBlock encoded[3];
-    const juce::AudioBuffer<float>* const sources[3] { &entry.drums, &entry.bass, &entry.vocals };
-
-    for (int i = 0; i < 3; ++i)
-        if (! encodeStem (*sources[i], entry.sampleRate, encoded[i]))
-            return false;
-
     const std::lock_guard<std::mutex> lock (cacheMutex());
-
-    // Write to a temp file and rename into place, so an interrupted write
-    // leaves the old entry (or nothing) rather than a half-file that would
-    // later fail to decode.
-    const auto temp = file.getSiblingFile (file.getFileNameWithoutExtension()
-                                           + "." + juce::String (juce::Random::getSystemRandom().nextInt())
-                                           + ".tmp");
-    temp.deleteFile();
-
+    juce::TemporaryFile temp (file);
     {
-        juce::FileOutputStream output (temp);
-        if (! output.openedOk())
+        juce::FileOutputStream output (temp.getFile());
+        if (! output.openedOk() || ! output.write (data.getData(), data.getSize()))
             return false;
-
-        bool ok = output.write (kMagic, 4)
-               && output.writeInt ((int) kContainerVersion)
-               && output.writeDouble (entry.sampleRate)
-               && output.writeInt (numChannels)
-               && output.writeInt (numSamples);
-
-        for (int i = 0; i < 3 && ok; ++i)
-            ok = output.writeInt64 ((juce::int64) encoded[i].getSize())
-              && output.write (encoded[i].getData(), encoded[i].getSize());
-
         output.flush();
-        ok = ok && output.getStatus().wasOk();
-
-        if (! ok)
-        {
-            temp.deleteFile();
+        if (output.getStatus().failed())
             return false;
-        }
     }
-
-    file.deleteFile();
-    if (! temp.moveFileTo (file))
-    {
-        temp.deleteFile();
-        return false;
-    }
-
-    return true;
+    return temp.overwriteTargetFileWithTemporary();
 }
 
 void StemCache::prune (std::int64_t maxBytes)

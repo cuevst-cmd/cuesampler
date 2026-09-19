@@ -194,14 +194,14 @@ prefixed `StemSeparator:`.
 
 ## Persistence
 - [ ] Mute VOCALS, save the project, close and reopen. The VOCALS button comes back muted,
-      the panel shows SEPARATING then READY (stems re-separate; audio is NOT serialized),
-      and once READY the vocals are muted as saved.
+      the panel shows LOADING STEMS then READY (embedded audio is decoded without another
+      separation pass), and the first audible mix has vocals muted as saved.
 
 ## Reset / second sample
 - [ ] Load a different sample while the first is still SEPARATING → progress resets, the old
-      job is abandoned (log shows the new generation start), the new sample separates.
-- [ ] After loading a fresh sample, all three mutes reset to OFF and the panel re-runs
-      SEPARATING → READY.
+      job is abandoned, and none of its audio or stems reappear in the new sample.
+- [ ] After loading a fresh sample, all three mutes reset to OFF. Cached stems may load;
+      otherwise the panel offers SEPARATE for a user-initiated pass.
 
 ## Edge cases
 - [ ] No sample loaded → panel is neutral (title only / blank status), buttons disabled.
@@ -221,3 +221,75 @@ The offline `tools/test_stem_separator.cpp` (build with `-DCUE_BUILD_STEM_TEST=O
 target `test_stem_separator`) asserts stem shapes, the subtraction reconstruction, per-stem
 energy/distinctness, and the mute-mix model (no-mute == original; vocals-muted ==
 original − vocals). Run it on a short stereo WAV with the model present.
+
+## DAW recall regression (state version 7)
+
+New saves embed 32-bit floating-point source audio and separated stems. Project
+files will be larger. A completed separation no longer depends on the optional
+disk cache or the model being installed when reopening. Older projects remain
+readable; successfully recovered cache-only stems are embedded on the next save.
+Audio already quantized/clipped by an older save cannot be reconstructed exactly.
+
+- Separate a sample, mute DRUMS and VOCALS, edit cue/gain/ADSR and warp markers,
+  choose a BARS segment, set the octave, and select a chop. Save the DAW project.
+- Close the project, temporarily move its original sample and stem-cache folder
+  aside, then reopen. Check the same sound, mute buttons, both chop layers, MIDI
+  mapping, selected chop, waveform view, and playhead. Restore the moved files.
+- During restore, confirm that the unmuted source never briefly plays. Save
+  immediately during loading and reopen that save; its audio must remain intact.
+- Unmute everything after reopening: the original source must return without
+  doubled stem subtraction. Compare an offline render before/after reopen.
+- With the editor open, change BARS, undo, and restore a different saved project.
+  Confirm the lit segment always agrees with the actual chop length.
+- Place a warp marker late in a 2-bar chop, then select 1 bar. Confirm the marker
+  in the later child retains its timing and remains active.
+- While stems/cache are loading, restore an empty project or a different sample.
+  The old sample and mutes must not reappear after the background job finishes.
+
+Automated regression checks (plugin installation is disabled):
+
+```sh
+cmake -S . -B build -DCUE_COPY_PLUGIN_AFTER_BUILD=OFF -DCUE_BUILD_STEM_CACHE_TEST=ON -DCUE_BUILD_STATE_TEST=ON
+cmake --build build --target test_stem_cache test_project_restore
+ctest --test-dir build --output-on-failure
+```
+
+## Audio extraction regression
+
+Exports use 32-bit floating-point WAV at the host sample rate and snapshot the
+chop, cue, pitch, warp, tempo/HALF-TIME, gain, envelope, reverse and stem mutes at
+the export gesture. Rendering and Save As copies run off the UI/audio threads.
+The envelope follows full-velocity one-shot playback; a held MIDI gate/note-off
+performance is not recorded into the file. Prepared audio preserves headroom
+instead of independently normalising each chop.
+
+- [ ] Drag the export pill with pitch, warp, SYNC and HALF-TIME individually,
+      then combined. Place each WAV on the grid and compare its onset, duration,
+      pitch and final transient to the loop; repeat at 44.1/48/96 kHz and with a
+      source at a different rate. Check chops at the start/end of the source.
+- [ ] Export just after moving a warp marker, changing a cue or toggling a stem
+      mute. The export must reflect that gesture's settings, including a mute
+      whose background playback remix has not finished yet.
+- [ ] Test reverse, nonzero cue, source peaks above 0 dBFS, global/chop gains,
+      attack/sustain and a release longer than the entire chop. Short attacking
+      chops must remain audible and the file must not clip/normalise float peaks.
+- [ ] Cold-render a long processed chop. The editor should remain responsive and
+      display Preparing export. Keep dragging to start the native file drag once
+      ready. Release early, then drag the pill again: the prepared result is reused
+      if settings are unchanged. Change settings before retrying: it must re-render.
+- [ ] Use Export Chop As, cancel it, and test a destination that cannot be written.
+      Failed saves report an error and preserve the rendered file and any existing
+      destination file. Close the editor while rendering; no crash or late dialog.
+- [ ] Drag to a DAW that references files in place. Wait more than 60 seconds,
+      close the plugin, save/reopen the DAW session and verify the clip still plays.
+      Successful drag files stay in `CueSampler/Exports` under JUCE's user application
+      data directory (macOS: `~/Library/CueSampler/Exports`). They are not automatically
+      deleted; don't manually remove files still referenced by projects. Use the
+      DAW's collect/copy-media feature before moving a project to another computer.
+
+The `test_project_restore` suite also reads actual exported WAVs and checks
+processing-delay compensation, loop lengths, pitch, late-loop audio, sample-rate
+conversion, float peaks, cue/reverse, stem intent, long-release short chops,
+background snapshots/cache lifetime, and stem-resampling alignment. Fresh stem
+cache keys include the corrected resampler revision; old saved projects preserve
+their embedded stems until explicitly separated again.

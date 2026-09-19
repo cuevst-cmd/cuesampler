@@ -104,6 +104,7 @@ public:
     static constexpr int kKeptStemIndices[3] = { Drums, Bass, Vocals };
 
 private:
+    friend struct CueSamplerStateTests;
     //==========================================================================
     // The loaded model: its Ort::Session plus cached I/O names. Defined in the
     // .cpp so the ORT C++ headers stay out of this header.
@@ -130,7 +131,7 @@ private:
     // The three 44.1 kHz stereo stems produced by one segmented model pass.
     struct Stems44 { juce::AudioBuffer<float> drums, bass, vocals; };
 
-    // Resample a buffer between rates (per-channel Lagrange). Returns a copy at
+    // Resample with bounded, delay-compensated per-channel Lagrange. Returns a copy at
     // dstRate; returns a plain copy when the rates already match.
     static juce::AudioBuffer<float> resample (const juce::AudioBuffer<float>& src,
                                               double srcRate, double dstRate);

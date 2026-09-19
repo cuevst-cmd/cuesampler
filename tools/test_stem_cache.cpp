@@ -63,14 +63,20 @@ float maxDifference (const juce::AudioBuffer<float>& a, const juce::AudioBuffer<
 
 } // namespace
 
-int main()
+int main (int argc, char** argv)
 {
     // Isolate from the real cache before anything touches getCacheDirectory().
-    const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
-                             .getChildFile ("cue-stem-cache-test-"
+    const auto base = argc > 1 ? juce::File (juce::String (argv[1]))
+                              : juce::File::getSpecialLocation (juce::File::tempDirectory);
+    const auto scratch = base.getChildFile ("cue-stem-cache-test-"
                                             + juce::String (juce::Time::currentTimeMillis()));
-    scratch.createDirectory();
+    if (scratch.createDirectory().failed())
+        return 2;
+   #if JUCE_WINDOWS
+    ::_putenv_s ("CUE_STEM_CACHE_DIR", scratch.getFullPathName().toRawUTF8());
+   #else
     ::setenv ("CUE_STEM_CACHE_DIR", scratch.getFullPathName().toRawUTF8(), 1);
+   #endif
 
     check (cuesampler::StemCache::getCacheDirectory() == scratch,
            "CUE_STEM_CACHE_DIR redirects the cache directory");
@@ -118,6 +124,47 @@ int main()
 
     // Stems must not be swapped in the container.
     check (maxDifference (written.drums, read.bass) > 0.01f, "stems keep their identity");
+
+    // Floating-point overshoots and quiet detail must survive exactly.
+    written.drums.setSample (0, 0, 1.25f);
+    written.bass.setSample (0, 0, -1.5f);
+    written.vocals.setSample (1, 1, 1.0e-12f);
+    check (cuesampler::StemCache::store (key, written), "store float peaks");
+    check (cuesampler::StemCache::load (key, read), "load float peaks");
+    check (maxDifference (written.drums, read.drums) == 0.0f, "positive overshoots survive bit-exactly");
+    check (maxDifference (written.bass, read.bass) == 0.0f, "negative overshoots survive bit-exactly");
+    check (maxDifference (written.vocals, read.vocals) == 0.0f, "quiet detail survives bit-exactly");
+
+    juce::MemoryBlock portable;
+    check (cuesampler::StemCache::encode (written, portable), "encode portable project stems");
+    cuesampler::StemCache::clear();
+    check (cuesampler::StemCache::decode (portable, read), "decode stems without the disk cache");
+    check (maxDifference (written.drums, read.drums) == 0.0f, "portable stems are exact");
+
+    // Version-1 projects must still read their original FLAC cache entries.
+    juce::MemoryBlock legacy;
+    {
+        juce::MemoryOutputStream container (legacy, false);
+        container.write ("CSTM", 4);
+        container.writeInt (1);
+        container.writeDouble (sampleRate);
+        container.writeInt (2);
+        container.writeInt (numSamples);
+        for (const auto* stem : { &written.drums, &written.bass, &written.vocals })
+        {
+            juce::MemoryBlock audio;
+            std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::MemoryOutputStream> (audio, false);
+            juce::FlacAudioFormat flac;
+            auto writer = flac.createWriterFor (stream, juce::AudioFormatWriterOptions()
+                .withSampleRate (sampleRate).withNumChannels (2).withBitsPerSample (24));
+            writer->writeFromAudioSampleBuffer (*stem, 0, numSamples);
+            writer.reset();
+            container.writeInt64 ((juce::int64) audio.getSize());
+            container.write (audio.getData(), audio.getSize());
+        }
+    }
+    check (cuesampler::StemCache::decode (legacy, read), "legacy v1 FLAC entries remain readable");
+    check (cuesampler::StemCache::store (key, written), "restore disk fixture");
 
     // ---- misses and malformed entries --------------------------------------
     cuesampler::StemCache::Entry ignored;

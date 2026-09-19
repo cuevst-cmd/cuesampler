@@ -15,10 +15,11 @@ namespace cuesampler
 // only in RAM: closing a project (or reloading the same file) threw the stems
 // away and the user had to run the whole pass again. This stores each result
 // under a key derived from the audio it was computed from plus the identity of
-// the model that computed it, so reopening a project rehydrates the stems from
-// disk in well under a second.
+// the model that computed it. New projects also embed the container so their
+// recall does not depend on the lifetime of this optional disk cache.
 //
-// Entries are three FLAC streams in one container file, written atomically via
+// New entries contain three lossless 32-bit float WAV streams. Version-1 FLAC
+// entries remain readable for older projects. Files are written atomically via
 // a temp file + rename so a crash mid-write can never leave a half-entry that
 // later reads as valid. Everything here is blocking file I/O — call it from a
 // background thread, never the message or audio thread.
@@ -36,9 +37,9 @@ public:
     // entry, and a changed model invalidates every key it produced.
     //
     // The key must be PERSISTED (see the processor's "stemCacheKey" state
-    // property) rather than recomputed on restore: a project embeds its sample
-    // as 16-bit FLAC, so the buffer that comes back from a restore is a
-    // quantized version of the one that was separated and hashes differently.
+    // property) rather than recomputed when reopening legacy projects: their
+    // 16-bit embedded source hashes differently from the original float audio.
+    // New projects embed both source and stems losslessly.
     static juce::String makeKey (const juce::AudioBuffer<float>& buffer,
                                  double sampleRate,
                                  const juce::String& modelId);
@@ -62,6 +63,12 @@ public:
     // Decodes the entry for 'key'. Returns false on a miss, a truncated or
     // malformed container, or a version this build doesn't understand.
     static bool load (const juce::String& key, Entry& result);
+
+    // The same self-contained container is embedded in DAW state. Encoding and
+    // decoding happen on workers; saving only copies the already encoded data.
+    static bool encode (const Entry& entry, juce::MemoryBlock& result);
+    static bool decode (const juce::MemoryBlock& data, Entry& result);
+    static bool storeEncoded (const juce::String& key, const juce::MemoryBlock& data);
 
     // Encodes and writes the three stems under 'key', replacing any existing
     // entry. Touches the entry's modification time so prune() treats a re-store

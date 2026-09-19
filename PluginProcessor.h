@@ -14,6 +14,7 @@
 #include <bitset>
 #include <atomic>
 #include <memory>
+#include <functional>
 #include <mutex>
 #include <vector>
 
@@ -30,7 +31,7 @@ public:
         juce::String filePath;
         juce::String fileName;
         int leadingContentStartSample = 0;
-        juce::MemoryBlock serializedStateData;
+        juce::var serializedStateData; // shared immutable binary data; no audio copy per mute
     };
 
     enum class SampleLoadResult
@@ -52,10 +53,10 @@ public:
     {
         std::shared_ptr<LoadedSampleData> source;   // pristine original to subtract from
         juce::AudioBuffer<float> drums, bass, vocals; // source rate/length/channels
-        // Key this set is stored under in the on-disk StemCache. Persisted in the
-        // project state so reopening can rehydrate these stems instead of running
-        // another separation pass. Empty when the cache write failed.
+        // Optional disk-cache identity, retained for legacy projects and reuse.
+        // New project recall uses serializedStemData, even if cache writes fail.
         juce::String cacheKey;
+        juce::var serializedStemData; // worker-encoded float container for DAW saves
     };
 
     struct TempoAnalysisData
@@ -450,10 +451,14 @@ public:
     bool canUndoEdit() const noexcept;
     void undoLastEdit();
 
-    // Renders a chop to a 24-bit WAV in the OS temp directory with all parameters baked in.
-    // applySync stretches the audio to match the current DAW tempo when sync is enabled.
-    // Called from the message thread. Returns an invalid File on failure.
-    juce::File renderChopToTempWav (int chopId, bool applySync);
+    // Non-realtime export: capture controls once, then render on a dedicated worker.
+    // Floating-point WAV preserves source/stem peaks. Completion runs on the UI thread.
+    struct ChopExportRequest;
+    std::shared_ptr<const ChopExportRequest> captureChopExport (int chopId, bool applySync, const juce::File& directory = {});
+    bool isChopExportCurrent (const std::shared_ptr<const ChopExportRequest>&);
+    void renderChopExportAsync (std::shared_ptr<const ChopExportRequest>, std::function<void (juce::File)>);
+    void saveChopExportAsync (juce::File source, juce::File destination, std::function<void (bool)> completed);
+    juce::File renderChopToTempWav (int chopId, bool applySync, const juce::File& directory = {}); // synchronous non-realtime/test API
 
     juce::String loadedFileName;
     double sampleSampleRate = 0.0;
@@ -461,6 +466,7 @@ public:
     juce::ChangeBroadcaster editChangeBroadcaster;
 
 private:
+    static juce::File renderChopExport (const ChopExportRequest&);
     class TempoAnalysisJob;
     class DeferredSampleRestoreJob;
     class WarpRenderJob;
@@ -490,9 +496,11 @@ private:
     {
         bool hasExplicitSampleState = false;
         bool hasSavedSample = false;
+        bool hasSavedChopState = false;
         juce::String samplePath;
         juce::String sampleFileName;
-        juce::MemoryBlock embeddedSampleData;
+        juce::var embeddedSampleData;
+        juce::var embeddedStemData;
         std::shared_ptr<TempoEditState> editState;
         std::shared_ptr<TempoAnalysisData> analysis;
         std::shared_ptr<ChopState> chopState;
@@ -512,10 +520,8 @@ private:
         bool restoredMuteDrums = false;
         bool restoredMuteBass = false;
         bool restoredMuteVocals = false;
-        // StemCache key saved with the project. Non-empty means the session had
-        // stems; the restore tries to pull them back from disk under this exact
-        // key rather than re-deriving one (the restored buffer is decoded from
-        // the 16-bit embedded copy and would hash differently).
+        // Legacy fallback when embeddedStemData is absent. Do not re-hash an
+        // older project's quantized source to look up its original separation.
         juce::String restoredStemCacheKey;
         int restoredBarsPerChop = 1;
         int restoredMidiOctaveOffset = 0;
@@ -838,6 +844,13 @@ private:
     std::atomic<bool> tempoAnalysisInProgress { false };
     std::atomic<bool> keyDetectionInProgress { false };
 
+    friend struct CueSamplerStateTests;
+    // Serializes non-realtime state writers and their final publication checks.
+    // NEVER acquired by processBlock, MIDI handling, or voice rendering.
+    mutable std::recursive_mutex sampleStateMutex;
+    juce::ValueTree pendingRestoreState; // preserve host state during async decoding
+    std::shared_ptr<LoadedSampleData> stemSource; // guarded by sampleStateMutex
+
     // Stem-separation state. stemGeneration guards background separation jobs;
     // stemRemixGeneration coalesces rapid mute toggles. appliedStemMask is the
     // mute bitmask (drums=1|bass=2|vocals=4) currently baked into loadedSample,
@@ -935,14 +948,16 @@ private:
     // installed or the session failed to build.
     StemSeparator* ensureStemSeparatorLoaded();
     void publishStems (std::shared_ptr<const StemSet> newStemSet, uint64_t generation);
-    void rebuildActiveMix();
+    void rebuildActiveMix (uint64_t generation);
+    static std::shared_ptr<LoadedSampleData> createStemMix (const StemSet& stems, int muteMask);
     void scheduleRebuildActiveMix();
     void buildChopsFromAnalysis (const TempoAnalysisData& analysis);
     DeferredRestoreStateData parseDeferredRestoreState (const juce::ValueTree& state) const;
     void applyParsedRestoreState (const DeferredRestoreStateData& restoreState);
     void completeDeferredSampleRestore (const DeferredRestoreStateData& restoreState,
                                         std::shared_ptr<LoadedSampleData> restoredSample,
-                                        uint64_t completedRestoreGeneration);
+                                        uint64_t completedRestoreGeneration,
+                                        std::shared_ptr<const StemSet> restoredStems);
     bool serializeSampleToStateData (const LoadedSampleData& sampleData, juce::MemoryBlock& stateData) const;
     std::shared_ptr<LoadedSampleData> createLoadedSampleDataFromStateData (const juce::MemoryBlock& stateData,
                                                                            const juce::String& fileName);
@@ -971,6 +986,7 @@ private:
                           double blockStartHostPpq);
 
     // Thread pools moved to the end of the class so they are destroyed first.
+    juce::ThreadPool exportThreadPool { 1 };
     juce::ThreadPool restoreThreadPool { 1 };
     juce::ThreadPool analysisThreadPool { 1 };
     juce::ThreadPool warpRenderThreadPool { 1 };

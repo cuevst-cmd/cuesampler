@@ -19,9 +19,6 @@ namespace cuesampler
 // number that produced it. The audio thread reads via get(); the render
 // pipeline writes via store(). Stale generations are silently rejected.
 //
-// Step 3 implementation: synchronous render only, linear interpolation. Step 4
-// will swap renderChopSync's body to a Bungee-driven per-segment pipeline so
-// the cache contract stays the same while audio quality improves.
 class ChopAudioCache
 {
 public:
@@ -34,6 +31,7 @@ public:
         // audio thread can still use them; this flag lets the playback path
         // know it can fast-path back to reading the source buffer if needed.
         bool isIdentity = false;
+        bool usedFallback = false;
     };
 
     struct PreparedKey
@@ -73,6 +71,7 @@ public:
         std::shared_ptr<const juce::AudioBuffer<float>> buffer;
         int cueFrame = 0;
         bool renderedWithBungee = false;
+        bool usedFallback = false;
     };
 
     ChopAudioCache() = default;
@@ -99,10 +98,9 @@ public:
     void clear();
     void clearPrepared();
 
-    // Synchronous render. Builds a WarpMap, allocates a target AudioBuffer,
-    // fills it via renderWarpedChopLinear, and returns an Entry ready to
-    // store. Generation is provided by the caller so it stays consistent
-    // with whatever marker-edit counter the caller manages.
+    // Non-realtime render through Bungee. Exports disable the interpolation
+    // fallback so a failed pitch-preserving render cannot silently change pitch.
+    // Generation is provided by playback-cache callers; exports never publish.
     static std::shared_ptr<Entry> renderChopSync (
         const juce::AudioBuffer<float>& source,
         double sampleRate,
@@ -110,7 +108,8 @@ public:
         int chopStartSample,
         int chopEndSample,
         const std::vector<ChopWarpMarker>& markers,
-        std::uint64_t generation);
+        std::uint64_t generation,
+        bool allowFallback = true);
 
     static PreparedKey makePreparedKey (
         int chopStartSample,
@@ -133,7 +132,8 @@ public:
         const std::vector<ChopWarpMarker>& markers,
         float pitchSemitones,
         float stretchRatio,
-        std::uint64_t generation);
+        std::uint64_t generation,
+        bool allowFallback = true);
 
 private:
     struct Snapshot

@@ -368,7 +368,22 @@ juce::AudioBuffer<float> StemSeparator::resample (const juce::AudioBuffer<float>
     {
         juce::LagrangeInterpolator interp;
         interp.reset();
-        interp.process (ratio, src.getReadPointer (ch), out.getWritePointer (ch), numOut);
+        // Lagrange has two INPUT frames of history delay. Advance exactly that
+        // much at unity before changing rates, so output frame zero maps to
+        // input frame zero even at a fractional conversion ratio. Compensating
+        // both passes keeps stems aligned with the original for subtraction.
+        constexpr int latency = (int) juce::LagrangeInterpolator::getBaseLatency();
+        float discarded[latency] {};
+        const auto* input = src.getReadPointer (ch);
+        const int consumed = interp.process (1.0, input, discarded, latency, numIn, 0);
+        // ceil(numIn / ratio) and flushing the history can require padding.
+        // The bounded overload feeds zeros instead of reading past the buffer.
+        const float zero = 0.0f;
+        const int remaining = numIn - consumed;
+        // JUCE's bounded overload still reads its first input when availability
+        // is zero; supply one real zero in that case (e.g. a one-frame source).
+        interp.process (ratio, remaining > 0 ? input + consumed : &zero,
+                        out.getWritePointer (ch), numOut, juce::jmax (1, remaining), 0);
     }
     return out;
 }

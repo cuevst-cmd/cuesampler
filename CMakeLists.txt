@@ -401,6 +401,7 @@ endif() # APPLE / WIN32 — platform-specific bundling
 #   ./build/test_stem_cache_artefacts/test_stem_cache
 option(CUE_BUILD_STEM_CACHE_TEST "Build the offline StemCache test" OFF)
 if(CUE_BUILD_STEM_CACHE_TEST)
+    enable_testing()
     juce_add_console_app(test_stem_cache PRODUCT_NAME "test_stem_cache")
     set_target_properties(test_stem_cache PROPERTIES EXCLUDE_FROM_ALL TRUE)
     target_sources(test_stem_cache PRIVATE
@@ -417,6 +418,26 @@ if(CUE_BUILD_STEM_CACHE_TEST)
         juce::juce_cryptography
         juce::juce_core
         juce::juce_recommended_config_flags)
+    add_test(NAME stem_cache COMMAND test_stem_cache "${CMAKE_CURRENT_BINARY_DIR}")
+endif()
+
+option(CUE_BUILD_STATE_TEST "Build DAW state and chop regression tests" OFF)
+if(CUE_BUILD_STATE_TEST)
+    enable_testing()
+    juce_add_console_app(test_project_restore PRODUCT_NAME "test_project_restore")
+    set_target_properties(test_project_restore PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    target_sources(test_project_restore PRIVATE tools/test_project_restore.cpp)
+    target_include_directories(test_project_restore PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${JUCE_MODULES_DIR}")
+    target_compile_definitions(test_project_restore PRIVATE JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED=1 JUCE_STANDALONE_APPLICATION=1)
+    target_link_libraries(test_project_restore PRIVATE CueSampler)
+    if(APPLE)
+        set_target_properties(test_project_restore PROPERTIES BUILD_RPATH "${ONNXRUNTIME_ROOT}/lib")
+    elseif(WIN32)
+        add_custom_command(TARGET test_project_restore POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ORT_RUNTIME_DLL}" "$<TARGET_FILE_DIR:test_project_restore>/onnxruntime.dll"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DIRECTML_DLL}" "$<TARGET_FILE_DIR:test_project_restore>/DirectML.dll")
+    endif()
+    add_test(NAME project_restore COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}")
 endif()
 
 # ── Optional offline StemSeparator test ───────────────────────────────────────

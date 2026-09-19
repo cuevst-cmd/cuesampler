@@ -88,10 +88,9 @@ namespace
 constexpr double tempoAnalysisTargetRate = 200.0;
 constexpr double maximumTempoAnalysisSeconds = 120.0;
 constexpr int maximumLoadedChannels = 2;
-constexpr size_t maximumEmbeddedSampleBytes = 128ull * 1024ull * 1024ull;
+// Host state APIs use a signed int byte count. Validate decoded shapes too.
+constexpr size_t maximumEmbeddedSampleBytes = (size_t) std::numeric_limits<int>::max();
 constexpr int maximumRestoredSequenceItems = 4096;
-constexpr int maximumRestoredChops = 256;
-constexpr int maximumRestoredWarpMarkersPerChop = 64;
 constexpr double representativeTempoWindowSeconds = 24.0;
 constexpr double representativeWindowStepSeconds = 4.0;
 constexpr double leadingSilenceWindowSeconds = 0.01;
@@ -1825,26 +1824,29 @@ public:
         auto set = std::make_shared<StemSet>();
         set->source = sampleData;             // pristine original (shared, not copied)
 
-        // Persist the result so this sample never has to be separated again —
-        // neither on the next project open nor the next time the file is loaded.
-        // Hashing + FLAC encoding run here on the stem thread, after the user
-        // already has their stems; a failed write just costs a future pass.
-        //
-        // The stems are moved through the cache Entry and on into the StemSet
-        // rather than copied into each: at a few tens of MB per stem, copying
-        // them twice is a RAM spike worth not taking.
+        // Prepare the portable project payload before publishing READY. Encoding
+        // and cache I/O stay on this worker; saving never runs a codec or reads
+        // the cache. A disk write failure does not affect project persistence.
         cuesampler::StemCache::Entry entry;
         entry.sampleRate = sampleData->sampleRate;
         entry.drums      = std::move (result.drums);
         entry.bass       = std::move (result.bass);
         entry.vocals     = std::move (result.vocals);
 
+        juce::MemoryBlock encoded;
+        if (! cuesampler::StemCache::encode (entry, encoded) || stale())
+        {
+            if (! stale()) owner.publishStems (nullptr, generation);
+            return jobHasFinished;
+        }
+        set->serializedStemData = juce::var (encoded);
+
         set->cacheKey = cuesampler::StemCache::makeKey (sampleData->buffer,
                                                         sampleData->sampleRate,
                                                         owner.stemModelId);
         if (set->cacheKey.isNotEmpty())
         {
-            if (cuesampler::StemCache::store (set->cacheKey, entry))
+            if (cuesampler::StemCache::storeEncoded (set->cacheKey, encoded))
             {
                 cuesampler::StemCache::prune();
             }
@@ -1860,7 +1862,8 @@ public:
         set->bass   = std::move (entry.bass);
         set->vocals = std::move (entry.vocals);
 
-        owner.publishStems (std::move (set), generation);
+        if (! stale())
+            owner.publishStems (std::move (set), generation);
         return jobHasFinished;
     }
 
@@ -1920,10 +1923,14 @@ public:
             return jobHasFinished;
         }
 
+        if (shouldExit() || generation != owner.stemGeneration.load (std::memory_order_acquire))
+            return jobHasFinished;
+
         // The cached stems are subtracted sample-for-sample from this buffer, so
         // anything but an exact shape match is a stale entry (the source file
         // changed under a saved key, say) and must be treated as a miss.
-        if (entry.drums.getNumChannels() != sampleData->buffer.getNumChannels()
+        if (entry.sampleRate != sampleData->sampleRate
+            || entry.drums.getNumChannels() != sampleData->buffer.getNumChannels()
             || entry.drums.getNumSamples() != sampleData->buffer.getNumSamples())
         {
             juce::Logger::writeToLog ("StemCache: entry for " + sampleData->fileName
@@ -1932,7 +1939,11 @@ public:
             return jobHasFinished;
         }
 
+        juce::MemoryBlock encoded;
+        if (! cuesampler::StemCache::encode (entry, encoded) || shouldExit())
+            return jobHasFinished;
         auto set = std::make_shared<StemSet>();
+        set->serializedStemData = juce::var (encoded);
         set->source   = sampleData;
         set->drums    = std::move (entry.drums);
         set->bass     = std::move (entry.bass);
@@ -1963,7 +1974,7 @@ public:
     {
         if (shouldExit() || generation != owner.stemRemixGeneration.load (std::memory_order_acquire))
             return jobHasFinished;
-        owner.rebuildActiveMix();
+        owner.rebuildActiveMix (generation);
         return jobHasFinished;
     }
 
@@ -1991,9 +2002,9 @@ public:
             return jobHasFinished;
 
         auto restoredSample = std::shared_ptr<LoadedSampleData> {};
-        if (restoreState.hasSavedSample && restoreState.embeddedSampleData.getSize() > 0)
-            restoredSample = owner.createLoadedSampleDataFromStateData (restoreState.embeddedSampleData,
-                                                                        restoreState.sampleFileName);
+        if (const auto* data = restoreState.embeddedSampleData.getBinaryData();
+            restoreState.hasSavedSample && data != nullptr)
+            restoredSample = owner.createLoadedSampleDataFromStateData (*data, restoreState.sampleFileName);
 
         if (restoredSample == nullptr && restoreState.samplePath.isNotEmpty())
             restoredSample = owner.createLoadedSampleDataFromFile (juce::File (restoreState.samplePath));
@@ -2001,7 +2012,38 @@ public:
         if (shouldExit())
             return jobHasFinished;
 
-        owner.completeDeferredSampleRestore (restoreState, std::move (restoredSample), generation);
+        std::shared_ptr<StemSet> restoredStems;
+        cuesampler::StemCache::Entry entry;
+        const auto* embeddedStems = restoreState.embeddedStemData.getBinaryData();
+        const bool decoded = embeddedStems != nullptr
+            ? cuesampler::StemCache::decode (*embeddedStems, entry)
+            : (restoreState.restoredStemCacheKey.isNotEmpty()
+               && cuesampler::StemCache::load (restoreState.restoredStemCacheKey, entry));
+        if (shouldExit() || generation != owner.restoreGeneration.load (std::memory_order_acquire))
+            return jobHasFinished;
+        if (decoded && restoredSample != nullptr
+            && entry.sampleRate == restoredSample->sampleRate
+            && entry.drums.getNumChannels() == restoredSample->buffer.getNumChannels()
+            && entry.drums.getNumSamples() == restoredSample->buffer.getNumSamples())
+        {
+            restoredStems = std::make_shared<StemSet>();
+            restoredStems->source = restoredSample;
+            restoredStems->cacheKey = restoreState.restoredStemCacheKey;
+            if (embeddedStems != nullptr)
+                restoredStems->serializedStemData = restoreState.embeddedStemData;
+            else
+            {
+                juce::MemoryBlock encoded;
+                if (cuesampler::StemCache::encode (entry, encoded))
+                    restoredStems->serializedStemData = juce::var (encoded);
+            }
+            restoredStems->drums = std::move (entry.drums);
+            restoredStems->bass = std::move (entry.bass);
+            restoredStems->vocals = std::move (entry.vocals);
+        }
+        if (! shouldExit())
+            owner.completeDeferredSampleRestore (restoreState, std::move (restoredSample), generation,
+                                                  std::move (restoredStems));
         return jobHasFinished;
     }
 
@@ -2152,7 +2194,10 @@ public:
             targetChop->warpMarkers,
             generation);
 
-        if (! shouldExit() && entry != nullptr)
+        // Coordinate the final check/store with sample replacement. Otherwise
+        // a just-finished render could repopulate a cache that restore cleared.
+        const std::lock_guard<std::recursive_mutex> lock (processor.sampleStateMutex);
+        if (! shouldExit() && entry != nullptr && processor.getLoadedSample().get() == sample.get())
             cache.store (entry);
 
         return jobHasFinished;
@@ -2245,7 +2290,9 @@ public:
                 chop.startSample, chop.endSample, chop.cueOffsetSamples,
                 chop.warpMarkers, effPitch, stretchRatio, generation);
 
+            const std::lock_guard<std::recursive_mutex> lock (processor.sampleStateMutex);
             if (entry != nullptr && entry->buffer != nullptr
+                && processor.getLoadedSample().get() == sample.get()
                 && entry->buffer->getNumSamples() > 0
                 && ! shouldExit()
                 && processor.prepareWarmGeneration.load (std::memory_order_acquire) == generation)
@@ -2448,6 +2495,7 @@ AudioPluginAudioProcessor::~AudioPluginAudioProcessor()
     keyDetectionThreadPool.removeAllJobs (true, -1);
     prepareRenderThreadPool.removeAllJobs (true, -1);
     stemThreadPool.removeAllJobs (true, -1);
+    exportThreadPool.removeAllJobs (true, -1);
 }
 
 
@@ -2770,6 +2818,7 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         else if (pendingCommand == TransportCommand::silence)
         {
             v.reset();
+            v.playbackSamplePosition = playbackSamplePosition.load (std::memory_order_acquire);
             playbackActive.store (false, std::memory_order_release);
         }
         else if (pendingCommand == TransportCommand::seek)
@@ -3786,8 +3835,16 @@ juce::AudioProcessorEditor* AudioPluginAudioProcessor::createEditor()
 //==============================================================================
 void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
+    if (pendingRestoreState.isValid())
+    {
+        juce::MemoryOutputStream output (destData, false);
+        output.write (cueSamplerStateMagic, 4);
+        pendingRestoreState.writeToStream (output);
+        return;
+    }
     juce::ValueTree state ("CueSamplerState");
-    state.setProperty ("version", 6, nullptr); // 6 adds stemCacheKey
+    state.setProperty ("version", 7, nullptr); // self-contained float source + stems
     state.setProperty ("gridBpmTrim", (double) gridBpmTrim.load (std::memory_order_acquire), nullptr);
     state.setProperty ("gridStartOffset", (double) gridStartOffset.load (std::memory_order_acquire), nullptr);
     state.setProperty ("waveformZoom", (double) waveformZoom.load (std::memory_order_acquire), nullptr);
@@ -3801,15 +3858,12 @@ void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData
     state.setProperty ("muteBass", muteBass.load (std::memory_order_acquire), nullptr);
     state.setProperty ("muteVocals", muteVocals.load (std::memory_order_acquire), nullptr);
 
-    // Stem AUDIO is not embedded (three more FLAC streams would multiply project
-    // size against the 128 MB embed cap). Instead the separation lives in the
-    // on-disk StemCache and the project carries only its key, so reopening
-    // rehydrates the stems in well under a second. A key that is no longer in the
-    // cache just falls back to offering SEPARATE again.
-    if (const auto stems = std::atomic_load (&stemSet);
-        stems != nullptr && stems->cacheKey.isNotEmpty())
+    // Audio has already been encoded on the loading/separation worker. Cache
+    // eviction, a missing model, or a different machine cannot change recall.
+    if (const auto stems = std::atomic_load (&stemSet); stems != nullptr)
     {
         state.setProperty ("stemCacheKey", stems->cacheKey, nullptr);
+        state.setProperty ("embeddedStemData", stems->serializedStemData, nullptr);
     }
     state.setProperty ("chopBarsCount", chopBarsCount.load (std::memory_order_acquire), nullptr);
     state.setProperty ("midiOctaveOffset", midiOctaveOffset.load (std::memory_order_acquire), nullptr);
@@ -3823,7 +3877,7 @@ void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData
         state.setProperty ("samplePath", currentSample->filePath, nullptr);
         state.setProperty ("sampleFileName", currentSample->fileName, nullptr);
 
-        if (currentSample->serializedStateData.getSize() > 0)
+        if (currentSample->serializedStateData.getBinaryData() != nullptr)
             state.setProperty ("embeddedSampleData", currentSample->serializedStateData, nullptr);
     }
 
@@ -3947,11 +4001,18 @@ void AudioPluginAudioProcessor::setStateInformation (const void* data, int sizeI
     if (! restoreState.hasExplicitSampleState)
         return;
 
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
+    pendingRestoreState = state;
+    resetStemState();
     const auto restoreStateGeneration = restoreGeneration.fetch_add (1, std::memory_order_acq_rel) + 1;
 
     restoreThreadPool.removeAllJobs (false, 0);
     analysisThreadPool.removeAllJobs (false, 0);
-    chopAudioCache.clearPrepared();
+    warpRenderThreadPool.removeAllJobs (false, 0);
+    prepareRenderThreadPool.removeAllJobs (false, 0);
+    warpRenderGeneration.fetch_add (1, std::memory_order_acq_rel);
+    prepareWarmGeneration.fetch_add (1, std::memory_order_acq_rel);
+    chopAudioCache.clear();
     tempoAnalysisGeneration.fetch_add (1, std::memory_order_acq_rel);
     tempoAnalysisInProgress.store (false, std::memory_order_release);
 
@@ -3960,11 +4021,12 @@ void AudioPluginAudioProcessor::setStateInformation (const void* data, int sizeI
     sampleChangeBroadcaster.sendChangeMessage();
     notifyEditStateChanged();
 
-    if (restoreState.hasSavedSample && (restoreState.embeddedSampleData.getSize() > 0 || restoreState.samplePath.isNotEmpty()))
+    if (restoreState.hasSavedSample && (restoreState.embeddedSampleData.getBinaryData() != nullptr || restoreState.samplePath.isNotEmpty()))
     {
         restoreThreadPool.addJob (new DeferredSampleRestoreJob (*this, restoreState, restoreStateGeneration), true);
         return;
     }
+    pendingRestoreState = {};
 }
 
 AudioPluginAudioProcessor::DeferredRestoreStateData
@@ -3980,8 +4042,10 @@ AudioPluginAudioProcessor::parseDeferredRestoreState (const juce::ValueTree& sta
     if (const auto* embeddedSampleData = state.getProperty ("embeddedSampleData").getBinaryData())
     {
         if (embeddedSampleData->getSize() <= maximumEmbeddedSampleBytes)
-            restoreState.embeddedSampleData = *embeddedSampleData;
+            restoreState.embeddedSampleData = state.getProperty ("embeddedSampleData");
     }
+
+    restoreState.embeddedStemData = state.getProperty ("embeddedStemData");
 
     restoreState.editState = std::make_shared<TempoEditState>();
     if (const auto editStateTree = state.getChildWithName ("TempoEditState"); editStateTree.isValid())
@@ -4008,7 +4072,10 @@ AudioPluginAudioProcessor::parseDeferredRestoreState (const juce::ValueTree& sta
             restoreState.analysis = std::move (analysis);
     }
 
+    restoreState.hasSavedChopState = state.getChildWithName ("ChopState").isValid();
     restoreState.chopState = std::make_shared<ChopState>();
+    // The already decoded ValueTree bounds these lists. Do not impose a lower
+    // restore-only cap than editing allows: it silently discards saved work.
     // Shared by both chop layers so the live and stashed sets are parsed and
     // validated identically.
     const auto parseChopStateTree = [] (const juce::ValueTree& chopStateTree, ChopState& target)
@@ -4023,9 +4090,6 @@ AudioPluginAudioProcessor::parseDeferredRestoreState (const juce::ValueTree& sta
 
         for (const auto chopTree : chopStateTree)
         {
-            if ((int) target.chops.size() >= maximumRestoredChops)
-                break;
-
             if (! chopTree.hasType ("Chop"))
                 continue;
 
@@ -4053,9 +4117,6 @@ AudioPluginAudioProcessor::parseDeferredRestoreState (const juce::ValueTree& sta
 
             for (const auto markerTree : chopTree)
             {
-                if ((int) chop.warpMarkers.size() >= maximumRestoredWarpMarkersPerChop)
-                    break;
-
                 if (! markerTree.hasType ("WarpMarker"))
                     continue;
 
@@ -4161,6 +4222,8 @@ void AudioPluginAudioProcessor::applyParsedRestoreState (const DeferredRestoreSt
                                            ? std::make_shared<TempoAnalysisData> (*restoreState.analysis)
                                            : std::shared_ptr<TempoAnalysisData> {});
     publishChopState (std::make_shared<ChopState> ());
+    std::atomic_store (&stashedChopState, std::make_shared<ChopState>());
+    manualChopModeActive.store (restoreState.restoredManualChopMode, std::memory_order_release);
 
     loadedFileName = restoreState.sampleFileName.isNotEmpty()
         ? restoreState.sampleFileName
@@ -4177,12 +4240,8 @@ void AudioPluginAudioProcessor::applyParsedRestoreState (const DeferredRestoreSt
     halfTimeEnabled.store (restoreState.restoredHalfTime, std::memory_order_release);
     chopPlaybackMode.store ((int) restoreState.restoredChopPlaybackMode, std::memory_order_release);
 
-    // Restore the mute flags and clear stem state. Stem audio is not embedded in
-    // the project; completeDeferredSampleRestore tries to pull it back from the
-    // on-disk StemCache once the sample itself is loaded, and these mutes are
-    // applied by publishStems if that succeeds. On a cache miss the flags stay
-    // set but nothing is muted — hasPendingStemMutes() is what the UI shows for
-    // that state instead of pretending the mutes are live.
+    // Keep the saved mute intent while the worker decodes both source and stems.
+    // It publishes the finished mix together; no unmuted source is exposed first.
     muteDrums.store (restoreState.restoredMuteDrums, std::memory_order_release);
     muteBass.store (restoreState.restoredMuteBass, std::memory_order_release);
     muteVocals.store (restoreState.restoredMuteVocals, std::memory_order_release);
@@ -4191,6 +4250,10 @@ void AudioPluginAudioProcessor::applyParsedRestoreState (const DeferredRestoreSt
     stemSeparationInProgress.store (false, std::memory_order_release);
     stemProgress.store (0.0f, std::memory_order_release);
     appliedStemMask.store (-1, std::memory_order_release);
+    const bool restoringStems = restoreState.embeddedStemData.getBinaryData() != nullptr
+                            || restoreState.restoredStemCacheKey.isNotEmpty();
+    stemCacheLookupInProgress.store (restoringStems, std::memory_order_release);
+    stemCacheLookupExpected.store (restoringStems, std::memory_order_release);
 
     chopBarsCount.store ((restoreState.restoredBarsPerChop <= 1) ? 1
                                                                  : (restoreState.restoredBarsPerChop <= 2) ? 2
@@ -4216,13 +4279,17 @@ void AudioPluginAudioProcessor::applyParsedRestoreState (const DeferredRestoreSt
 
 void AudioPluginAudioProcessor::completeDeferredSampleRestore (const DeferredRestoreStateData& restoreState,
                                                                std::shared_ptr<LoadedSampleData> restoredSample,
-                                                               uint64_t completedRestoreGeneration)
+                                                               uint64_t completedRestoreGeneration,
+                                                               std::shared_ptr<const StemSet> restoredStems)
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     if (completedRestoreGeneration != restoreGeneration.load (std::memory_order_acquire))
         return;
 
     if (restoredSample == nullptr)
     {
+        stemCacheLookupInProgress.store (false, std::memory_order_release);
+        stemCacheLookupExpected.store (false, std::memory_order_release);
         touchTempoUiRevision();
         sampleChangeBroadcaster.sendChangeMessage();
         notifyEditStateChanged();
@@ -4324,7 +4391,18 @@ void AudioPluginAudioProcessor::completeDeferredSampleRestore (const DeferredRes
                               juce::jmax (1, getTotalNumOutputChannels()));
 
     pendingTransportCommand.store ((int) TransportCommand::silence, std::memory_order_release);
-    std::atomic_store (&loadedSample, restoredSample);
+    // Build the saved mix before making any sample audible. Audio callbacks
+    // see silence during decoding, then the correct mix (never an unmuted flash).
+    const int restoredMask = (muteDrums.load() ? 1 : 0) | (muteBass.load() ? 2 : 0) | (muteVocals.load() ? 4 : 0);
+    auto restoredMix = restoredStems != nullptr ? createStemMix (*restoredStems, restoredMask) : restoredSample;
+    stemSource = restoredSample;
+    std::atomic_store (&stemSet, restoredStems);
+    appliedStemMask.store (restoredStems != nullptr ? restoredMask : -1, std::memory_order_release);
+    stemsReady.store (restoredStems != nullptr, std::memory_order_release);
+    stemProgress.store (restoredStems != nullptr ? 1.0f : 0.0f, std::memory_order_release);
+    stemCacheLookupInProgress.store (false, std::memory_order_release);
+    stemCacheLookupExpected.store (false, std::memory_order_release);
+    std::atomic_store (&loadedSample, restoredMix);
     std::atomic_store (&tempoEditState, restoredEditState);
     std::atomic_store (&tempoAnalysis, restoredAnalysis);
     publishChopState (restoredChopState);
@@ -4343,11 +4421,7 @@ void AudioPluginAudioProcessor::completeDeferredSampleRestore (const DeferredRes
     sampleSampleRate = restoredSample->sampleRate;
 
     const auto maxPlaybackPosition = juce::jmax (0.0, (double) restoredSample->buffer.getNumSamples() - 1.0);
-    const auto fallbackStartSample = (double) juce::jlimit (0,
-                                                            juce::jmax (0, totalSamples - 1),
-                                                            restoredSample->leadingContentStartSample);
-    const auto restoredPlaybackPosition = juce::jlimit (0.0, maxPlaybackPosition, restoreState.restoredPlaybackPosition);
-    playbackSamplePosition.store (restoredPlaybackPosition > 0.0 ? restoredPlaybackPosition : fallbackStartSample,
+    playbackSamplePosition.store (juce::jlimit (0.0, maxPlaybackPosition, restoreState.restoredPlaybackPosition),
                                   std::memory_order_release);
     playbackActive.store (false, std::memory_order_release);
 
@@ -4361,7 +4435,7 @@ void AudioPluginAudioProcessor::completeDeferredSampleRestore (const DeferredRes
         timeStretchRatio.store (1.0f, std::memory_order_release);
     }
 
-    if (restoredAnalysis != nullptr && restoredChopState->chops.empty())
+    if (restoredAnalysis != nullptr && ! restoreState.hasSavedChopState)
         buildChopsFromAnalysis (*restoredAnalysis);
 
     if (restoredAnalysis == nullptr)
@@ -4369,15 +4443,7 @@ void AudioPluginAudioProcessor::completeDeferredSampleRestore (const DeferredRes
     else
         touchTempoUiRevision();
 
-    // Stem audio is not serialized into the project, but the separation it came
-    // from is on disk under the key we saved. Pull it back rather than making the
-    // user sit through another pass; the restored mute flags then apply on
-    // publish. A miss (cache pruned, different machine, changed model) leaves
-    // stem state idle with the STEMS button offered.
-    if (restoreState.restoredStemCacheKey.isNotEmpty())
-        launchStemCacheLookup (restoredSample, restoreState.restoredStemCacheKey);
-    else
-        resetStemState();
+    pendingRestoreState = {};
 
     // Restored chops may carry warp markers — re-bake those entries.
     if (const auto restoredState = std::atomic_load (&chopState); restoredState != nullptr)
@@ -4430,7 +4496,10 @@ AudioPluginAudioProcessor::createLoadedSampleDataFromFile (const juce::File& fil
     sampleData->fileName = file.getFileNameWithoutExtension();
     sampleData->leadingContentStartSample = findLeadingContentStartSample (*sampleData, 0,
                                                                            sampleData->buffer.getNumSamples());
-    serializeSampleToStateData (*sampleData, sampleData->serializedStateData);
+    juce::MemoryBlock encoded;
+    if (! serializeSampleToStateData (*sampleData, encoded))
+        return {};
+    sampleData->serializedStateData = juce::var (encoded);
 
     if (loadResult != nullptr)
         *loadResult = SampleLoadResult::loaded;
@@ -4485,7 +4554,8 @@ bool AudioPluginAudioProcessor::serializeSampleToStateData (const LoadedSampleDa
         const auto options = juce::AudioFormatWriterOptions()
                                  .withSampleRate (sampleData.sampleRate)
                                  .withNumChannels (numChannels)
-                                 .withBitsPerSample (bitsPerSample);
+                                 .withBitsPerSample (bitsPerSample)
+                                 .withSampleFormat (juce::AudioFormatWriterOptions::SampleFormat::floatingPoint);
 
         auto writer = format.createWriterFor (stream, options);
         if (writer == nullptr)
@@ -4503,12 +4573,8 @@ bool AudioPluginAudioProcessor::serializeSampleToStateData (const LoadedSampleDa
         return true;
     };
 
-    juce::FlacAudioFormat flacFormat;
-    if (serializeWithFormat (flacFormat, 16))
-        return true;
-
     juce::WavAudioFormat wavFormat;
-    return serializeWithFormat (wavFormat, 16);
+    return serializeWithFormat (wavFormat, 32);
 }
 
 std::shared_ptr<AudioPluginAudioProcessor::LoadedSampleData>
@@ -4533,7 +4599,7 @@ AudioPluginAudioProcessor::createLoadedSampleDataFromStateData (const juce::Memo
     sampleData->fileName = fileName.isNotEmpty() ? fileName : "Embedded Sample";
     sampleData->leadingContentStartSample = findLeadingContentStartSample (*sampleData, 0,
                                                                            sampleData->buffer.getNumSamples());
-    sampleData->serializedStateData = stateData;
+    sampleData->serializedStateData = juce::var (stateData);
     return sampleData;
 }
 
@@ -4545,6 +4611,9 @@ AudioPluginAudioProcessor::loadAudioFile (const juce::File& file)
     if (sampleData == nullptr)
         return loadResult;
 
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
+    resetStemState();
+    pendingRestoreState = {};
     restoreGeneration.fetch_add (1, std::memory_order_acq_rel);
     restoreThreadPool.removeAllJobs (false, 0);
 
@@ -4629,398 +4698,181 @@ std::shared_ptr<const AudioPluginAudioProcessor::ChopState> AudioPluginAudioProc
     return std::atomic_load (&chopState);
 }
 
-juce::File AudioPluginAudioProcessor::renderChopToTempWav (int chopId, bool applySync)
+// Immutable export settings captured before dispatch. Workers never query mutable
+// controls, publish to playback caches, or touch the processor after dispatch.
+struct AudioPluginAudioProcessor::ChopExportRequest
 {
-    const auto sampleData   = getLoadedSample();
-    const auto chopSnapshot = getChopState();
+    std::shared_ptr<const LoadedSampleData> sample;
+    std::shared_ptr<const LoadedSampleData> mixedSample;
+    std::shared_ptr<const StemSet> stems;
+    std::shared_ptr<const ChopState> chops;
+    std::shared_ptr<const cuesampler::ChopAudioCache::PreparedEntry> prepared;
+    ChopDefinition chop;
+    juce::File directory;
+    int muteMask = 0;
+    double outputRate = 44100.0;
+    float pitch = 0.0f, stretch = 1.0f, gainDecibels = 0.0f;
+};
 
-    if (sampleData == nullptr || sampleData->buffer.getNumSamples() == 0)
+std::shared_ptr<const AudioPluginAudioProcessor::ChopExportRequest>
+AudioPluginAudioProcessor::captureChopExport (int chopId, bool applySync, const juce::File& directory)
+{
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
+    auto request = std::make_shared<ChopExportRequest>();
+    request->directory = directory;
+    request->sample = getLoadedSample();
+    request->chops = getChopState();
+    if (pendingRestoreState.isValid() || request->sample == nullptr || request->chops == nullptr)
         return {};
-    if (chopSnapshot == nullptr)
+    const auto& chops = request->chops->chops;
+    const auto found = std::find_if (chops.begin(), chops.end(),
+                                    [chopId] (const auto& c) { return c.id == chopId; });
+    if (found == chops.end() || request->sample->buffer.getNumSamples() <= 0)
         return {};
-
-    const ChopDefinition* chop = nullptr;
-    for (const auto& c : chopSnapshot->chops)
-    {
-        if (c.id == chopId)
-        {
-            chop = &c;
-            break;
-        }
-    }
-    if (chop == nullptr)
+    request->chop = *found;
+    request->muteMask = (muteDrums.load() ? 1 : 0) | (muteBass.load() ? 2 : 0) | (muteVocals.load() ? 4 : 0);
+    request->stems = std::atomic_load (&stemSet);
+    // Never silently export the original while the requested stems are unavailable.
+    if (request->muteMask != 0 && request->stems == nullptr)
         return {};
-
-    const auto sourceRate      = juce::jmax (1.0, sampleData->sampleRate);
-    const auto currentHostRate = juce::jmax (1.0, hostSampleRate.load (std::memory_order_acquire));
-    const auto numChannels     = sampleData->buffer.getNumChannels();
-
-    // Step 12: warped chops export through the warp cache so the WAV reflects
-    // the baked warp. If the chop has markers, we synchronously render a fresh
-    // cache entry so the export uses the latest marker state (the async cache
-    // might be stale if marker edits just happened). For unwarped chops we
-    // continue reading from the source buffer with no allocation.
-    std::shared_ptr<cuesampler::ChopAudioCache::Entry> exportRenderHold;
-    const juce::AudioBuffer<float>* effectiveBuffer = &sampleData->buffer;
-    int effectiveSourceLength = sampleData->buffer.getNumSamples();
-
-    if (! chop->warpMarkers.empty())
-    {
-        auto baked = cuesampler::ChopAudioCache::renderChopSync (
-            sampleData->buffer,
-            sourceRate,
-            chopId,
-            chop->startSample,
-            chop->endSample,
-            chop->warpMarkers,
-            warpRenderGeneration.fetch_add (1, std::memory_order_acq_rel) + 1);
-
-        if (baked != nullptr
-            && baked->warpedBuffer != nullptr
-            && baked->warpedBuffer->getNumSamples() > 0)
-        {
-            exportRenderHold = std::move (baked);
-            effectiveBuffer = exportRenderHold->warpedBuffer.get();
-            effectiveSourceLength = effectiveBuffer->getNumSamples();
-            // Keep the cache hot for the audio thread too.
-            chopAudioCache.store (exportRenderHold);
-        }
-    }
-
-    const auto sourceLength    = effectiveSourceLength;
-
-    const float chopGainLinear = juce::Decibels::decibelsToGain (chop->gainDecibels);
-
-    const float globalSemitones  = pitchSemitones.load (std::memory_order_acquire);
-    const float effectiveSemitones = juce::jlimit (-24.0f, 24.0f,
-                                                    globalSemitones + chop->pitchSemitones);
-    const double pitchFactor = std::pow (2.0, (double) effectiveSemitones / 12.0);
-
-    // Warped chops first bake their marker-defined local timing into
-    // effectiveBuffer, then run through the same global stretch controls as
-    // live playback so exported files still match the DAW tempo.
-    const bool isWarped = (exportRenderHold != nullptr);
-
+    request->outputRate = hostSampleRate.load();
+    if (request->outputRate <= 0.0)
+        request->outputRate = request->sample->sampleRate;
+    request->pitch = juce::jlimit (-24.0f, 24.0f, pitchSemitones.load() + found->pitchSemitones);
+    request->gainDecibels = globalGainDecibels.load();
     if (applySync)
     {
+        request->stretch = juce::jlimit (0.25f, 4.0f, timeStretchRatio.load());
         const auto analysis = std::atomic_load (&tempoAnalysis);
+        const auto bpm = hostBpm.load();
         if (analysis != nullptr)
-            updateHostSyncStretchRatio (*analysis, hostBpm.load (std::memory_order_acquire));
+        {
+            const auto sourceBpm = getAdjustedAnalysisBpm (*analysis);
+            request->stretch = (bpm > 0.0 && sourceBpm > 0.0)
+                ? juce::jlimit (0.25f, 4.0f, (float) (sourceBpm / bpm)) : 1.0f;
+        }
     }
-
-    auto stretchRatio = applySync
-        ? juce::jlimit (0.25f, 4.0f, timeStretchRatio.load (std::memory_order_acquire))
-        : 1.0f;
-
-    // For warped chops the effective buffer IS the chop's slot in clip-local
-    // time, so we must translate the cue point from source-time to local-time.
-    int cueStart = 0;
-    int chopEnd  = 0;
-    if (isWarped)
+    if (halfTimeEnabled.load())
+        request->stretch = juce::jlimit (0.25f, 4.0f, request->stretch * 2.0f);
+    const auto key = cuesampler::ChopAudioCache::makePreparedKey (
+        found->startSample, found->endSample, found->cueOffsetSamples, found->warpMarkers,
+        request->sample->sampleRate, request->outputRate, request->pitch, request->stretch);
+    if (request->stems == nullptr || request->muteMask == juce::jmax (0, appliedStemMask.load()))
     {
-        cuesampler::WarpMap tempMap;
-        tempMap.build (chop->startSample, chop->endSample, chop->warpMarkers, sourceRate);
-        const double cueSource = chop->startSample + chop->cueOffsetSamples;
-        const double cueLocalSeconds = tempMap.localTimeAtSourceSample (cueSource);
-        const int mappedCue = (int) std::round (cueLocalSeconds * sourceRate);
-
-        cueStart = juce::jlimit (0,
-                                  juce::jmax (0, effectiveSourceLength - 1),
-                                  mappedCue);
-        chopEnd = effectiveSourceLength;
+        request->mixedSample = request->sample;
+        request->prepared = chopAudioCache.getPrepared (chopId, key);
+        if (request->prepared != nullptr && request->prepared->usedFallback)
+            request->prepared.reset();
     }
-    else
+    // Use original identity for stable comparisons even when a pending remix publishes.
+    if (request->stems != nullptr)
+        request->sample = request->stems->source;
+    return request;
+}
+
+bool AudioPluginAudioProcessor::isChopExportCurrent (const std::shared_ptr<const ChopExportRequest>& request)
+{
+    if (request == nullptr) return false;
+    const auto current = captureChopExport (request->chop.id, getSyncToHost());
+    return current != nullptr && current->sample == request->sample
+        && current->stems == request->stems && current->chops == request->chops
+        && current->muteMask == request->muteMask && current->outputRate == request->outputRate
+        && current->pitch == request->pitch && current->stretch == request->stretch
+        && current->gainDecibels == request->gainDecibels;
+}
+
+void AudioPluginAudioProcessor::renderChopExportAsync (
+    std::shared_ptr<const ChopExportRequest> request, std::function<void (juce::File)> completed)
+{
+    exportThreadPool.addJob ([request = std::move (request), completed = std::move (completed)]
     {
-        cueStart = juce::jlimit (chop->startSample,
-                                  juce::jmax (chop->startSample, chop->endSample - 1),
-                                  chop->startSample + chop->cueOffsetSamples);
-        chopEnd = juce::jmin (chop->endSample, effectiveSourceLength);
-    }
+        const auto file = request != nullptr ? renderChopExport (*request) : juce::File();
+        if (! juce::MessageManager::callAsync ([file, completed] { completed (file); }))
+            file.deleteFile();
+    });
+}
 
-    const int inputFrames = juce::jmax (0, chopEnd - cueStart);
-    if (inputFrames <= 0)
+void AudioPluginAudioProcessor::saveChopExportAsync (
+    juce::File source, juce::File destination, std::function<void (bool)> completed)
+{
+    // Owned by the processor, so plugin teardown joins outstanding file work.
+    exportThreadPool.addJob ([source, destination, completed]
+    {
+        juce::TemporaryFile replacement (destination);
+        const bool saved = source.copyFileTo (replacement.getFile())
+                           && replacement.overwriteTargetFileWithTemporary();
+        if (saved && source != destination) source.deleteFile();
+        juce::MessageManager::callAsync ([saved, completed] { completed (saved); });
+    });
+}
+
+juce::File AudioPluginAudioProcessor::renderChopToTempWav (int chopId, bool applySync, const juce::File& directory)
+{
+    const auto request = captureChopExport (chopId, applySync, directory);
+    return request != nullptr ? renderChopExport (*request) : juce::File();
+}
+
+juce::File AudioPluginAudioProcessor::renderChopExport (const ChopExportRequest& request)
+{
+    const auto& chop = request.chop;
+    const double currentHostRate = request.outputRate;
+    auto prepared = request.prepared;
+    if (prepared == nullptr)
+    {
+        // A mute click can precede the playback remix. Render its captured intent
+        // directly, without waiting for or exporting the previous active mix.
+        const auto sample = request.mixedSample != nullptr ? request.mixedSample
+            : request.stems != nullptr ? createStemMix (*request.stems, request.muteMask) : request.sample;
+        prepared = cuesampler::ChopAudioCache::renderPreparedChopSync (
+            sample->buffer, sample->sampleRate, currentHostRate, chop.id,
+            chop.startSample, chop.endSample, chop.cueOffsetSamples, chop.warpMarkers,
+            request.pitch, request.stretch, 0, false);
+    }
+    if (prepared == nullptr || prepared->buffer == nullptr || prepared->usedFallback)
         return {};
-
-    const bool halfTimeActive = halfTimeEnabled.load (std::memory_order_acquire);
-    if (halfTimeActive)
-        stretchRatio = juce::jlimit (0.25f, 4.0f, stretchRatio * 2.0f);
-
-    const auto sourceFramesPerOutputFrame = (sourceRate / currentHostRate) / (double) stretchRatio;
-    const auto outputFramesPerInputFrame = 1.0 / sourceFramesPerOutputFrame;
-    const bool sourceRateMatchesHost = std::abs (sourceRate - currentHostRate) < 0.5;
-    const bool stretchIsUnity = std::abs (stretchRatio - 1.0f) < 0.005f;
-    const bool pitchIsUnity = std::abs (effectiveSemitones) < 0.01f;
-    const bool bypassBungee = pitchIsUnity && stretchIsUnity;
-    const int finalOutputFrames = juce::jmax (1, (int) std::round ((double) inputFrames * outputFramesPerInputFrame));
-
-    constexpr int kBlock = 512;
-    juce::AudioBuffer<float> outputBuffer (numChannels, finalOutputFrames + kBlock * 4);
-    outputBuffer.clear();
-
-    int framesToWrite = 0;
-
-    if (bypassBungee)
+    const auto& rendered = *prepared->buffer;
+    const int numChannels = rendered.getNumChannels();
+    const int cueFrame = prepared->cueFrame;
+    const int framesToWrite = rendered.getNumSamples() - cueFrame;
+    if (framesToWrite <= 0) return {};
+    juce::AudioBuffer<float> outputBuffer (numChannels, framesToWrite);
+    for (int ch = 0; ch < numChannels; ++ch)
     {
-        if (! sourceRateMatchesHost)
-        {
-            // Source/host sample-rate conversion at unity pitch.
-            for (int ch = 0; ch < numChannels; ++ch)
-            {
-                const auto* src = effectiveBuffer->getReadPointer (ch);
-                auto* dst = outputBuffer.getWritePointer (ch);
-                double pos = (double) cueStart;
-                for (int i = 0; i < finalOutputFrames; ++i)
-                {
-                    dst[i] = interpolateSampleLanczos (src, sourceLength, pos) * chopGainLinear;
-                    pos += sourceFramesPerOutputFrame;
-                }
-            }
-            framesToWrite = finalOutputFrames;
-        }
-        else
-        {
-            // 1:1 straight copy
-            for (int ch = 0; ch < numChannels; ++ch)
-            {
-                const auto* src = effectiveBuffer->getReadPointer (ch);
-                auto* dst = outputBuffer.getWritePointer (ch);
-                for (int i = 0; i < inputFrames; ++i)
-                    dst[i] = src[cueStart + i] * chopGainLinear;
-            }
-            framesToWrite = inputFrames;
-        }
+        outputBuffer.copyFrom (ch, 0, rendered, ch, cueFrame, framesToWrite);
+        if (chop.reversed)
+            std::reverse (outputBuffer.getWritePointer (ch), outputBuffer.getWritePointer (ch) + framesToWrite);
     }
-    else
+    outputBuffer.applyGain (juce::Decibels::decibelsToGain (chop.gainDecibels));
+
+    // Share playback's one-shot ADSR, including its short-chop release cap.
+    // A long release must not trigger at frame zero and silence an attacking chop.
+    VoiceState exportVoice;
+    exportVoice.startEnvelope (chop, currentHostRate);
+    for (int i = 0; i < framesToWrite; ++i)
     {
-        Bungee::SampleRates rates { (int) std::round (sourceRate), (int) std::round (currentHostRate) };
-
-        auto offlineStretcher = std::make_unique<Bungee::Stretcher<Bungee::Basic>> (rates, numChannels, -1);
-        const int maxOfflineInputFrames = juce::jmax (kBlock, offlineStretcher->maxInputFrameCount());
-        auto offlineStream    = std::make_unique<Bungee::Stream<Bungee::Basic>> (*offlineStretcher,
-                                                                                 maxOfflineInputFrames,
-                                                                                 numChannels);
-
-        std::vector<const float*> inPtrs  ((size_t) numChannels);
-        std::vector<float*>       outPtrs ((size_t) numChannels);
-        juce::AudioBuffer<float> chunkBuffer (numChannels, kBlock + 16);
-        juce::AudioBuffer<float> zeroBuf (numChannels, maxOfflineInputFrames);
-        zeroBuf.clear();
-
-        const int maxPrerollFrames = offlineStretcher->maxInputFrameCount();
-        const int prerollFrames = juce::jmin (cueStart, maxPrerollFrames);
-        const int syntheticPrerollFrames = isWarped ? juce::jmax (0, maxPrerollFrames - prerollFrames) : 0;
-        if (prerollFrames > 0 || syntheticPrerollFrames > 0)
-        {
-            const int maxPrerollOutputFrames =
-                juce::jmax (kBlock, (int) std::ceil ((double) kBlock * outputFramesPerInputFrame) + 16);
-            juce::AudioBuffer<float> discardBuffer (numChannels, maxPrerollOutputFrames);
-
-            int syntheticRendered = 0;
-            while (syntheticRendered < syntheticPrerollFrames)
-            {
-                const int syntheticInputFrames = juce::jmin (kBlock, syntheticPrerollFrames - syntheticRendered);
-                const double syntheticOutputFrames = juce::jlimit (
-                    1.0,
-                    (double) maxPrerollOutputFrames,
-                    juce::jmax (1.0, std::ceil ((double) syntheticInputFrames * outputFramesPerInputFrame)));
-                discardBuffer.clear();
-
-                for (int ch = 0; ch < numChannels; ++ch)
-                {
-                    auto* tempInput = zeroBuf.getWritePointer (ch);
-                    const auto* sourceData = effectiveBuffer->getReadPointer (ch);
-
-                    for (int i = 0; i < syntheticInputFrames; ++i)
-                    {
-                        const int mirrorOffset = syntheticPrerollFrames - syntheticRendered - i;
-                        const int sourceIndex = juce::jlimit (0,
-                                                              juce::jmax (0, sourceLength - 1),
-                                                              cueStart + mirrorOffset);
-                        tempInput[i] = sourceData[sourceIndex];
-                    }
-
-                    inPtrs[(size_t) ch] = tempInput;
-                    outPtrs[(size_t) ch] = discardBuffer.getWritePointer (ch);
-                }
-
-                offlineStream->process (inPtrs.data(), outPtrs.data(),
-                                        syntheticInputFrames, syntheticOutputFrames, pitchFactor);
-                syntheticRendered += syntheticInputFrames;
-            }
-
-            int prerollRead = cueStart - prerollFrames;
-
-            while (prerollRead < cueStart)
-            {
-                const int prerollInputFrames = juce::jmin (kBlock, cueStart - prerollRead);
-                const double prerollOutputFrames = juce::jlimit (
-                    1.0,
-                    (double) maxPrerollOutputFrames,
-                    juce::jmax (1.0, std::ceil ((double) prerollInputFrames * outputFramesPerInputFrame)));
-                discardBuffer.clear();
-
-                for (int ch = 0; ch < numChannels; ++ch)
-                {
-                    inPtrs[(size_t) ch] = effectiveBuffer->getReadPointer (ch, prerollRead);
-                    outPtrs[(size_t) ch] = discardBuffer.getWritePointer (ch);
-                }
-
-                offlineStream->process (inPtrs.data(), outPtrs.data(),
-                                        prerollInputFrames, prerollOutputFrames, pitchFactor);
-                prerollRead += prerollInputFrames;
-            }
-        }
-
-        double sourcePosition = (double) cueStart;
-        const double stopSample = (double) chopEnd;
-        int outputWriteOffset = 0;
-        int zeroRenderStreak = 0;
-
-        while (outputWriteOffset < finalOutputFrames)
-        {
-            const int remainingOutput = finalOutputFrames - outputWriteOffset;
-            int segmentOutputFrames = juce::jmin (kBlock, remainingOutput);
-            int inputFramesRequested = 0;
-
-            if (sourcePosition < stopSample && sourcePosition < (double) sourceLength)
-            {
-                const auto inputFramesUntilStop = stopSample - sourcePosition;
-                const auto outputFramesUntilStop = (int) std::floor (inputFramesUntilStop / sourceFramesPerOutputFrame);
-                segmentOutputFrames = juce::jmin (juce::jmax (1, outputFramesUntilStop), segmentOutputFrames);
-
-                inputFramesRequested = juce::jlimit (1, maxOfflineInputFrames,
-                                                     (int) std::ceil ((double) segmentOutputFrames * sourceFramesPerOutputFrame));
-
-                if (sourcePosition + inputFramesRequested > stopSample)
-                {
-                    inputFramesRequested = juce::jmax (1, (int) std::ceil (stopSample - sourcePosition));
-                }
-            }
-
-            chunkBuffer.clear();
-
-            for (int ch = 0; ch < numChannels; ++ch)
-            {
-                auto* tempInput = zeroBuf.getWritePointer (ch);
-                std::fill (tempInput, tempInput + juce::jmax (1, inputFramesRequested), 0.0f);
-                
-                if (inputFramesRequested > 0)
-                {
-                    const auto sourceStart = juce::jlimit (0, juce::jmax (0, sourceLength - 1), (int) std::floor (sourcePosition));
-                    const auto availableFrames = juce::jmax (0, sourceLength - sourceStart);
-                    const auto copiedFrames = juce::jmin (availableFrames, inputFramesRequested);
-
-                    if (copiedFrames > 0)
-                    {
-                        const auto* sourceData = effectiveBuffer->getReadPointer (ch, sourceStart);
-                        std::copy (sourceData, sourceData + copiedFrames, tempInput);
-                    }
-                }
-
-                inPtrs[(size_t) ch] = tempInput;
-                outPtrs[(size_t) ch] = chunkBuffer.getWritePointer (ch);
-            }
-
-            const int renderedFrames = offlineStream->process (inPtrs.data(), outPtrs.data(),
-                                                               inputFramesRequested,
-                                                               (double) segmentOutputFrames,
-                                                               pitchFactor);
-
-            if (renderedFrames > 0)
-            {
-                const int writableFrames = juce::jmin (renderedFrames,
-                                                       finalOutputFrames - outputWriteOffset);
-                if (writableFrames <= 0)
-                    break;
-
-                for (int ch = 0; ch < numChannels; ++ch)
-                {
-                    const auto* src = chunkBuffer.getReadPointer (ch);
-                    auto* dst = outputBuffer.getWritePointer (ch) + outputWriteOffset;
-                    for (int i = 0; i < writableFrames; ++i)
-                        dst[i] = src[i] * chopGainLinear;
-                }
-
-                outputWriteOffset += writableFrames;
-                zeroRenderStreak = 0;
-            }
-            else
-            {
-                ++zeroRenderStreak;
-            }
-
-            sourcePosition += (double) inputFramesRequested;
-
-            if (zeroRenderStreak >= 16)
-            {
-                // Bungee isn't outputting anymore, force flush by padding with zero to hit finalOutputFrames exactly
-                break;
-            }
-        }
-
-        framesToWrite = finalOutputFrames;
-    }
-
-    if (chop->reversed && framesToWrite > 1)
-    {
+        const auto envelopeGain = exportVoice.nextEnvelopeGain (true, framesToWrite - i, framesToWrite);
         for (int ch = 0; ch < numChannels; ++ch)
-        {
-            auto* samples = outputBuffer.getWritePointer (ch);
-            std::reverse (samples, samples + framesToWrite);
-        }
-    }
-
-    // Bake the per-chop envelope into exported audio. Export behaves like a
-    // one-shot trigger: A/D/S begin at frame zero and R starts early enough to
-    // reach silence at the chop boundary.
-    if (framesToWrite > 0)
-    {
-        juce::ADSR exportEnvelope;
-        exportEnvelope.setSampleRate (currentHostRate);
-        const auto exportReleaseSeconds = juce::jmax ((float) (32.0 / currentHostRate),
-                                                       chop->releaseMilliseconds * 0.001f);
-        exportEnvelope.setParameters ({ chop->attackMilliseconds * 0.001f,
-                                        chop->decayMilliseconds * 0.001f,
-                                        juce::jlimit (0.0f, 1.0f, chop->sustainLevel),
-                                        exportReleaseSeconds });
-        exportEnvelope.noteOn();
-
-        const int releaseFrames = juce::jmax (32, (int) std::round (
-            (double) exportReleaseSeconds * currentHostRate));
-        bool releaseTriggered = false;
-
-        for (int i = 0; i < framesToWrite; ++i)
-        {
-            if (! releaseTriggered && releaseFrames > 0 && framesToWrite - i <= releaseFrames)
-            {
-                exportEnvelope.noteOff();
-                releaseTriggered = true;
-            }
-
-            const auto envelopeGain = exportEnvelope.getNextSample();
-            for (int ch = 0; ch < numChannels; ++ch)
-                outputBuffer.getWritePointer (ch)[i] *= envelopeGain;
-        }
+            outputBuffer.getWritePointer (ch)[i] *= envelopeGain;
     }
 
     // Exported chops match what users hear through the global output control.
     if (framesToWrite > 0)
         outputBuffer.applyGain (0, framesToWrite,
                                 juce::Decibels::decibelsToGain (
-                                    globalGainDecibels.load (std::memory_order_acquire)));
+                                    request.gainDecibels));
 
-    const auto sampleName = sampleData->fileName.isNotEmpty() ? sampleData->fileName
-                                                               : juce::String ("chop");
-    auto tempDirectory = juce::File::getSpecialLocation (juce::File::tempDirectory);
+    const auto sampleName = juce::File::createLegalFileName (
+        request.sample->fileName.isNotEmpty() ? request.sample->fileName : juce::String ("chop")).substring (0, 100);
+    auto tempDirectory = request.directory != juce::File() ? request.directory
+        : juce::File::getSpecialLocation (juce::File::tempDirectory);
     if (! tempDirectory.createDirectory())
-        tempDirectory = juce::File ("/tmp");
+        return {};
 
     const auto tempFile = tempDirectory
                               .getChildFile (sampleName
-                                             + "_chop" + juce::String (chopId)
-                                             + "_gPitch_" + juce::String (globalSemitones, 2)
-                                             + "_cPitch_" + juce::String (chop->pitchSemitones, 2)
-                                             + "_export_" + juce::String (juce::Time::currentTimeMillis())
+                                             + "_chop" + juce::String (chop.id)
+                                             + "_pitch_" + juce::String (request.pitch, 2)
+                                             + "_export_" + juce::Uuid().toString()
                                              + ".wav");
     tempFile.deleteFile();
 
@@ -5034,11 +4886,16 @@ juce::File AudioPluginAudioProcessor::renderChopToTempWav (int chopId, bool appl
     const auto options = juce::AudioFormatWriterOptions()
                              .withSampleRate (currentHostRate)
                              .withNumChannels (numChannels)
-                             .withBitsPerSample (24);
+                             .withBitsPerSample (32)
+                             .withSampleFormat (juce::AudioFormatWriterOptions::SampleFormat::floatingPoint);
 
     auto writer = wav.createWriterFor (outputStream, options);
     if (writer == nullptr)
+    {
+        outputStream.reset();
+        tempFile.deleteFile();
         return {};
+    }
 
     if (! writer->writeFromAudioSampleBuffer (outputBuffer, 0, framesToWrite))
     {
@@ -5773,6 +5630,10 @@ void AudioPluginAudioProcessor::publishTempoAnalysis (std::shared_ptr<TempoAnaly
 // Stem separation — mirrors the launchTempoAnalysis / publishTempoAnalysis pair.
 void AudioPluginAudioProcessor::resetStemState()
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
+    stemGeneration.fetch_add (1, std::memory_order_acq_rel);
+    stemRemixGeneration.fetch_add (1, std::memory_order_acq_rel);
+    stemSource.reset();
     // Abandon any in-flight separation / queued remix for the previous sample and
     // reset stem state. appliedStemMask = -1 marks loadedSample as the raw original.
     // Does NOT touch the mute flags (restore preserves them) and does NOT launch a
@@ -5818,6 +5679,7 @@ StemSeparator* AudioPluginAudioProcessor::ensureStemSeparatorLoaded()
 
 void AudioPluginAudioProcessor::requestStemSeparation()
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     // Message-thread entry point for the STEMS button. Separate the pristine
     // original currently loaded: once stems exist, stemSet->source holds it;
     // otherwise loadedSample is the raw original (appliedStemMask == -1).
@@ -5832,6 +5694,7 @@ void AudioPluginAudioProcessor::requestStemSeparation()
 
 void AudioPluginAudioProcessor::launchStemSeparation (std::shared_ptr<LoadedSampleData> sampleData)
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     resetStemState();
 
     // No model installed, or nothing to separate → behave as before: original
@@ -5858,34 +5721,39 @@ void AudioPluginAudioProcessor::launchStemSeparation (std::shared_ptr<LoadedSamp
         return;
     }
 
+    stemSource = sampleData;
     stemSeparationInProgress.store (true, std::memory_order_release);
-    const auto generation = stemGeneration.fetch_add (1, std::memory_order_acq_rel) + 1;
+    const auto generation = stemGeneration.load (std::memory_order_acquire);
     stemThreadPool.addJob (new StemSeparationJob (*this, std::move (sampleData), generation), true);
 }
 
 void AudioPluginAudioProcessor::launchStemCacheLookup (std::shared_ptr<LoadedSampleData> sampleData,
                                                        juce::String savedKey)
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     // Always leaves stem state reset, whether or not a lookup actually starts, so
     // callers never have to pair this with their own reset.
     resetStemState();
 
-    // No model means no key namespace to look in (and nothing that could have
-    // written an entry), so there is nothing to rehydrate.
-    if (stemModelId.isEmpty()
+    // A fresh-file lookup needs a model namespace; an explicit legacy project
+    // key remains usable even when the model is no longer installed.
+    if ((stemModelId.isEmpty() && savedKey.isEmpty())
         || sampleData == nullptr || sampleData->buffer.getNumSamples() <= 0)
         return;
 
+    stemSource = sampleData;
     stemCacheLookupInProgress.store (true, std::memory_order_release);
     stemCacheLookupExpected.store (savedKey.isNotEmpty(), std::memory_order_release);
-    const auto generation = stemGeneration.fetch_add (1, std::memory_order_acq_rel) + 1;
+    const auto generation = stemGeneration.load (std::memory_order_acquire);
     stemThreadPool.addJob (new StemCacheLookupJob (*this, std::move (sampleData),
                                                    std::move (savedKey), generation), true);
 }
 
 void AudioPluginAudioProcessor::publishStems (std::shared_ptr<const StemSet> newStemSet, uint64_t generation)
 {
-    if (generation != stemGeneration.load (std::memory_order_acquire))
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
+    if (generation != stemGeneration.load (std::memory_order_acquire)
+        || (newStemSet != nullptr && newStemSet->source != stemSource))
         return; // superseded by a newer sample / separation
 
     stemSeparationInProgress.store (false, std::memory_order_release);
@@ -5902,12 +5770,60 @@ void AudioPluginAudioProcessor::publishStems (std::shared_ptr<const StemSet> new
 
     std::atomic_store (&stemSet, newStemSet);
     stemProgress.store (1.0f, std::memory_order_release);
+    rebuildActiveMix (stemRemixGeneration.load());
     stemsReady.store (true, std::memory_order_release);
-    rebuildActiveMix(); // apply any active mutes now that stems exist
+    notifyEditStateChanged();
 }
 
-void AudioPluginAudioProcessor::rebuildActiveMix()
+std::shared_ptr<AudioPluginAudioProcessor::LoadedSampleData>
+AudioPluginAudioProcessor::createStemMix (const StemSet& stems, int muteMask)
 {
+    std::shared_ptr<LoadedSampleData> newSample;
+
+    if (muteMask == 0)
+    {
+        // Nothing muted → restore the exact pristine original (zero-copy alias).
+        newSample = stems.source;
+    }
+    else
+    {
+        const auto& orig = stems.source->buffer;
+        const int numCh = orig.getNumChannels();
+        const int numS  = orig.getNumSamples();
+
+        juce::AudioBuffer<float> mix (numCh, numS);
+        for (int ch = 0; ch < numCh; ++ch)
+            mix.copyFrom (ch, 0, orig, ch, 0, numS);
+
+        auto subtract = [&] (const juce::AudioBuffer<float>& stem)
+        {
+            const int sc = juce::jmin (numCh, stem.getNumChannels());
+            const int sn = juce::jmin (numS, stem.getNumSamples());
+            for (int ch = 0; ch < sc; ++ch)
+                mix.addFrom (ch, 0, stem, ch, 0, sn, -1.0f);
+        };
+        if (muteMask & 1) subtract (stems.drums);
+        if (muteMask & 2) subtract (stems.bass);
+        if (muteMask & 4) subtract (stems.vocals);
+
+        newSample = std::make_shared<LoadedSampleData>();
+        newSample->sampleRate                = stems.source->sampleRate;
+        newSample->sourceFile                = stems.source->sourceFile;
+        newSample->filePath                  = stems.source->filePath;
+        newSample->fileName                  = stems.source->fileName;
+        newSample->leadingContentStartSample = stems.source->leadingContentStartSample;
+        newSample->serializedStateData       = stems.source->serializedStateData;
+        newSample->buffer                    = std::move (mix);
+    }
+
+    return newSample;
+}
+
+void AudioPluginAudioProcessor::rebuildActiveMix (uint64_t generation)
+{
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
+    if (generation != stemRemixGeneration.load (std::memory_order_acquire))
+        return;
     const auto stems = std::atomic_load (&stemSet);
     if (stems == nullptr || stems->source == nullptr)
         return; // no stems → original already playing
@@ -5926,43 +5842,7 @@ void AudioPluginAudioProcessor::rebuildActiveMix()
         return; // already correct — avoid a needless swap + cache rebuild
     }
 
-    std::shared_ptr<LoadedSampleData> newSample;
-
-    if (desiredMask == 0)
-    {
-        // Nothing muted → restore the exact pristine original (zero-copy alias).
-        newSample = stems->source;
-    }
-    else
-    {
-        const auto& orig = stems->source->buffer;
-        const int numCh = orig.getNumChannels();
-        const int numS  = orig.getNumSamples();
-
-        juce::AudioBuffer<float> mix (numCh, numS);
-        for (int ch = 0; ch < numCh; ++ch)
-            mix.copyFrom (ch, 0, orig, ch, 0, numS);
-
-        auto subtract = [&] (const juce::AudioBuffer<float>& stem)
-        {
-            const int sc = juce::jmin (numCh, stem.getNumChannels());
-            const int sn = juce::jmin (numS, stem.getNumSamples());
-            for (int ch = 0; ch < sc; ++ch)
-                mix.addFrom (ch, 0, stem, ch, 0, sn, -1.0f);
-        };
-        if (desiredMask & 1) subtract (stems->drums);
-        if (desiredMask & 2) subtract (stems->bass);
-        if (desiredMask & 4) subtract (stems->vocals);
-
-        newSample = std::make_shared<LoadedSampleData>();
-        newSample->sampleRate                = stems->source->sampleRate;
-        newSample->sourceFile                = stems->source->sourceFile;
-        newSample->filePath                  = stems->source->filePath;
-        newSample->fileName                  = stems->source->fileName;
-        newSample->leadingContentStartSample = stems->source->leadingContentStartSample;
-        newSample->serializedStateData       = stems->source->serializedStateData;
-        newSample->buffer                    = std::move (mix);
-    }
+    auto newSample = createStemMix (*stems, desiredMask);
 
     std::atomic_store (&loadedSample, newSample);
     appliedStemMask.store (desiredMask, std::memory_order_release);
@@ -6193,8 +6073,16 @@ void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData&
                 // fall inside the new chop bounds.
                 for (const auto& marker : old.warpMarkers)
                 {
-                    if (marker.sourceSample > def.startSample && marker.sourceSample < def.endSample)
-                        def.warpMarkers.push_back (marker);
+                    auto rebased = marker;
+                    rebased.localTimeSeconds += (double) (old.startSample - def.startSample) / sampleRate;
+                    if (rebased.sourceSample > def.startSample && rebased.sourceSample < def.endSample
+                        && rebased.localTimeSeconds > 0.0
+                        && rebased.localTimeSeconds < (double) (def.endSample - def.startSample) / sampleRate)
+                    {
+                        rebased.snappedToGrid = false;
+                        rebased.gridFingerprint = 0.0;
+                        def.warpMarkers.push_back (rebased);
+                    }
                 }
             }
 

@@ -2432,6 +2432,7 @@ public:
     ~WaveformDisplayComponent() override
     {
         stopTimer();
+        readyExportFile.deleteFile();
         // Cancel any in-flight capture, but deliberately do NOT leave manual
         // mode here. Closing the plugin window is not an edit, and exiting the
         // mode now swaps the chop layers — that would silently rewrite the
@@ -3286,8 +3287,18 @@ public:
 
     void mouseDrag (const juce::MouseEvent& event) override
     {
+        if (exportWaitingForDrag)
+        {
+            if (! exportRendering && readyExportFile.existsAsFile())
+            {
+                exportWaitingForDrag = false;
+                startReadyExportDrag();
+            }
+            return;
+        }
         // Dragging the floating export button arms the OS file drag immediately
-        // (no 2 s wait). A tiny threshold distinguishes a drag from a click.
+        // (no 2 s wait). A tiny threshold distinguishes a drag from a click;
+        // cold renders continue the gesture after the worker finishes.
         if (exportButtonPressed)
         {
             if (! exportButtonDragArmed
@@ -3300,7 +3311,6 @@ public:
                 {
                     exportDragFired = true; // suppress our own FileDragAndDropTarget
                     initiateChopExportDrag (chopId);
-                    exportDragFired = false;
                 }
                 repaint();
             }
@@ -3337,6 +3347,7 @@ public:
 
     void mouseUp (const juce::MouseEvent& event) override
     {
+        exportWaitingForDrag = false;
         // Released on the delete badge => remove the chop. Releasing off the
         // badge cancels, matching normal button behaviour.
         if (deleteBadgePressed)
@@ -3832,6 +3843,17 @@ public:
 
         // ---- Floating export affordance (drawn on top) ----
         paintExportButton (g);
+        if (exportRendering || readyExportFile != juce::File())
+        {
+            const auto status = getDisplayBounds().toNearestInt().removeFromBottom (24).reduced (8, 0);
+            g.setColour (juce::Colours::black.withAlpha (0.85f));
+            g.fillRect (status);
+            g.setColour (juce::Colour (0xffffb300));
+            g.setFont (monoFont (11.0f));
+            g.drawText (exportRendering ? "Preparing export... keep dragging, or drag again when ready."
+                                       : "Export ready. Drag the export button to place the audio.",
+                        status, juce::Justification::centred);
+        }
     }
 
     void resized() override
@@ -3919,33 +3941,97 @@ private:
             waveformVerticalScale = targetWaveformVerticalScale;
     }
 
-    void initiateChopExportDrag (int chopId)
+    static void showExportError (const juce::String& message)
     {
-        const bool applySync = processor.getSyncToHost();
-        const auto tempFile  = processor.renderChopToTempWav (chopId, applySync);
+        juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                                               "Chop export", message);
+    }
 
-        if (! tempFile.existsAsFile())
+    void beginExport (int chopId, bool forDrag)
+    {
+        if (exportRendering) return;
+        if (exportRequestedChopId == chopId && readyExportFile.existsAsFile()
+            && processor.isChopExportCurrent (exportRequest))
         {
-            exportDragReady = false;
-            exportDragFired = false;
-            setMouseCursor (juce::MouseCursor::NormalCursor);
+            if (forDrag) startReadyExportDrag(); else showExportSaveDialog();
             return;
         }
-
-        const auto path = tempFile.getFullPathName();
-        const bool dragStarted = juce::DragAndDropContainer::performExternalDragDropOfFiles (
-            juce::StringArray { path },
-            /*canMoveFiles=*/ false,
-            /*sourceComponent=*/ this,
-            /*callback=*/ [path]()
+        readyExportFile.deleteFile();
+        readyExportFile = juce::File();
+        exportRequestedChopId = chopId;
+        exportRequest = processor.captureChopExport (chopId, processor.getSyncToHost());
+        if (exportRequest == nullptr)
+        {
+            exportDragFired = exportDragReady = false;
+            showExportError ("The chop is not ready. Wait for sample loading or stem separation to finish, then try again.");
+            return;
+        }
+        exportRendering = true;
+        exportWaitingForDrag = forDrag;
+        exportDragFired = exportDragReady = false;
+        repaint();
+        juce::Component::SafePointer<WaveformDisplayComponent> safeThis (this);
+        processor.renderChopExportAsync (exportRequest, [safeThis, forDrag] (juce::File file)
+        {
+            if (safeThis == nullptr)
             {
-                juce::Timer::callAfterDelay (60000, [path]() { juce::File (path).deleteFile(); });
-            });
+                file.deleteFile();
+                return;
+            }
+            auto& self = *safeThis;
+            self.exportRendering = false;
+            self.readyExportFile = file;
+            self.repaint();
+            if (! file.existsAsFile())
+            {
+                self.exportWaitingForDrag = false;
+                showExportError ("The audio could not be rendered or written. Please try again and check available disk space.");
+                return;
+            }
+            if (! forDrag)
+                self.showExportSaveDialog();
+            // Start the native drag from the next mouseDrag event, not a worker
+            // completion: macOS requires a current mouse event. If released,
+            // keep the prepared file for the next deliberate export gesture.
+        });
+    }
 
-        if (! dragStarted)
-            juce::File (path).deleteFile();
+    void initiateChopExportDrag (int chopId) { beginExport (chopId, true); }
 
+    void startReadyExportDrag()
+    {
+        // Hosts may reference dragged files instead of copying them. Successful
+        // exports must outlive both the drag gesture and the plugin instance.
+        const auto directory = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+                                   .getChildFile ("CueSampler/Exports");
+        const auto retained = directory.getChildFile (readyExportFile.getFileName());
+        if (! directory.createDirectory() || ! readyExportFile.moveFileTo (retained))
+        {
+            showExportError ("Could not keep the exported audio in " + directory.getFullPathName());
+            return;
+        }
+        readyExportFile = juce::File();
+        exportDragFired = true;
         exportDragReady = false;
+        juce::Component::SafePointer<WaveformDisplayComponent> safeThis (this);
+        const bool started = juce::DragAndDropContainer::performExternalDragDropOfFiles (
+            juce::StringArray { retained.getFullPathName() }, false, this,
+            [safeThis]
+            {
+                if (safeThis != nullptr)
+                {
+                    safeThis->exportDragFired = false;
+                    safeThis->repaint();
+                }
+            });
+        if (started)
+            exportRequest.reset();
+        else
+        {
+            exportDragFired = false;
+            readyExportFile = retained; // retry or Save As; no successful host reference yet
+            showExportError ("The drag could not start. Drag the export button again, or use Export Chop As.");
+        }
         setMouseCursor (juce::MouseCursor::NormalCursor);
         repaint();
     }
@@ -4110,33 +4196,31 @@ private:
         juce::CallOutBox::launchAsynchronously (std::move (content), targetArea, parent);
     }
 
-    // Click (no drag) path: render the chop and offer a Save-As dialog.
-    void saveChopToFile (int chopId)
-    {
-        const bool applySync = processor.getSyncToHost();
-        const auto tempFile  = processor.renderChopToTempWav (chopId, applySync);
-        if (! tempFile.existsAsFile())
-            return;
+    void saveChopToFile (int chopId) { beginExport (chopId, false); }
 
+    void showExportSaveDialog()
+    {
+        const auto tempFile = readyExportFile;
+        readyExportFile = juce::File();
+        exportRequest.reset();
         auto suggested = juce::File::getSpecialLocation (juce::File::userDesktopDirectory)
                              .getChildFile (tempFile.getFileName());
-
         chopExportChooser = std::make_unique<juce::FileChooser> (
             "Export Chop As", suggested, "*.wav");
-
         const auto flags = juce::FileBrowserComponent::saveMode
                          | juce::FileBrowserComponent::canSelectFiles
                          | juce::FileBrowserComponent::warnAboutOverwriting;
-
-        chopExportChooser->launchAsync (flags, [tempFile] (const juce::FileChooser& fc)
+        juce::Component::SafePointer<WaveformDisplayComponent> safeThis (this);
+        chopExportChooser->launchAsync (flags, [tempFile, safeThis] (const juce::FileChooser& fc)
         {
-            auto dest = fc.getResult();
-            if (dest != juce::File())
+            const auto dest = fc.getResult();
+            if (dest == juce::File() || safeThis == nullptr) { tempFile.deleteFile(); return; }
+            safeThis->processor.saveChopExportAsync (tempFile, dest, [tempFile, safeThis] (bool saved)
             {
-                dest.deleteFile();
-                tempFile.copyFileTo (dest);
-            }
-            tempFile.deleteFile();
+                if (! saved && safeThis != nullptr)
+                    showExportError ("Saving failed. Your rendered audio is still available at "
+                                     + tempFile.getFullPathName());
+            });
         });
     }
 
@@ -5926,6 +6010,11 @@ private:
     int   exportTargetChopId    = -1;   // chop the button acts on: selection OR last MIDI trigger
     int   lastSeenSelectedId    = -1;   // detects selection changes
     std::unique_ptr<juce::FileChooser> chopExportChooser;
+    std::shared_ptr<const AudioPluginAudioProcessor::ChopExportRequest> exportRequest;
+    juce::File readyExportFile;
+    int exportRequestedChopId = -1;
+    bool exportRendering = false;
+    bool exportWaitingForDrag = false;
 
     // Warp-mode drag state (step 9). markerIndex < 0 means nothing being dragged.
     int  warpDragChopId      = -1;
@@ -6460,6 +6549,8 @@ private:
 
     void updateDisplays()
     {
+        refreshBarsSegments();
+        manualChopButton.setToggleState (processor.isManualChopModeActive(), juce::dontSendNotification);
         syncWarpAccentState();
         updateTimeDisplay();
         updateTempoDisplay();

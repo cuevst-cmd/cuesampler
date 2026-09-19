@@ -64,10 +64,8 @@ float readLinear (const float* sourceData, int sourceLength, double position) no
                     + ((double) sourceData[i1] - (double) sourceData[i0]) * frac);
 }
 
-void sanitiseAndNormalisePreparedBuffer (juce::AudioBuffer<float>& buffer) noexcept
+void sanitisePreparedBuffer (juce::AudioBuffer<float>& buffer) noexcept
 {
-    float peak = 0.0f;
-
     for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
     {
         auto* data = buffer.getWritePointer (ch);
@@ -82,13 +80,10 @@ void sanitiseAndNormalisePreparedBuffer (juce::AudioBuffer<float>& buffer) noexc
                 sample = 0.0f;
                 data[frame] = 0.0f;
             }
-
-            peak = juce::jmax (peak, std::abs (sample));
         }
     }
-
-    if (peak > 1.0f)
-        buffer.applyGain (0.98f / peak);
+    // Preserve floating-point headroom. Normalising each prepared chop changed
+    // its level relative to live playback, neighbouring chops, and stem mixes.
 }
 
 bool renderPreparedWithInterpolation (const juce::AudioBuffer<float>& base,
@@ -129,7 +124,7 @@ bool renderPreparedWithInterpolation (const juce::AudioBuffer<float>& base,
         }
     }
 
-    sanitiseAndNormalisePreparedBuffer (prepared);
+    sanitisePreparedBuffer (prepared);
     return true;
 }
 
@@ -339,7 +334,7 @@ bool renderPreparedWithBungee (const juce::AudioBuffer<float>& base,
     if (outputRendered <= preRollOutputFrames)
         return false;
 
-    sanitiseAndNormalisePreparedBuffer (prepared);
+    sanitisePreparedBuffer (prepared);
     return true;
 }
 
@@ -730,7 +725,8 @@ ChopAudioCache::renderChopSync (const juce::AudioBuffer<float>& source,
                                 int chopStartSample,
                                 int chopEndSample,
                                 const std::vector<ChopWarpMarker>& markers,
-                                std::uint64_t generation)
+                                std::uint64_t generation,
+                                bool allowFallback)
 {
     auto entry = std::make_shared<Entry>();
     entry->chopId     = chopId;
@@ -765,6 +761,8 @@ ChopAudioCache::renderChopSync (const juce::AudioBuffer<float>& source,
     const bool renderOk = renderWarpedChopBungee (warpMap, source, *warped, sampleRate);
     if (! renderOk)
     {
+        entry->usedFallback = true;
+        if (! allowFallback) return entry;
         // Bungee render failed (very unlikely) — fall back to linear resampling.
         std::vector<const float*> srcPtrs ((size_t) channels, nullptr);
         std::vector<float*>       dstPtrs ((size_t) channels, nullptr);
@@ -829,7 +827,8 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
                                         const std::vector<ChopWarpMarker>& markers,
                                         float pitchSemitones,
                                         float stretchRatio,
-                                        std::uint64_t generation)
+                                        std::uint64_t generation,
+                                        bool allowFallback)
 {
     auto entry = std::make_shared<PreparedEntry>();
     entry->chopId = chopId;
@@ -899,13 +898,14 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
                                            chopStartSample,
                                            chopEndSample,
                                            markers,
-                                           generation);
+                                           generation, allowFallback);
         if (warpedEntry == nullptr || warpedEntry->warpedBuffer == nullptr
             || warpedEntry->warpedBuffer->getNumSamples() <= 0)
         {
             return entry;
         }
 
+        entry->usedFallback = warpedEntry->usedFallback;
         const auto& warped = *warpedEntry->warpedBuffer;
         const int warpedFrames = warped.getNumSamples();
         const int chanCount = juce::jmax (warped.getNumChannels(), source.getNumChannels());
@@ -984,17 +984,16 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
                                                        pitchSemitones,
                                                        clampedStretch,
                                                        preRollFrames);
-        if (! renderedWithBungee
-            && ! renderPreparedWithInterpolation (base,
-                                                  *prepared,
-                                                  sourceFramesPerOutputFrame,
-                                                  preRollFrames))
+        if (! renderedWithBungee)
         {
-            return entry;
+            entry->usedFallback = true;
+            if (! allowFallback || ! renderPreparedWithInterpolation (
+                    base, *prepared, sourceFramesPerOutputFrame, preRollFrames))
+                return entry;
         }
     }
 
-    sanitiseAndNormalisePreparedBuffer (*prepared);
+    sanitisePreparedBuffer (*prepared);
 
     const double cueOutputFrame = cueBaseFrame / sourceFramesPerOutputFrame;
     entry->cueFrame = juce::jlimit (0,
