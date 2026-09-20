@@ -1,4 +1,5 @@
 #include "StemSeparator.h"
+#include "StemProcessingSettings.h"
 
 // ONNX Runtime C++ API (same bundled runtime as BeatThisAnalyzer).
 #include <onnxruntime_cxx_api.h>
@@ -50,38 +51,7 @@ namespace
         return (int) juce::jlimit (1u, 16u, std::thread::hardware_concurrency());
     }
 
-    // Segment overlap for the triangular overlap-add. Lower = fewer inferences
-    // (faster) but more boundary artifacts at each ~7.8 s segment seam. Override
-    // with CUE_STEM_OVERLAP (clamped [0, 0.5]) to dial in by ear without a rebuild.
-    double resolveOverlap (double fallback)
-    {
-        if (const char* env = std::getenv ("CUE_STEM_OVERLAP"))
-        {
-            const double v = std::atof (env);
-            if (v >= 0.0)
-                return juce::jlimit (0.0, 0.5, v);
-        }
-        return fallback;
-    }
 
-    // Per-inference segment length in samples. The htdemucs graph takes a dynamic
-    // length, so a SHORTER segment cuts the activation memory of each forward pass
-    // — the lever that lets a memory-constrained accelerator run this graph, since
-    // DirectML pre-allocates the whole fused segment up front (a full 7.8 s segment
-    // can blow the GPU's memory budget and fail graph fusion with E_OUTOFMEMORY).
-    // The cost is more inferences and more overlap-add seams. Override with
-    // CUE_STEM_SEGMENT (samples @ 44.1 kHz; clamped [44100, kSegmentSamples], i.e.
-    // 1 s .. 7.8 s) to fit the accelerator without a rebuild.
-    int resolveSegment (int fallback)
-    {
-        if (const char* env = std::getenv ("CUE_STEM_SEGMENT"))
-        {
-            const int n = std::atoi (env);
-            if (n >= 44100)
-                return juce::jlimit (44100, fallback, n);
-        }
-        return fallback;
-    }
 }
 
 //==============================================================================
@@ -359,31 +329,62 @@ juce::AudioBuffer<float> StemSeparator::resample (const juce::AudioBuffer<float>
         return copy;
     }
 
-    const double ratio  = srcRate / dstRate; // input samples consumed per output sample
-    const int    numOut = juce::jmax (1, (int) std::ceil ((double) numIn * dstRate / srcRate));
+    const double ratio = srcRate / dstRate;
+    const int numOut = juce::jmax (1, (int) std::ceil ((double) numIn / ratio));
+
+    // Offline, zero-phase band-limited resampling. The cutoff follows the lower
+    // Nyquist limit; Lagrange interpolation alone did not reject frequencies
+    // above that limit when downsampling. A Blackman-windowed sinc gives a
+    // smooth transition while symmetric reads preserve absolute sample timing.
+    const double cutoff = 0.95 * juce::jmin (1.0, 1.0 / ratio);
+    const int radius = (int) std::ceil (32.0 / cutoff);
+    const int taps = radius * 2 + 1;
+    constexpr int phases = 1024;
+    const double pi = juce::MathConstants<double>::pi;
+    std::vector<float> kernels ((size_t) (phases + 1) * (size_t) taps);
+    for (int phase = 0; phase <= phases; ++phase)
+    {
+        auto* kernel = kernels.data() + (size_t) phase * (size_t) taps;
+        const double fraction = (double) phase / phases;
+        double sum = 0.0;
+        for (int tap = 0; tap < taps; ++tap)
+        {
+            const double x = (tap - radius) - fraction;
+            const double t = x * cutoff;
+            const double window = std::abs (t) <= 32.0
+                ? 0.42 + 0.5 * std::cos (pi * t / 32.0) + 0.08 * std::cos (2.0 * pi * t / 32.0)
+                : 0.0;
+            const double sinc = std::abs (t) < 1.0e-12 ? 1.0 : std::sin (pi * t) / (pi * t);
+            kernel[tap] = (float) (cutoff * sinc * window);
+            sum += kernel[tap];
+        }
+        for (int tap = 0; tap < taps; ++tap) kernel[tap] /= (float) sum;
+    }
 
     juce::AudioBuffer<float> out (numCh, numOut);
-    out.clear();
     for (int ch = 0; ch < numCh; ++ch)
     {
-        juce::LagrangeInterpolator interp;
-        interp.reset();
-        // Lagrange has two INPUT frames of history delay. Advance exactly that
-        // much at unity before changing rates, so output frame zero maps to
-        // input frame zero even at a fractional conversion ratio. Compensating
-        // both passes keeps stems aligned with the original for subtraction.
-        constexpr int latency = (int) juce::LagrangeInterpolator::getBaseLatency();
-        float discarded[latency] {};
         const auto* input = src.getReadPointer (ch);
-        const int consumed = interp.process (1.0, input, discarded, latency, numIn, 0);
-        // ceil(numIn / ratio) and flushing the history can require padding.
-        // The bounded overload feeds zeros instead of reading past the buffer.
-        const float zero = 0.0f;
-        const int remaining = numIn - consumed;
-        // JUCE's bounded overload still reads its first input when availability
-        // is zero; supply one real zero in that case (e.g. a one-frame source).
-        interp.process (ratio, remaining > 0 ? input + consumed : &zero,
-                        out.getWritePointer (ch), numOut, juce::jmax (1, remaining), 0);
+        auto* output = out.getWritePointer (ch);
+        for (int i = 0; i < numOut; ++i)
+        {
+            const double position = (double) i * ratio;
+            const int centre = (int) std::floor (position);
+            const double phasePosition = (position - centre) * phases;
+            const int phase = juce::jlimit (0, phases - 1, (int) phasePosition);
+            const float fraction = (float) (phasePosition - phase);
+            const auto* a = kernels.data() + (size_t) phase * (size_t) taps;
+            const auto* b = a + taps;
+            double sample = 0.0;
+            for (int tap = 0; tap < taps; ++tap)
+            {
+                // Extend the edge value; even one-frame buffers remain bounded
+                // and constant signals stay constant through the boundary.
+                const int index = juce::jlimit (0, numIn - 1, centre + tap - radius);
+                sample += (double) input[index] * (a[tap] + fraction * (b[tap] - a[tap]));
+            }
+            output[i] = (float) sample;
+        }
     }
     return out;
 }
@@ -452,7 +453,8 @@ StemSeparator::Stems44 StemSeparator::runModel (const Model& model,
         return empty;
 
     const double t0      = juce::Time::getMillisecondCounterHiRes();
-    const double overlap = resolveOverlap (kOverlap);
+    const auto settings = cuesampler::StemProcessingSettings::fromEnvironment();
+    const double overlap = settings.overlap;
 
     // The published fp32 graph currently has a fixed T=343980 input. Honour a
     // fixed model dimension even if CUE_STEM_SEGMENT is set; only apply the
@@ -463,7 +465,7 @@ StemSeparator::Stems44 StemSeparator::runModel (const Model& model,
     const int fixedModelSegment = (modelInputShape.size() >= 3 && modelInputShape[2] > 0)
                                 ? (int) modelInputShape[2]
                                 : kSegmentSamples;
-    const int seg    = dynamicTimeAxis ? resolveSegment (kSegmentSamples) : fixedModelSegment;
+    const int seg    = dynamicTimeAxis ? settings.requestedSegmentSamples : fixedModelSegment;
     const int stride = juce::jmax (1, (int) std::llround ((double) seg * (1.0 - overlap)));
 
     // Triangular overlap-add weight (Demucs, transition_power = 1): ramp 1..max
@@ -487,12 +489,12 @@ StemSeparator::Stems44 StemSeparator::runModel (const Model& model,
     Ort::MemoryInfo memInfo = Ort::MemoryInfo::CreateCpu (OrtArenaAllocator, OrtMemTypeDefault);
     const std::array<int64_t, 3> inShape { 1, (int64_t) kModelChannels, (int64_t) seg };
 
-    int numSeg = 0;
-    for (int o = 0; o < L; o += stride) ++numSeg;
+    const int numSeg = cuesampler::StemProcessingSettings::windowCount (L, seg, stride);
     int segDone = 0;
 
-    for (int offset = 0; offset < L; offset += stride)
+    for (int segmentIndex = 0; segmentIndex < numSeg; ++segmentIndex)
     {
+        const int offset = segmentIndex * stride;
         if (shouldAbort && shouldAbort())
             return empty;
 

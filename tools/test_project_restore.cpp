@@ -156,6 +156,42 @@ struct CueSamplerStateTests
 
     static void runExports (const juce::File& scratch)
     {
+        // Spectral rejection, gain, stereo independence and phase alignment are
+        // properties of the conversion, independent of neural-model output.
+        for (const auto rates : { std::pair<double, double> { 96000, 44100 },
+                                  { 48000, 44100 }, { 44100, 8000 }, { 8000, 44100 } })
+        {
+            const auto [inputRate, outputRate] = rates;
+            for (const bool reject : { false, true })
+            {
+                if (reject && inputRate < outputRate) continue;
+                const double frequency = reject ? (outputRate == 8000 ? 10000 : inputRate == 48000 ? 23000 : 30000) : 1000;
+                juce::AudioBuffer<float> tone (2, (int) inputRate);
+                for (int i = 0; i < tone.getNumSamples(); ++i)
+                {
+                    tone.setSample (0, i, (float) std::sin (juce::MathConstants<double>::twoPi * frequency * i / inputRate));
+                    tone.setSample (1, i, 0.25f);
+                }
+                const auto start = juce::Time::getMillisecondCounterHiRes();
+                const auto converted = StemSeparator::resample (tone, inputRate, outputRate);
+                double energy = 0, error = 0, dcError = 0;
+                const int margin = 256;
+                for (int i = margin; i < converted.getNumSamples() - margin; ++i)
+                {
+                    const auto sample = converted.getSample (0, i);
+                    energy += sample * sample;
+                    error = std::max (error, std::abs (sample - std::sin (juce::MathConstants<double>::twoPi * frequency * i / outputRate)));
+                    dcError = std::max (dcError, std::abs ((double) converted.getSample (1, i) - 0.25));
+                }
+                const double rms = std::sqrt (energy / (converted.getNumSamples() - 2 * margin));
+                std::cout << "SINC " << inputRate << "->" << outputRate << " tone=" << frequency
+                          << " rms=" << rms << " elapsed-ms=" << juce::Time::getMillisecondCounterHiRes() - start << std::endl;
+                check (reject ? rms < 0.001 : error < 0.001, reject ? "resampling rejects above-Nyquist aliasing" : "resampling preserves passband gain and phase");
+                check (dcError < 1.0e-6, "resampling preserves DC and channel independence");
+                if (! reject && inputRate == 96000)
+                    check (equal (tone, StemSeparator::resample (tone, inputRate, inputRate)), "equal-rate resampling preserves every sample");
+            }
+        }
         for (const double rate : { 8000.0, 22050.0, 48000.0, 96000.0 })
         {
             juce::AudioBuffer<float> impulse (1, 4097);
@@ -351,6 +387,345 @@ struct CueSamplerStateTests
         check (p.captureChopExport (7, false, scratch) == nullptr, "missing requested stems cannot silently export the original");
     }
 
+    static void runMousePlaybackModes()
+    {
+        P p;
+        setup (p);
+        p.waveformZoom.store (0); p.waveformScroll.store (0);
+        auto layout = std::make_shared<P::ChopState>();
+        P::ChopDefinition chop;
+        chop.id = 1; chop.startSample = 0; chop.endSample = 2048;
+        chop.cueOffsetSamples = 128; chop.assignedMidiNote = -2;
+        layout->chops.push_back (chop); layout->selectedChopId = 1; layout->nextChopId = 2;
+        p.publishChopState (layout);
+        p.prepareToPlay (8000, 64);
+        juce::AudioBuffer<float> output (2, 64);
+        juce::MidiBuffer midi;
+        auto render = [&] (int blocks)
+        {
+            for (int i = 0; i < blocks; ++i) { midi.clear(); p.processBlock (output, midi); }
+        };
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+        auto* gate = findButton (*editor, "GATE");
+        auto* oneShot = findButton (*editor, "ONE SHOT");
+        check (gate != nullptr && oneShot != nullptr, "both playback mode choices are always visible");
+        if (gate == nullptr || oneShot == nullptr) return;
+        check (gate->getToggleState() && ! oneShot->getToggleState(), "Gate is visibly selected by default");
+        oneShot->onClick();
+        check (! gate->getToggleState() && oneShot->getToggleState()
+               && p.getChopPlaybackMode() == P::ChopPlaybackMode::OneShot, "One Shot selector updates processor and active highlight");
+
+        // Exercise actual waveform handlers, including a full click before the
+        // audio thread has seen any start/release commands. This chop has no MIDI key.
+        std::function<juce::Component* (juce::Component&)> findWave = [&] (juce::Component& c) -> juce::Component*
+        {
+            if (juce::String (typeid (c).name()).contains ("WaveformDisplayComponent")) return &c;
+            for (auto* child : c.getChildren()) if (auto* found = findWave (*child)) return found;
+            return nullptr;
+        };
+        auto* wave = findWave (*editor);
+        check (wave != nullptr, "waveform component available for mouse regression");
+        if (wave == nullptr) return;
+        const juce::Point<float> point (45.0f, 100.0f);
+        const juce::MouseEvent event (juce::Desktop::getInstance().getMainMouseSource(), point,
+            juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier), 1, 0, 0, 0, 0,
+            wave, wave, juce::Time::getCurrentTime(), point, juce::Time::getCurrentTime(), 1, false);
+        wave->mouseDown (event); wave->mouseUp (event); render (1);
+        check (p.voice.playbackActive && p.voice.playbackTriggeredByMouse && p.voice.chopOneShot
+               && p.getMidiNoteForChopId (1) == -1 && output.getMagnitude (0, 64) > 0,
+               "quick waveform click plays an unmapped One Shot after mouse-up");
+        check (p.voice.playbackSamplePosition >= 128 && p.voice.playbackSamplePosition < 256,
+               "mouse audition starts at the chop cue");
+        gate->onClick(); render (40);
+        check (! p.voice.playbackActive, "One Shot ends without looping even when mode changes during playback");
+        wave->mouseDown (event); render (80);
+        check (p.voice.playbackActive && ! p.voice.chopOneShot && p.voice.playbackSamplePosition < 2048,
+               "Gate waveform hold loops past the chop boundary");
+        oneShot->onClick(); wave->mouseUp (event); render (20);
+        check (! p.voice.playbackActive, "mouse-up releases a latched Gate even after switching to One Shot");
+        wave->mouseDown (event); render (40);
+        check (! p.voice.playbackActive, "holding the mouse does not loop a One Shot");
+        wave->mouseUp (event); render (1);
+        wave->mouseDown (event); render (1);
+        check (p.voice.playbackSamplePosition >= 128 && p.voice.playbackSamplePosition < 256,
+               "repeated mouse clicks retrigger from the cue instead of resuming");
+        wave->mouseUp (event);
+        p.stopPlayback(); render (1);
+        check (! p.voice.playbackActive, "Stop cancels a mouse One Shot");
+
+        gate->onClick(); wave->mouseDown (event); render (1);
+        p.startPlayback(); render (1); wave->mouseUp (event); render (10);
+        check (p.voice.playbackActive && ! p.voice.playbackTriggeredByMouse,
+               "mouse-up does not stop a newer transport voice");
+        p.stopPlayback(); render (1);
+        gate->onClick(); wave->mouseDown (event); render (1);
+        editor.reset(); render (20);
+        check (! p.voice.playbackActive, "closing the editor releases a held mouse Gate");
+    }
+
+    static void runExportHandle()
+    {
+        P p; setup (p);
+        p.waveformZoom.store (0); p.waveformScroll.store (0);
+        auto layout = std::make_shared<P::ChopState>();
+        P::ChopDefinition chop;
+        chop.id = 1; chop.startSample = 0; chop.endSample = 32000;
+        layout->chops.push_back (chop); layout->selectedChopId = 1; layout->nextChopId = 2;
+        p.publishChopState (layout);
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+        editor->setVisible (true);
+        for (int i = 0; i < 30; ++i) pump();
+        std::function<juce::Component* (juce::Component&)> findWave = [&] (juce::Component& c) -> juce::Component*
+        {
+            if (juce::String (typeid (c).name()).contains ("WaveformDisplayComponent")) return &c;
+            for (auto* child : c.getChildren()) if (auto* found = findWave (*child)) return found;
+            return nullptr;
+        };
+        auto* wave = findWave (*editor);
+        auto* tooltip = dynamic_cast<juce::TooltipClient*> (wave);
+        check (wave != nullptr && tooltip != nullptr, "export waveform provides gesture hints");
+        if (wave == nullptr || tooltip == nullptr) return;
+        auto eventAt = [&] (juce::Point<float> point, bool pressed)
+        {
+            return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), point,
+                juce::ModifierKeys (pressed ? juce::ModifierKeys::leftButtonModifier : 0),
+                1, 0, 0, 0, 0, wave, wave, juce::Time::getCurrentTime(), point, juce::Time::getCurrentTime(), 1, false);
+        };
+        juce::Point<float> dragPoint, adsrPoint;
+        bool foundDrag = false, foundAdsr = false;
+        for (int x = 30; x < wave->getWidth() - 80; x += 3)
+        {
+            const juce::Point<float> point ((float) x, 48.0f);
+            wave->mouseMove (eventAt (point, false));
+            if (tooltip->getTooltip().startsWith ("Drag this chop")) { dragPoint = point; foundDrag = true; }
+            if (tooltip->getTooltip().startsWith ("Adjust this chop")) { adsrPoint = point; foundAdsr = true; }
+        }
+        check (foundDrag && foundAdsr && dragPoint != adsrPoint, "ADSR and DRAG AUDIO have distinct hit targets and hints");
+        if (! foundDrag || ! foundAdsr) return;
+        auto click = eventAt (dragPoint, true);
+        auto gate = std::make_shared<juce::WaitableEvent>();
+        p.exportThreadPool.addJob ([gate] { gate->wait (10000); });
+        wave->mouseDown (click);
+        check (p.exportThreadPool.getNumJobs() == 2, "pressing DRAG AUDIO immediately queues background preparation");
+        wave->mouseUp (click);
+        wave->mouseDoubleClick (click);
+        check (! p.isPlaying() && ! p.getChopState()->chops.front().favorite,
+               "export handle neither auditions nor toggles a favorite");
+        gate->signal();
+        check (waitFor ([&] { return p.exportThreadPool.getNumJobs() == 0; }), "early-release export preparation completes");
+        for (int i = 0; i < 10; ++i) pump();
+        check (findButton (*editor, "SAVE WAV...") == nullptr, "preparation click does not open the ADSR menu");
+
+        auto reuseGate = std::make_shared<juce::WaitableEvent>();
+        p.exportThreadPool.addJob ([reuseGate] { reuseGate->wait (10000); });
+        wave->mouseDown (click); wave->mouseUp (click);
+        check (p.exportThreadPool.getNumJobs() == 1, "repeat click reuses prepared audio without another render");
+        p.setChopEnvelopeParameter (1, P::ChopEnvelopeParameter::Attack, 25);
+        for (int i = 0; i < 5; ++i) pump();
+        wave->mouseDown (click); wave->mouseUp (click);
+        check (p.exportThreadPool.getNumJobs() == 2, "editing the chop invalidates prepared export audio");
+        reuseGate->signal();
+        check (waitFor ([&] { return p.exportThreadPool.getNumJobs() == 0; }), "updated export finishes after an early release");
+        for (int i = 0; i < 10; ++i) pump();
+        auto adsrClick = eventAt (adsrPoint, true);
+        wave->mouseDown (adsrClick); wave->mouseUp (adsrClick);
+        check (findButton (*editor, "SAVE WAV...") != nullptr, "ADSR opens the envelope menu with a separate Save WAV action");
+    }
+
+    static void runFavorites()
+    {
+        P p;
+        setup (p);
+        auto layout = std::make_shared<P::ChopState>();
+        for (int i = 0; i < 4; ++i)
+        {
+            P::ChopDefinition c;
+            c.id = i + 1; c.startSample = i * 16000; c.endSample = (i + 1) * 16000;
+            c.cueOffsetSamples = 17; c.gainDecibels = -2; c.pitchSemitones = 1;
+            c.assignedMidiNote = i == 0 ? 60 : i == 1 ? 72 : i == 2 ? -2 : -1;
+            layout->chops.push_back (c);
+        }
+        layout->nextChopId = 5;
+        p.publishChopState (layout);
+        p.setMidiOctaveOffset (1);
+        const auto originalMap = p.getChopState()->midiMap.noteToChopIndex;
+        const auto source = p.getLoadedSample();
+        for (int id : { 3, 1, 4 }) { p.selectChopById (id); p.toggleSelectedChopFavorite(); }
+        check (p.getChopState()->favoriteChopIndices == std::vector<int> { 2, 0, 3 },
+               "favorites retain click order rather than source order");
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+        auto* button = findButton (*editor, "FAVORITES");
+        check (button != nullptr, "Favorites button is present");
+        if (button == nullptr) return;
+        button->onClick();
+        check (p.isFavoritesViewEnabled() && button->getToggleState(), "Favorites button enters temporary performance view");
+        check (p.getMidiNoteForChopId (3) == 36 && p.getMidiNoteForChopId (1) == 37
+               && p.getMidiNoteForChopId (4) == 38 && p.getMidiNoteForChopId (2) == -1,
+               "only favorites map consecutively from C2, overriding pins temporarily");
+        p.setMidiOctaveOffset (-1);
+        check (p.getMidiOctaveOffset() == 1 && p.getMidiRootNote() == 36,
+               "Favorites keeps C2 without overwriting normal octave setting");
+        bool intact = p.getLoadedSample() == source && p.getChopState()->chops.size() == 4;
+        for (int i = 0; i < 4; ++i)
+        {
+            const auto& c = p.getChopState()->chops[(size_t) i];
+            intact = intact && c.startSample == i * 16000 && c.endSample == (i + 1) * 16000
+                   && c.cueOffsetSamples == 17 && c.assignedMidiNote == layout->chops[(size_t) i].assignedMidiNote
+                   && c.gainDecibels == -2 && c.pitchSemitones == 1;
+        }
+        check (intact, "Favorites preserves audio, bounds, processing and original MIDI assignments");
+        p.prepareToPlay (8000, 64);
+        juce::AudioBuffer<float> output (2, 64);
+        juce::MidiBuffer midi;
+        midi.addEvent (juce::MidiMessage::noteOn (1, 36, (juce::uint8) 100), 0);
+        p.processBlock (output, midi);
+        check (p.getLastTriggeredChopId() == 3, "real MIDI C2 triggers the first favorited chop");
+        const auto revision = p.getChopTriggerRevision();
+        midi.clear(); midi.addEvent (juce::MidiMessage::noteOn (1, 72, (juce::uint8) 100), 0);
+        p.processBlock (output, midi);
+        check (p.getChopTriggerRevision() == revision, "nonfavorite original MIDI assignment is inactive in Favorites");
+        p.selectChopById (3); p.toggleSelectedChopFavorite();
+        check (p.getMidiNoteForChopId (1) == 36 && p.getMidiNoteForChopId (4) == 37,
+               "removing a favorite closes the MIDI gap");
+        midi.clear(); p.processBlock (output, midi);
+        check (! p.voice.playbackActive, "remapping favorites silences a held voice safely on the audio thread");
+        p.undoLastEdit();
+        check (p.getChopState()->favoriteChopIndices == std::vector<int> { 2, 0, 3 }
+               && p.getMidiNoteForChopId (3) == 36, "Undo restores favorite order and compact MIDI mapping");
+        p.selectChopById (3); p.toggleSelectedChopFavorite();
+        p.setFavoritesViewEnabled (false);
+        p.selectChopById (3); p.toggleSelectedChopFavorite();
+        p.setFavoritesViewEnabled (true);
+        check (p.getChopState()->favoriteChopIndices == std::vector<int> { 0, 3, 2 },
+               "re-favoriting appends a chop to the end of the lineup");
+        juce::MemoryBlock saved; p.getStateInformation (saved);
+        P reopened;
+        reopened.setStateInformation (saved.getData(), (int) saved.getSize());
+        check (waitFor ([&] { return restored (reopened); }) && reopened.isFavoritesViewEnabled()
+               && reopened.getChopState()->favoriteChopIndices == std::vector<int> { 0, 3, 2 }
+               && reopened.getMidiNoteForChopId (1) == 36,
+               "project recall restores Favorites view, chronology and MIDI map");
+        std::unique_ptr<juce::AudioProcessorEditor> reopenedEditor (reopened.createEditor());
+        auto* restoredButton = findButton (*reopenedEditor, "FAVORITES");
+        check (restoredButton != nullptr && restoredButton->getToggleState(), "reopened editor shows Favorites enabled");
+        reopened.setFavoritesViewEnabled (false);
+        check (reopened.getChopState()->midiMap.noteToChopIndex == originalMap && reopened.getMidiRootNote() == 48,
+               "leaving Favorites after recall restores exact original mapping and root");
+        for (int id : { 1, 3, 4 }) { p.selectChopById (id); p.toggleSelectedChopFavorite(); }
+        check (p.getChopState()->favoriteChopIndices.empty() && p.getMappedMidiNotes().none()
+               && p.getChopState()->selectedChopId == -1, "empty Favorites has no phantom MIDI assignments or hidden selection");
+        p.setFavoritesViewEnabled (false);
+        check (p.getChopState()->midiMap.noteToChopIndex == originalMap, "empty Favorites can return to full original layout");
+
+        juce::MemoryInputStream input (saved.getData(), saved.getSize(), false); input.skipNextBytes (4);
+        auto legacy = juce::ValueTree::readFromStream (input);
+        legacy.removeProperty ("favoritesViewEnabled", nullptr);
+        for (auto child : legacy.getChildWithName ("ChopState")) child.removeProperty ("favoriteOrder", nullptr);
+        juce::MemoryBlock oldData;
+        { juce::MemoryOutputStream out (oldData, false); out.write ("CSB2", 4); legacy.writeToStream (out); }
+        reopened.setStateInformation (oldData.getData(), (int) oldData.getSize());
+        check (waitFor ([&] { return restored (reopened); }) && ! reopened.isFavoritesViewEnabled()
+               && reopened.getChopState()->favoriteChopIndices == std::vector<int> { 0, 2, 3 },
+               "legacy favorites without chronology use deterministic sample order");
+    }
+
+    static void runDoubleTempo (const juce::File& scratch)
+    {
+        P p;
+        setup (p);
+        auto analysis = std::make_shared<P::TempoAnalysisData>();
+        analysis->estimatedBpm = 60;
+        analysis->beatPeriodSeconds = 1;
+        analysis->analysisEndSeconds = 8;
+        std::atomic_store (&p.tempoAnalysis, analysis);
+        p.chopBarsCount.store (1);
+        p.publishChopState (std::make_shared<P::ChopState>());
+        p.buildChopsFromAnalysis (*analysis);
+        p.hostSampleRate.store (8000);
+        p.hostBpm.store (120);
+        p.setSyncToHost (true);
+        const auto originalChops = p.getChopState();
+        const auto originalAudio = p.getLoadedSample();
+        check (! p.getDoubleTempoEnabled() && originalChops->chops.size() == 2,
+               "60 BPM starts with two four-second bars");
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+        auto* button = findButton (*editor, "2x");
+        check (button != nullptr && button->isEnabled(), "2x button is available for analyzed audio");
+        if (button == nullptr) return;
+        button->onClick();
+        check (button->getToggleState() && p.getDoubleTempoEnabled()
+               && std::abs (p.getAdjustedAnalysisBpm (*analysis) - 120) < 1.0e-9,
+               "2x button changes detected 60 BPM to 120 BPM");
+        check (p.getChopState()->chops.size() == 4
+               && p.getChopState()->chops[0].endSample == 16000,
+               "2x rebuilds the automatic chop grid to two-second bars");
+        check (std::abs (p.timeStretchRatio.load() - 1.0f) < 1.0e-6f
+               && std::abs (p.getCurrentGridFingerprint() - 0.5) < 1.0e-9,
+               "2x uses corrected tempo for 120 BPM host sync and grid fingerprint");
+        p.setWarpDivision (P::WarpDivision_Beat);
+        check (std::abs (p.getWarpDivisionSeconds() - 0.5) < 1.0e-9,
+               "warp snapping follows doubled tempo");
+        check (p.getLoadedSample() == originalAudio && p.getGridBpmTrim() == 0,
+               "tempo correction preserves source audio and fine trim");
+        const auto exported = readExport (p.renderChopToTempWav (p.getChopState()->chops[0].id, true, scratch), 8000);
+        check (exported.getNumSamples() == 16000, "120 BPM sync export retains a two-second corrected bar");
+
+        juce::MemoryBlock saved;
+        p.getStateInformation (saved);
+        P reopened;
+        reopened.setStateInformation (saved.getData(), (int) saved.getSize());
+        check (waitFor ([&] { return restored (reopened); }) && reopened.getDoubleTempoEnabled() && reopened.getTempoAnalysis() != nullptr
+               && std::abs (reopened.getAdjustedAnalysisBpm (*reopened.getTempoAnalysis()) - 120) < 1.0e-9
+               && reopened.getChopState()->chops.size() == 4,
+               "2x and corrected chop grid survive portable project recall");
+        std::unique_ptr<juce::AudioProcessorEditor> reopenedEditor (reopened.createEditor());
+        auto* recalledButton = findButton (*reopenedEditor, "2x");
+        check (recalledButton != nullptr && recalledButton->getToggleState(), "reopened editor shows saved 2x state");
+
+        p.undoLastEdit();
+        const auto undone = p.getChopState();
+        bool restoredLayout = undone->chops.size() == originalChops->chops.size()
+                           && undone->selectedChopId == originalChops->selectedChopId
+                           && undone->midiMap.noteForChopIndex == originalChops->midiMap.noteForChopIndex;
+        for (size_t i = 0; restoredLayout && i < undone->chops.size(); ++i)
+            restoredLayout = undone->chops[i].id == originalChops->chops[i].id
+                          && undone->chops[i].startSample == originalChops->chops[i].startSample
+                          && undone->chops[i].endSample == originalChops->chops[i].endSample;
+        check (! p.getDoubleTempoEnabled() && restoredLayout
+               && std::abs (p.timeStretchRatio.load() - 0.5f) < 1.0e-6f,
+               "undo restores original tempo, chop layout and host sync");
+        button->onClick();
+        button->onClick();
+        check (! p.getDoubleTempoEnabled() && ! button->getToggleState()
+               && std::abs (p.getAdjustedAnalysisBpm (*analysis) - 60) < 1.0e-9,
+               "second click switches 2x off without cumulative doubling");
+        p.setGridBpmTrim (0.5f);
+        p.setDoubleTempoEnabled (true);
+        check (std::abs (p.getAdjustedAnalysisBpm (*analysis) - 120.5) < 1.0e-9,
+               "fine trim stays in BPM units after doubling");
+        p.setManualChopModeActive (true);
+        const auto manualChops = p.getChopState();
+        p.setDoubleTempoEnabled (false);
+        check (p.getChopState() == manualChops, "2x preserves manually placed chop boundaries");
+
+        juce::MemoryInputStream input (saved.getData(), saved.getSize(), false);
+        input.skipNextBytes (4);
+        auto legacy = juce::ValueTree::readFromStream (input);
+        legacy.removeProperty ("doubleTempoEnabled", nullptr);
+        juce::MemoryBlock legacyData;
+        { juce::MemoryOutputStream output (legacyData, false); output.write ("CSB2", 4); legacy.writeToStream (output); }
+        reopened.setStateInformation (legacyData.getData(), (int) legacyData.getSize());
+        check (waitFor ([&] { return restored (reopened); }) && ! reopened.getDoubleTempoEnabled(),
+               "older projects default to normal tempo");
+
+        P empty;
+        std::unique_ptr<juce::AudioProcessorEditor> emptyEditor (empty.createEditor());
+        const auto* emptyButton = findButton (*emptyEditor, "2x");
+        check (emptyButton != nullptr && ! emptyButton->isEnabled(), "2x is disabled without analyzed audio");
+        empty.setDoubleTempoEnabled (true);
+        check (! empty.getDoubleTempoEnabled(), "tempo correction cannot apply without analysis");
+    }
+
     static void run (bool testSeparation)
     {
         P original;
@@ -511,22 +886,37 @@ struct CueSamplerStateTests
 
         if (testSeparation)
         {
+            // Deliberately stall optional persistence: readiness, mute remix and
+            // an immediate portable save/restore must still complete.
+            auto cacheGate = std::make_shared<juce::WaitableEvent>();
+            original.stemCacheWriteThreadPool.addJob ([cacheGate] { cacheGate->wait (90000); });
+            const auto readyStart = juce::Time::getMillisecondCounterHiRes();
             original.requestStemSeparation();
             const auto deadline = juce::Time::getMillisecondCounterHiRes() + 60000.0;
             while (original.stemSeparationInProgress.load() && juce::Time::getMillisecondCounterHiRes() < deadline) pump();
             const auto actualStems = std::atomic_load (&original.stemSet);
-            check (actualStems != nullptr && actualStems->serializedStemData.getBinaryData() != nullptr,
-                   "real separation publishes portable stem data");
+            std::cout << "STEM READY ms=" << juce::Time::getMillisecondCounterHiRes() - readyStart << std::endl;
+            check (! original.stemSeparationInProgress.load() && actualStems != nullptr
+                   && actualStems != originalStems && actualStems->serializedStemData.getBinaryData() != nullptr,
+                   "real separation publishes portable stem data before cache write");
             if (actualStems != nullptr)
             {
                 const auto actualMix = original.getLoadedSample();
                 juce::MemoryBlock actualSaved;
                 original.getStateInformation (actualSaved);
-                cuesampler::StemCache::clear();
+                check (! cuesampler::StemCache::contains (actualStems->cacheKey), "stems are ready while disk cache is blocked");
+                original.setMuteDrums (false); original.setMuteVocals (false);
+                check (waitFor ([&] { return original.appliedStemMask.load() == 0; }), "mute remix completes while disk cache is blocked");
+                check (equal (actualStems->source->buffer, original.getLoadedSample()->buffer), "blocked cache cannot interfere with unmuted audio");
                 reopened.setStateInformation (actualSaved.getData(), (int) actualSaved.getSize());
                 check (waitFor ([&] { return restored (reopened); }), "real separation project reopens without cache/model");
                 check (equal (actualMix->buffer, reopened.getLoadedSample()->buffer), "real separated mix restores bit-exactly");
             }
+            cacheGate->signal();
+            check (waitFor ([&] { return original.stemCacheWriteThreadPool.getNumJobs() == 0; }), "optional cache writing finishes after release");
+            cuesampler::StemCache::Entry cached;
+            check (actualStems != nullptr && cuesampler::StemCache::load (actualStems->cacheKey, cached)
+                   && equal (cached.drums, actualStems->drums), "deferred cache write retains exact stems");
         }
     }
 };
@@ -543,6 +933,10 @@ int main (int argc, char** argv)
     ::setenv ("CUE_STEM_CACHE_DIR", scratch.getFullPathName().toRawUTF8(), 1);
    #endif
     CueSamplerStateTests::runExports (scratch);
+    CueSamplerStateTests::runMousePlaybackModes();
+    CueSamplerStateTests::runExportHandle();
+    CueSamplerStateTests::runFavorites();
+    CueSamplerStateTests::runDoubleTempo (scratch);
     CueSamplerStateTests::run (argc > 2 && juce::String (argv[2]) == "--separate");
     scratch.deleteRecursively();
     std::cout << (failures == 0 ? "ALL PASSED" : "FAILED") << std::endl;

@@ -13,6 +13,7 @@
 // the real user cache.
 
 #include "../StemCache.h"
+#include "../StemProcessingSettings.h"
 
 #include <juce_core/juce_core.h>
 
@@ -84,6 +85,45 @@ int main (int argc, char** argv)
     constexpr double sampleRate = 44100.0;
     constexpr int    numSamples = 44100; // 1 s
     const auto mix = makeBuffer (2, numSamples, 1);
+
+    // Environment overrides must change cache identity and malformed values
+    // must retain the quality default. Keep the caller's environment intact.
+    const char* overlapEnv = std::getenv ("CUE_STEM_OVERLAP");
+    const bool hadOverlap = overlapEnv != nullptr;
+    const juce::String savedOverlap = overlapEnv != nullptr ? overlapEnv : "";
+    const auto setOverlap = [] (const char* value)
+    {
+       #if JUCE_WINDOWS
+        ::_putenv_s ("CUE_STEM_OVERLAP", value != nullptr ? value : "");
+       #else
+        if (value != nullptr) ::setenv ("CUE_STEM_OVERLAP", value, 1);
+        else ::unsetenv ("CUE_STEM_OVERLAP");
+       #endif
+    };
+    setOverlap (nullptr);
+    check (cuesampler::StemProcessingSettings::fromEnvironment().overlap == 0.10, "default overlap is 10 percent");
+    const auto defaultKey = cuesampler::StemCache::makeKey (mix, sampleRate, "model-a");
+    setOverlap ("0");
+    check (defaultKey != cuesampler::StemCache::makeKey (mix, sampleRate, "model-a"), "overlap changes invalidate cached separation");
+    setOverlap ("0.10");
+    check (defaultKey == cuesampler::StemCache::makeKey (mix, sampleRate, "model-a"), "equivalent overlap settings share cache identity");
+    for (const auto* invalid : { "nan", "-1", "bad", "0.2junk" })
+    {
+        setOverlap (invalid);
+        check (cuesampler::StemProcessingSettings::fromEnvironment().overlap == 0.10, "invalid overlap retains quality default");
+    }
+    setOverlap ("1");
+    check (cuesampler::StemProcessingSettings::fromEnvironment().overlap == 0.5, "overlap override is bounded");
+    setOverlap (hadOverlap ? savedOverlap.toRawUTF8() : nullptr);
+
+    for (const int stride : { 343980, 309582, 171990 })
+        for (const int length : { 0, 1, 309582, 343979, 343980, 343981, 653562, 653563, 1000000 })
+        {
+            const int count = cuesampler::StemProcessingSettings::windowCount (length, 343980, stride);
+            const bool covers = length == 0 ? count == 0 : count > 0 && (count - 1) * stride + 343980 >= length;
+            const bool necessary = count <= 1 || (count - 2) * stride + 343980 < length;
+            check (covers && necessary, "windows cover every frame without redundant tail inference");
+        }
 
     // ---- keys ---------------------------------------------------------------
     const auto key = cuesampler::StemCache::makeKey (mix, sampleRate, "model-a");

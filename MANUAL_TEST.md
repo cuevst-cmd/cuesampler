@@ -8,6 +8,13 @@ Load the VST3 or AU in a DAW (or AudioPluginHost); watch the log for lines
 prefixed `StemSeparator:`.
 
 ## Chop playback modes
+- [ ] Both **GATE** and **ONE SHOT** choices stay visible; exactly the active mode is highlighted.
+- [ ] Click/hold a waveform chop in **GATE**: it loops until mouse-up, then releases.
+      In **ONE SHOT**, a quick click plays to the end once after mouse-up; holding
+      longer than the chop must not restart it. Repeat with an unassigned chop.
+- [ ] Re-click a waveform chop: it retriggers from its cue. Switching modes mid-click
+      affects the next trigger; the current voice retains the mode it started in.
+- [ ] Closing the editor releases a held mouse Gate. Stop cancels a mouse One Shot.
 - [ ] In **GATE** mode, hold a mapped MIDI note past the chop end. The chop loops from its
       cue point until note-off, then releases cleanly without a click.
 - [ ] In **GATE** mode, release before the chop end. Playback stops immediately with the
@@ -21,8 +28,8 @@ prefixed `StemSeparator:`.
       restore as One-Shot. Older projects should open in **GATE** mode.
 
 ## Per-chop ADSR and export
-- [ ] Select a chop and click its floating **ADSR / EXPORT** pill. The compact callout opens
-      with Attack, Decay, Sustain, and Release knobs; dragging the pill still starts a direct
+- [ ] Select a chop and click its floating **ADSR** button. The compact callout opens
+      with Attack, Decay, Sustain, and Release knobs; use the separate **DRAG AUDIO** handle for
       file drag into the DAW.
 - [ ] Give two chops clearly different envelopes and retrigger each from MIDI. Attack/decay/
       sustain remain independent per chop; in GATE mode Release begins on note-off.
@@ -263,7 +270,7 @@ The envelope follows full-velocity one-shot playback; a held MIDI gate/note-off
 performance is not recorded into the file. Prepared audio preserves headroom
 instead of independently normalising each chop.
 
-- [ ] Drag the export pill with pitch, warp, SYNC and HALF-TIME individually,
+- [ ] Drag the DRAG AUDIO handle with pitch, warp, SYNC and HALF-TIME individually,
       then combined. Place each WAV on the grid and compare its onset, duration,
       pitch and final transient to the loop; repeat at 44.1/48/96 kHz and with a
       source at a different rate. Check chops at the start/end of the source.
@@ -275,9 +282,9 @@ instead of independently normalising each chop.
       chops must remain audible and the file must not clip/normalise float peaks.
 - [ ] Cold-render a long processed chop. The editor should remain responsive and
       display Preparing export. Keep dragging to start the native file drag once
-      ready. Release early, then drag the pill again: the prepared result is reused
+      ready. Release early, then drag the handle again: the prepared result is reused
       if settings are unchanged. Change settings before retrying: it must re-render.
-- [ ] Use Export Chop As, cancel it, and test a destination that cannot be written.
+- [ ] Use ADSR > Save WAV, cancel it, and test a destination that cannot be written.
       Failed saves report an error and preserve the rendered file and any existing
       destination file. Close the editor while rendering; no crash or late dialog.
 - [ ] Drag to a DAW that references files in place. Wait more than 60 seconds,
@@ -293,3 +300,121 @@ conversion, float peaks, cue/reverse, stem intent, long-release short chops,
 background snapshots/cache lifetime, and stem-resampling alignment. Fresh stem
 cache keys include the corrected resampler revision; old saved projects preserve
 their embedded stems until explicitly separated again.
+
+## Stem quality and readiness (10% overlap / sinc resampling)
+
+New separations use 10% overlap and a band-limited, zero-phase sample-rate
+converter. Overlap adds roughly 11% more inference windows on long files versus
+zero overlap; short-file counts depend on length. Processing stops as soon as the
+last window covers the source. Optional disk-cache writes run on a separate
+worker after READY; the portable project payload is prepared before READY.
+Existing saved stems retain their original sound until separated again.
+
+- [ ] Separate music with drums and vocals spanning the 7.02-second window stride.
+      Listen across boundaries for clicks, pumping and bleed, comparing the same
+      source with `CUE_STEM_OVERLAP=0` and the default (unset). Compare identical
+      regions and levels; overlap does not guarantee better isolation on every song.
+- [ ] Try 8, 22.05, 44.1, 48 and 96 kHz sources. Check attacks remain aligned with
+      the original and that exported stem-muted loops match playback.
+- [ ] At READY, immediately change mute buttons, export a loop and save the DAW
+      project. Reopen with the original/cache unavailable and verify the exact mix,
+      chop settings and audio are retained. Repeat on a slow or unwritable cache.
+- [ ] Benchmark representative full songs separately from first-use model loading,
+      with several plugin instances playing at 64/128-sample host buffers. Check
+      playback stability, elapsed time and memory on macOS and Windows.
+
+Automated coverage: `test_stem_cache` checks setting-sensitive keys and complete,
+nonredundant window coverage. `test_project_restore` checks resampler passband,
+alias rejection, timing, short buffers and exact equal-rate copies. Run
+`test_project_restore <scratch-parent> --separate` with the model installed to
+exercise real inference, blocked cache writing, independent mute remixing and
+bit-exact portable save/restore before the cache exists.
+
+## Sample tempo 2x correction
+
+- [ ] Load a sample detected at 60 BPM and click **2x** next to the BPM readout.
+      The button lights up and BPM reads 120; click again to return to 60.
+- [ ] With one-bar automatic chops, boundaries change from every four seconds to
+      every two seconds. Grid lines and warp snap divisions follow the corrected
+      BPM. Manually placed chop boundaries stay in place.
+- [ ] In a 120 BPM DAW with SYNC enabled, the corrected 120 BPM sample plays at
+      its native tempo. Export a one-bar chop and confirm a two-second file.
+      Without SYNC, correcting the detected BPM does not change playback speed.
+- [ ] Apply a +0.5 BPM trim: 2x uses 120.5 BPM, retaining the fine trim in BPM units.
+      Confirm manual BPM entry and shift-resize use the corrected tempo too.
+- [ ] Undo restores the prior BPM, chop layout and sync ratio. Save/reopen a
+      project with 2x enabled and verify the lit button, grid and exports.
+- [ ] Older projects open with 2x off; loading a different sample resets it.
+      The button is disabled while analysis is running or no sample is loaded.
+
+`test_project_restore` exercises the real button, tempo/grid/sync/export math,
+Undo, fine trim, manual chops, saved-state recall and older-state defaults.
+
+## Favorite keyboard colors
+
+- [ ] Double-click a chop to favorite it: both the chop and its mapped visual
+      keyboard key turn pink. Check white and black keys.
+- [ ] Select or play a favorite: its key remains pink, with a stronger highlight.
+      Unfavorite it and confirm the usual mapped/selected color returns.
+- [ ] Undo, change OCT, switch chop layers and reopen the editor/project. Pink
+      follows the current resolved MIDI mapping and saved favorite state; an
+      unreachable chop must not tint a key owned by a different chop.
+
+## Favorites performance view
+
+- [ ] Favorite chops out of sample order (for example 3, 1, 6, 4). Click
+      **FAVORITES** above the waveform: only those chops appear, side by side,
+      labeled C2, C#2, D2, D#2 in the order they were favorited. Pink keyboard
+      keys and incoming MIDI must agree with the tile labels.
+- [ ] Click/hold a tile in GATE mode, then release it. Try ONE SHOT and hardware
+      MIDI too. Cue, gain, pitch, reverse, warp and stem settings still belong
+      to the original chops. This view does not concatenate or rewrite audio.
+- [ ] Double-click a tile to unfavorite it. Remaining assignments close the gap.
+      Undo restores its position. Re-favorite a removed chop from the full view:
+      it goes to the end. Remapping while holding a key must not leave a stuck note.
+- [ ] Toggle Favorites off. Original explicit MIDI assignments, unassigned chops,
+      octave offset, full waveform zoom/scroll and source boundaries return.
+      In Favorites, octave and waveform-editing controls are disabled; favorite
+      tiles wrap into rows and fit within the waveform panel without scrolling.
+- [ ] Save/reopen with Favorites on, including favorites from a manual chop layout.
+      The current view, favorite order and temporary MIDI map return. Switching
+      it off after recall still restores the original mappings.
+- [ ] Remove every favorite: show the empty-state instructions and no mapped keys.
+      Load another sample: Favorites returns off. Old projects without favorite
+      chronology use sample order initially; new favorite actions record order.
+- [ ] With 8, 18 and 24 favorites, verify every tile fits on screen in rows.
+      Resize the window: labels and waveforms stay inside their tiles. Play and
+      remove tiles in each row; gaps and empty cells must not trigger a chop.
+      The first 92 favorites map from MIDI 36 (C2) through 127 (G9); additional
+      tiles explicitly display NO MIDI. Favorites are taken from the active chop
+      layout; switch the manual/automatic layout in the full view.
+
+`test_project_restore` checks chronology, the real Favorites button, C2 MIDI
+triggering, original-pin suppression/restoration, original audio/settings,
+held-voice reset on remap, removal/re-add, Undo, portable recall and old states.
+
+## Explicit chop export handle
+- [ ] Selecting a chop shows separate **ADSR** and **DRAG AUDIO** controls. They
+      remain available in manual and warp modes without obscuring the +/- buttons.
+- [ ] Hold the waveform for more than two seconds: this only previews audio;
+      no export countdown or export gesture is armed.
+- [ ] Press DRAG AUDIO: show **PREPARING...** while the worker renders. Moving
+      the mouse starts a native audio-file drag as soon as rendering is ready.
+- [ ] Release before it is ready. No delayed drag or Save dialog should appear;
+      a checkmark and **AUDIO READY** message invite the next drag.
+- [ ] A simple click on DRAG AUDIO prepares the audio without opening ADSR or
+      toggling a favorite. Repeating the click reuses the prepared file.
+- [ ] Change pitch/warp/stems after preparing: the next export uses fresh settings.
+      Select another chop while rendering: its next request supersedes the old UI result.
+- [ ] ADSR opens its envelope menu; **SAVE WAV...** opens the file-save workflow.
+- [ ] Test actual drops in a DAW on macOS and Windows, including a cold render,
+      early release/retry, rejected drop and repeat drag of unchanged audio.
+
+## Knob defaults
+- [ ] Change each main knob, then Option-click (Mac) / Alt-click (Windows):
+      CUE, both GAIN/PITCH controls, TEMPO trim, ZOOM and SCROLL return to zero.
+- [ ] ADSR resets to Attack 0 ms, Decay 0 ms, Sustain 100%, Release 5 ms.
+      Confirm the selected chop's stored settings match the knobs.
+- [ ] After dragging a knob, Option-click and move the mouse before release:
+      the reset value stays put. Normal dragging still works on the next gesture.
+- [ ] Knob tooltips name the platform's reset modifier. Double-click also resets.

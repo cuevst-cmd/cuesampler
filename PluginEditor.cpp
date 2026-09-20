@@ -641,8 +641,9 @@ public:
 
     void captureCurrentValueAsDefault() noexcept
     {
-        defaultValue = getValue();
-        hasDefaultValue = true;
+        // JUCE also clears any previous drag state and sends the normal
+        // gesture/value notifications when returning to this default.
+        setDoubleClickReturnValue (true, getValue(), juce::ModifierKeys::altModifier);
     }
 
     float getHoverAlpha() const noexcept { return hoverAlpha; }
@@ -659,15 +660,15 @@ public:
         ensureAnimating();
     }
 
-    void mouseDown (const juce::MouseEvent& event) override
+    juce::String getTooltip() override
     {
-        if (hasDefaultValue && event.mods.isAltDown())
-        {
-            setValue (defaultValue, juce::sendNotificationSync);
-            return;
-        }
-
-        juce::Slider::mouseDown (event);
+       #if JUCE_MAC
+        const juce::String hint = "Option-click to reset to default.";
+       #else
+        const juce::String hint = "Alt-click to reset to default.";
+       #endif
+        const auto description = juce::Slider::getTooltip();
+        return description.isEmpty() ? hint : description + " " + hint;
     }
 
 private:
@@ -694,8 +695,6 @@ private:
         repaint();
     }
 
-    double defaultValue = 0.0;
-    bool hasDefaultValue = false;
     float hoverAlpha = 0.0f;
     int   animHz = 60;
 };
@@ -1088,7 +1087,7 @@ public:
 
             if (button.getToggleState())
             {
-                const auto accent = themedTitleColour (accentOrange);
+                const auto accent = getCueAccent (button, themedTitleColour (accentOrange));
                 g.setColour (accent.withAlpha (0.18f));
                 g.fillRoundedRectangle (bounds.reduced (1.0f), 2.0f);
                 g.setColour (accent.withAlpha (0.80f));
@@ -1199,7 +1198,7 @@ public:
         if (style == "segment")
         {
             const float hover = getHoverAlpha (button, false);
-            const auto accent = themedTitleColour (accentOrange);
+            const auto accent = getCueAccent (button, themedTitleColour (accentOrange));
             auto ink = button.getToggleState() ? accent
                                                : textMuted.interpolatedWith (textPrimary, hover);
 
@@ -1467,7 +1466,7 @@ public:
         addAndMakeVisible (sustainKnob);
         addAndMakeVisible (releaseKnob);
 
-        configureButton (exportButton, "EXPORT CHOP", textPrimary.withAlpha (0.92f));
+        configureButton (exportButton, "SAVE WAV...", textPrimary.withAlpha (0.92f));
         exportButton.getProperties().set ("cueStyle", "flatAction");
         exportButton.setTooltip ("Save this chop with its ADSR envelope baked into the audio.");
         exportButton.onClick = [this]
@@ -1570,26 +1569,31 @@ public:
         setColour (juce::MidiKeyboardComponent::textLabelColourId, juce::Colour (0xff746757));
     }
 
-    // Lights a key for a previewed chop without going through the shared
-    // MidiKeyboardState (which would inject a note and re-trigger the chop).
-    // Drawn with the same pressed-overlay as a real key-down.
-    void setHighlightedNote (int note)
+    // Resolve selection, playable keys and favorites from one immutable map.
+    // Using the winning chop for each note also handles explicit MIDI mappings
+    // and collisions without colouring a key for an unreachable favorite.
+    void refreshChops (const std::shared_ptr<const AudioPluginAudioProcessor::ChopState>& state)
     {
-        if (note == highlightedNote)
-            return;
-        highlightedNote = note;
-        repaint();
-    }
+        std::bitset<128> mapped, favorites;
+        int selectedNote = -1;
+        if (state != nullptr)
+            for (int note = 0; note < 128; ++note)
+            {
+                const int index = state->midiMap.noteToChopIndex[(size_t) note];
+                if (index < 0 || (size_t) index >= state->chops.size())
+                    continue;
+                const auto& chop = state->chops[(size_t) index];
+                mapped.set ((size_t) note);
+                favorites.set ((size_t) note, chop.favorite);
+                if (chop.id == state->selectedChopId)
+                    selectedNote = note;
+            }
 
-    // The notes that will actually trigger a chop. The keyboard spans C1..B7 —
-    // 84 keys — and a typical chop set maps eight of them, so without this the
-    // bed of dead keys is indistinguishable from the live ones. Cheap to call
-    // repeatedly: unchanged input is a no-op, so this never churns repaints.
-    void setMappedNotes (const std::bitset<128>& notes)
-    {
-        if (notes == mappedNotes)
+        if (mapped == mappedNotes && favorites == favoriteNotes && selectedNote == highlightedNote)
             return;
-        mappedNotes = notes;
+        mappedNotes = mapped;
+        favoriteNotes = favorites;
+        highlightedNote = selectedNote;
         repaint();
     }
 
@@ -1606,8 +1610,16 @@ public:
                         bool isDown, bool isOver, juce::Colour lineColour, juce::Colour textColour) override
     {
         const bool lit = isDown || midiNoteNumber == highlightedNote;
-        juce::MidiKeyboardComponent::drawWhiteNote (midiNoteNumber, g, area, lit,
-                                                    isOver, lineColour, textColour);
+        const bool favorite = isFavorite (midiNoteNumber);
+        if (favorite)
+        {
+            g.setColour (juce::Colour (0xffff2db1).withAlpha (lit ? 0.85f : isOver ? 0.65f : 0.45f));
+            g.fillRect (area.reduced (0.5f, 0.0f));
+        }
+        // Draw labels and separators above the tint; a favorite stays pink
+        // while selected/pressed, instead of changing to the mode accent.
+        juce::MidiKeyboardComponent::drawWhiteNote (midiNoteNumber, g, area, lit && ! favorite,
+                                                    isOver && ! favorite, lineColour, textColour);
         paintMappedWash (g, area, midiNoteNumber, lit, 0.22f);
     }
 
@@ -1615,14 +1627,23 @@ public:
                         bool isDown, bool isOver, juce::Colour noteFillColour) override
     {
         const bool lit = isDown || midiNoteNumber == highlightedNote;
-        juce::MidiKeyboardComponent::drawBlackNote (midiNoteNumber, g, area, lit,
-                                                    isOver, noteFillColour);
+        const bool favorite = isFavorite (midiNoteNumber);
+        if (favorite)
+            noteFillColour = noteFillColour.interpolatedWith (juce::Colour (0xffff2db1),
+                                                              lit ? 0.95f : isOver ? 0.85f : 0.7f);
+        juce::MidiKeyboardComponent::drawBlackNote (midiNoteNumber, g, area, lit && ! favorite,
+                                                    isOver && ! favorite, noteFillColour);
         // Sharps start from near-black, so the same alpha that reads clearly on
         // cream would be invisible here.
         paintMappedWash (g, area, midiNoteNumber, lit, 0.42f);
     }
 
 private:
+    bool isFavorite (int note) const noexcept
+    {
+        return note >= 0 && note < 128 && favoriteNotes.test ((size_t) note);
+    }
+
     // Three tiers have to stay tellable apart at a glance:
     //   unmapped      — untouched cream / near-black
     //   mapped, silent— this wash
@@ -1632,7 +1653,7 @@ private:
     void paintMappedWash (juce::Graphics& g, juce::Rectangle<float> area,
                           int midiNoteNumber, bool lit, float alpha) const
     {
-        if (lit || midiNoteNumber < 0 || midiNoteNumber > 127)
+        if (lit || isFavorite (midiNoteNumber) || midiNoteNumber < 0 || midiNoteNumber > 127)
             return;
         if (! mappedNotes.test ((size_t) midiNoteNumber))
             return;
@@ -1643,6 +1664,7 @@ private:
 
     int highlightedNote = -1;
     std::bitset<128> mappedNotes;
+    std::bitset<128> favoriteNotes;
 };
 
 class DisplayBox final : public juce::Component,
@@ -2401,7 +2423,8 @@ public:
         : processor (p),
           horizontalScrollBar (false)
     {
-        setTooltip ("Click a chop to select and preview it.  Double-click to toggle favourite (pink highlight).  "
+        setTooltip ("Click a chop to preview it. Use DRAG AUDIO to export, or ADSR to adjust its envelope and save a WAV.  "
+                    "Double-click to toggle favourite (pink highlight).  "
                     "Drag a selected chop edge to change only that chop's start or end.  "
                     "Shift-drag a selected chop edge to resize the grid and update tempo.  "
                     "Drag an audio file here to load it.");
@@ -2427,11 +2450,58 @@ public:
         horizontalScrollBar.addListener (this);
         horizontalScrollBar.setAlwaysOnTop (true);
         addAndMakeVisible (horizontalScrollBar);
+        // The selected chop's actions should be usable on the first frame,
+        // including when the host has not started delivering editor timers yet.
+        if (const auto state = processor.getChopState())
+        {
+            exportTargetChopId = lastSeenSelectedId = state->selectedChopId;
+            exportButtonAppear = 1.0f;
+        }
+    }
+
+    // Reuse the source peak cache for compact favorites tiles. This is drawing
+    // only; MIDI playback still uses the original chop and its processing.
+    void drawFavoriteWaveform (juce::Graphics& g, juce::Rectangle<float> area,
+                               const AudioPluginAudioProcessor::ChopDefinition& chop)
+    {
+        const auto sample = processor.getLoadedSample();
+        if (sample == nullptr || sample->buffer.getNumSamples() == 0) return;
+        if (sample != peakCacheSource) updatePeakCache();
+        const int length = sample->buffer.getNumSamples();
+        const int begin = juce::jlimit (0, length - 1, chop.startSample);
+        const int end = juce::jlimit (begin + 1, length, chop.endSample);
+        const int width = juce::jmax (1, (int) area.getWidth());
+        const float mid = area.getCentreY(), height = area.getHeight() * 0.46f;
+        g.setColour (juce::Colour (0xffff2db1).withAlpha (0.88f));
+        for (int x = 0; x < width; ++x)
+        {
+            const int column = chop.reversed ? width - 1 - x : x;
+            const int a = begin + (int) ((int64_t) (end - begin) * column / width);
+            const int b = juce::jmin (end, juce::jmax (a + 1, begin + (int) ((int64_t) (end - begin) * (column + 1) / width)));
+            float low = 0, high = 0;
+            if (b - a < cacheBlockSize || peakCache.isEmpty())
+            {
+                for (int ch = 0; ch < sample->buffer.getNumChannels(); ++ch)
+                {
+                    const auto range = sample->buffer.findMinMax (ch, a, b - a);
+                    low = juce::jmin (low, range.getStart()); high = juce::jmax (high, range.getEnd());
+                }
+            }
+            else
+                for (int block = a / cacheBlockSize; block < (b + cacheBlockSize - 1) / cacheBlockSize && block < peakCache.size(); ++block)
+                {
+                    const auto range = peakCache.getReference (block);
+                    low = juce::jmin (low, range.getStart()); high = juce::jmax (high, range.getEnd());
+                }
+            g.drawVerticalLine ((int) area.getX() + x, mid - juce::jlimit (0.0f, 1.0f, high) * height,
+                                 mid - juce::jlimit (-1.0f, 0.0f, low) * height + 1.0f);
+        }
     }
 
     ~WaveformDisplayComponent() override
     {
         stopTimer();
+        if (isHoldingToPlay) processor.releaseChopPreview();
         readyExportFile.deleteFile();
         // Cancel any in-flight capture, but deliberately do NOT leave manual
         // mode here. Closing the plugin window is not an edit, and exiting the
@@ -2489,13 +2559,21 @@ public:
                 loadAnimPhase = 0.0f;
             }
         }
+        if (! exportRendering && readyExportFile != juce::File()
+            && ! processor.isChopExportCurrent (exportRequest))
+        {
+            readyExportFile.deleteFile();
+            readyExportFile = juce::File();
+        }
         repaint();
     }
 
     juce::String getTooltip() override
     {
+        if (adsrButtonHovered)
+            return "Adjust this chop's envelope, or save it as a WAV file.";
         if (exportButtonHovered)
-            return "Click for this chop's ADSR and Export menu, or drag directly into your DAW.";
+            return "Drag this chop's audio into your DAW. No hold required. Click to prepare it first.";
         return juce::SettableTooltipClient::getTooltip();
     }
 
@@ -2552,8 +2630,9 @@ public:
         hoveredChopId = -1;
         if (edgeDragChopId < 0)
             edgeHoverKind = 0;
-        if (exportButtonHovered)
+        if (exportButtonHovered || adsrButtonHovered)
         {
+            adsrButtonHovered = false;
             exportButtonHovered = false;
             repaint();
         }
@@ -2565,9 +2644,8 @@ public:
         if (! isPositionInsideDisplay (event.position))
             return;
 
-        // The compact chop-action pill remains available in manual mode once
-        // a completed chop is selected. Click opens ADSR/export; drag retains
-        // the direct drag-to-DAW gesture.
+        // Separate envelope and audio-drag controls remain available for
+        // completed manual chops and take priority over waveform gestures.
         // Delete badge outranks everything: it sits on top of the pill row and
         // is only a 20 px target, so a hit here is unambiguous.
         if (hitTestDeleteBadge (event.position))
@@ -2577,8 +2655,18 @@ public:
             return;
         }
 
+        if (hitTestAdsrButton (event.position))
+        {
+            adsrButtonPressed = event.mods.isLeftButtonDown();
+            repaint();
+            return;
+        }
+
         if (hitTestExportButton (event.position))
         {
+            if (! event.mods.isLeftButtonDown()) return;
+            exportPressedChopId = exportTargetChopId;
+            beginExport (exportPressedChopId, ExportAction::prepare);
             exportButtonPressed   = true;
             exportButtonDragArmed = false;
             exportButtonPressPos  = event.position;
@@ -2586,7 +2674,7 @@ public:
             return;
         }
 
-        // Manual mode keeps ordinary click-to-audition/export disabled, but
+        // Manual mode keeps ordinary click-to-audition disabled, but
         // completed chop boundaries remain directly draggable. Any chop can
         // be grabbed by either edge; its exact MIDI assignment is untouched.
         if (manualChopMode)
@@ -2651,26 +2739,10 @@ public:
         const auto targetSample = sampleForDisplayPosition (event.position.x);
         processor.selectChopAtSample (targetSample);
         isHoldingToPlay = true;
-        processor.startPlayback();
+        processor.startChopPreview();
         updateHoverState (event.position);
 
-        // Begin hold-for-export detection
-        holdChopId     = -1;
-        holdTickCount  = 0;
-        exportDragReady = false;
-        exportDragFired = false;
 
-        if (const auto cs = processor.getChopState())
-        {
-            for (const auto& c : cs->chops)
-            {
-                if (targetSample >= (double) c.startSample && targetSample < (double) c.endSample)
-                {
-                    holdChopId = c.id;
-                    break;
-                }
-            }
-        }
     }
 
     void updateCursorForMode (juce::Point<float> pos)
@@ -2687,6 +2759,18 @@ public:
             return;
         }
 
+        const bool overAdsr = hitTestAdsrButton (pos);
+        if (overAdsr != adsrButtonHovered)
+        {
+            adsrButtonHovered = overAdsr;
+            repaint();
+        }
+        if (overAdsr)
+        {
+            setMouseCursor (juce::MouseCursor::PointingHandCursor);
+            return;
+        }
+
         const bool overExport = hitTestExportButton (pos);
         if (overExport != exportButtonHovered)
         {
@@ -2695,7 +2779,7 @@ public:
         }
         if (overExport)
         {
-            setMouseCursor (juce::MouseCursor::PointingHandCursor);
+            setMouseCursor (juce::MouseCursor::DraggingHandCursor);
             return;
         }
 
@@ -3296,26 +3380,26 @@ public:
             }
             return;
         }
-        // Dragging the floating export button arms the OS file drag immediately
-        // (no 2 s wait). A tiny threshold distinguishes a drag from a click;
-        // cold renders continue the gesture after the worker finishes.
+        // A small movement threshold distinguishes a drag from a preparation
+        // click. Rendering starts on mouse-down, before the user leaves the handle.
         if (exportButtonPressed)
         {
             if (! exportButtonDragArmed
                 && event.position.getDistanceFrom (exportButtonPressPos) > 4.0f)
             {
                 exportButtonDragArmed = true;
-                const int chopId = exportTargetChopId;
+                const int chopId = exportPressedChopId;
                 exportButtonPressed = false;
                 if (chopId >= 0)
                 {
-                    exportDragFired = true; // suppress our own FileDragAndDropTarget
                     initiateChopExportDrag (chopId);
                 }
                 repaint();
             }
             return;
         }
+
+        if (adsrButtonPressed) return;
 
         if (processor.isWarpModeActive() && warpDragChopId >= 0 && warpDragMarkerIndex >= 0)
         {
@@ -3335,13 +3419,6 @@ public:
             return;
         }
 
-        // Trigger OS file drag when the 2-second hold is ready
-        if (exportDragReady && holdChopId >= 0 && ! exportDragFired)
-        {
-            exportDragFired = true;
-            initiateChopExportDrag (holdChopId);
-            return;
-        }
 
     }
 
@@ -3361,17 +3438,19 @@ public:
             return;
         }
 
-        // Released on the chop-action pill without dragging => open the
-        // per-chop ADSR/export callout.
-        if (exportButtonPressed)
+        if (adsrButtonPressed)
         {
-            exportButtonPressed = false;
-            if (! exportButtonDragArmed && hitTestExportButton (event.position))
-            {
-                if (exportTargetChopId >= 0)
-                    showChopAdsrMenu (exportTargetChopId);
-            }
-            exportButtonDragArmed = false;
+            adsrButtonPressed = false;
+            if (hitTestAdsrButton (event.position) && exportTargetChopId >= 0)
+                showChopAdsrMenu (exportTargetChopId);
+            repaint();
+            return;
+        }
+
+        if (exportButtonPressed || exportButtonDragArmed)
+        {
+            exportButtonPressed = exportButtonDragArmed = false;
+            exportPressedChopId = -1;
             repaint();
             return;
         }
@@ -3405,21 +3484,19 @@ public:
         if (isHoldingToPlay)
         {
             isHoldingToPlay = false;
-            processor.stopPlayback();
+            processor.releaseChopPreview();
         }
 
-        // Reset hold-export state
-        holdChopId     = -1;
-        holdTickCount  = 0;
-        exportDragReady = false;
-        exportDragFired = false;
-        setMouseCursor (juce::MouseCursor::NormalCursor);
+
     }
 
     void mouseDoubleClick (const juce::MouseEvent& event) override
     {
         if (! isPositionInsideDisplay (event.position))
             return;
+
+        if (hitTestExportButton (event.position) || hitTestAdsrButton (event.position)
+            || hitTestDeleteBadge (event.position)) return;
 
         if (manualChopMode)
         {
@@ -3716,122 +3793,6 @@ public:
         paintEdgeDragGhost (g, waveformBounds);
         paintPlayhead (g, waveformBounds);
 
-        // ---- Hold-to-export loading animation ----
-        if (holdChopId >= 0 && ! exportDragReady && holdTickCount > 0)
-        {
-            if (const auto cs = processor.getChopState())
-            {
-                for (const auto& c : cs->chops)
-                {
-                    if (c.id != holdChopId)
-                        continue;
-
-                    const auto numSamples = [&]() -> int
-                    {
-                        if (const auto s = processor.getLoadedSample())
-                            return s->buffer.getNumSamples();
-                        return 0;
-                    }();
-                    if (numSamples <= 0)
-                        break;
-
-                    const auto visRange = getVisibleRange (numSamples);
-                    const auto startX   = displayXForSamplePosition ((double) c.startSample, visRange, waveformBounds);
-                    const auto endX     = displayXForSamplePosition ((double) c.endSample,   visRange, waveformBounds);
-                    auto chopRect = juce::Rectangle<float> (
-                        std::min (startX, endX), waveformBounds.getY(),
-                        std::abs (endX - startX), waveformBounds.getHeight());
-
-                    const float progress = (float) holdTickCount / (float) holdTicksRequired();
-                    const juce::Colour amber (0xffffb300);
-
-                    juce::Graphics::ScopedSaveState ss (g);
-                    juce::Path clip;
-                    clip.addRoundedRectangle (waveformBounds, 4.0f);
-                    g.reduceClipRegion (clip);
-
-                    // Amber fill deepening with progress
-                    g.setColour (amber.withAlpha (0.05f + 0.20f * progress));
-                    g.fillRect (chopRect);
-
-                    // Circular progress ring
-                    const float cx     = chopRect.getCentreX();
-                    const float cy     = chopRect.getCentreY();
-                    const float radius = juce::jlimit (8.0f, 18.0f,
-                                                       juce::jmin (chopRect.getWidth() * 0.35f,
-                                                                   chopRect.getHeight() * 0.32f));
-                    const float ringW  = juce::jmax (1.5f, radius * 0.22f);
-
-                    // Background ring
-                    g.setColour (juce::Colours::black.withAlpha (0.40f));
-                    g.drawEllipse (cx - radius, cy - radius, radius * 2.0f, radius * 2.0f, ringW);
-
-                    // Sweeping amber arc (clockwise from 12 o'clock)
-                    juce::Path arc;
-                    const float startAngle = -juce::MathConstants<float>::halfPi;
-                    const float endAngle   = startAngle + progress * juce::MathConstants<float>::twoPi;
-                    arc.addArc (cx - radius, cy - radius, radius * 2.0f, radius * 2.0f,
-                                startAngle, endAngle, true);
-                    juce::PathStrokeType strokeType (ringW,
-                                                     juce::PathStrokeType::curved,
-                                                     juce::PathStrokeType::rounded);
-                    g.setColour (amber.withAlpha (0.92f));
-                    g.strokePath (arc, strokeType);
-
-                    break;
-                }
-            }
-        }
-
-        // ---- Export-ready amber overlay ----
-        if (exportDragReady && holdChopId >= 0)
-        {
-            if (const auto cs = processor.getChopState())
-            {
-                for (const auto& c : cs->chops)
-                {
-                    if (c.id != holdChopId)
-                        continue;
-
-                    const auto numSamples = [&]() -> int
-                    {
-                        if (const auto s = processor.getLoadedSample())
-                            return s->buffer.getNumSamples();
-                        return 0;
-                    }();
-                    if (numSamples <= 0)
-                        break;
-
-                    const auto visRange = getVisibleRange (numSamples);
-                    const auto startX   = displayXForSamplePosition ((double) c.startSample, visRange, waveformBounds);
-                    const auto endX     = displayXForSamplePosition ((double) c.endSample,   visRange, waveformBounds);
-                    auto chopRect = juce::Rectangle<float> (
-                        std::min (startX, endX), waveformBounds.getY(),
-                        std::abs (endX - startX), waveformBounds.getHeight());
-
-                    juce::Graphics::ScopedSaveState ss (g);
-                    juce::Path clip;
-                    clip.addRoundedRectangle (waveformBounds, 4.0f);
-                    g.reduceClipRegion (clip);
-
-                    g.setColour (juce::Colour (0xffffb300).withAlpha (0.28f));
-                    g.fillRect (chopRect);
-                    g.setColour (juce::Colour (0xffffb300).withAlpha (0.85f));
-                    g.drawRect (chopRect.expanded (0.0f, 0.0f), 2.0f);
-
-                    if (chopRect.getWidth() > 50.0f)
-                    {
-                        g.setColour (juce::Colour (0xffffb300));
-                        g.setFont (monoFont (13.0f));
-                        g.drawFittedText ("DRAG TO EXPORT",
-                                          chopRect.withSizeKeepingCentre (chopRect.getWidth() - 8.0f, 22.0f).toNearestInt(),
-                                          juce::Justification::centred, 1);
-                    }
-                    break;
-                }
-            }
-        }
-
         // ---- Drag-over highlight ----
         if (isDragOver)
         {
@@ -3843,15 +3804,16 @@ public:
 
         // ---- Floating export affordance (drawn on top) ----
         paintExportButton (g);
-        if (exportRendering || readyExportFile != juce::File())
+        if (exportRequestedChopId == exportTargetChopId
+            && (exportRendering || readyExportFile != juce::File()))
         {
             const auto status = getDisplayBounds().toNearestInt().removeFromBottom (24).reduced (8, 0);
             g.setColour (juce::Colours::black.withAlpha (0.85f));
             g.fillRect (status);
             g.setColour (juce::Colour (0xffffb300));
             g.setFont (monoFont (11.0f));
-            g.drawText (exportRendering ? "Preparing export... keep dragging, or drag again when ready."
-                                       : "Export ready. Drag the export button to place the audio.",
+            g.drawText (exportRendering ? "PREPARING AUDIO... Keep holding and move to drag when ready, or release and drag again."
+                                       : "AUDIO READY - drag the DRAG AUDIO handle into your DAW.",
                         status, juce::Justification::centred);
         }
     }
@@ -3947,33 +3909,46 @@ private:
                                                "Chop export", message);
     }
 
-    void beginExport (int chopId, bool forDrag)
+    enum class ExportAction { prepare, drag, save };
+
+    void beginExport (int chopId, ExportAction action)
     {
-        if (exportRendering) return;
-        if (exportRequestedChopId == chopId && readyExportFile.existsAsFile()
-            && processor.isChopExportCurrent (exportRequest))
+        if (chopId < 0) return;
+        const bool sameRequest = exportRequestedChopId == chopId
+                              && processor.isChopExportCurrent (exportRequest);
+        if (exportRendering && sameRequest)
         {
-            if (forDrag) startReadyExportDrag(); else showExportSaveDialog();
+            exportCompletionAction = action;
+            exportWaitingForDrag = action == ExportAction::drag;
+            return;
+        }
+        if (sameRequest && readyExportFile.existsAsFile())
+        {
+            if (action == ExportAction::drag) startReadyExportDrag();
+            else if (action == ExportAction::save) showExportSaveDialog();
             return;
         }
         readyExportFile.deleteFile();
         readyExportFile = juce::File();
         exportRequestedChopId = chopId;
         exportRequest = processor.captureChopExport (chopId, processor.getSyncToHost());
+        exportCompletionAction = action;
+        exportWaitingForDrag = action == ExportAction::drag;
+        exportDragFired = false;
         if (exportRequest == nullptr)
         {
-            exportDragFired = exportDragReady = false;
+            exportRendering = exportWaitingForDrag = false;
             showExportError ("The chop is not ready. Wait for sample loading or stem separation to finish, then try again.");
             return;
         }
         exportRendering = true;
-        exportWaitingForDrag = forDrag;
-        exportDragFired = exportDragReady = false;
         repaint();
         juce::Component::SafePointer<WaveformDisplayComponent> safeThis (this);
-        processor.renderChopExportAsync (exportRequest, [safeThis, forDrag] (juce::File file)
+        const auto request = exportRequest;
+        processor.renderChopExportAsync (request, [safeThis, request] (juce::File file)
         {
-            if (safeThis == nullptr)
+            // A newer chop/setting may supersede a render while its worker runs.
+            if (safeThis == nullptr || safeThis->exportRequest != request)
             {
                 file.deleteFile();
                 return;
@@ -3988,15 +3963,14 @@ private:
                 showExportError ("The audio could not be rendered or written. Please try again and check available disk space.");
                 return;
             }
-            if (! forDrag)
+            if (self.exportCompletionAction == ExportAction::save)
                 self.showExportSaveDialog();
-            // Start the native drag from the next mouseDrag event, not a worker
-            // completion: macOS requires a current mouse event. If released,
-            // keep the prepared file for the next deliberate export gesture.
+            // macOS needs a current mouse event to start an external drag.
+            // Mouse-up cancels continuation but retains the prepared audio.
         });
     }
 
-    void initiateChopExportDrag (int chopId) { beginExport (chopId, true); }
+    void initiateChopExportDrag (int chopId) { beginExport (chopId, ExportAction::drag); }
 
     void startReadyExportDrag()
     {
@@ -4012,7 +3986,6 @@ private:
         }
         readyExportFile = juce::File();
         exportDragFired = true;
-        exportDragReady = false;
         juce::Component::SafePointer<WaveformDisplayComponent> safeThis (this);
         const bool started = juce::DragAndDropContainer::performExternalDragDropOfFiles (
             juce::StringArray { retained.getFullPathName() }, false, this,
@@ -4030,7 +4003,7 @@ private:
         {
             exportDragFired = false;
             readyExportFile = retained; // retry or Save As; no successful host reference yet
-            showExportError ("The drag could not start. Drag the export button again, or use Export Chop As.");
+            showExportError ("The drag could not start. Try DRAG AUDIO again, or choose ADSR then Save WAV.");
         }
         setMouseCursor (juce::MouseCursor::NormalCursor);
         repaint();
@@ -4041,8 +4014,14 @@ private:
     // Repoints the button at a chop, replaying the pop-in when the target
     // actually changes. The target is the selected chop or the chop most
     // recently triggered from a MIDI key (see timerCallback).
+    bool isExportGestureActive() const
+    {
+        return exportButtonPressed || exportButtonDragArmed || exportWaitingForDrag || adsrButtonPressed;
+    }
+
     void setExportTarget (int chopId)
     {
+        if (isExportGestureActive()) return;
         if (chopId != exportTargetChopId)
         {
             exportTargetChopId = chopId;
@@ -4051,13 +4030,11 @@ private:
     }
 
     // The button is shown whenever there's a target chop and we're not in the
-    // middle of another gesture that owns the display (edge resize, warp,
-    // or an in-progress hold-to-export).
+    // middle of another gesture that owns the display (edge resize or warp).
     bool isExportButtonActive() const
     {
-        if (processor.isWarpModeActive())                            return false;
-        if (edgeDragChopId >= 0 || edgeHoverKind != 0)               return false;
-        if (holdTickCount > 0 || exportDragReady || exportDragFired)  return false;
+        if (edgeDragChopId >= 0 || warpDragChopId >= 0 || warpDragMarkerIndex >= 0) return false;
+        if (exportDragFired) return false;
         if (exportTargetChopId < 0 || processor.getLoadedSample() == nullptr) return false;
 
         const auto cs = processor.getChopState();
@@ -4098,8 +4075,8 @@ private:
         if (visR - visL < 2.0f) // target chop scrolled out of view
             return {};
 
-        constexpr float w = 116.0f;
-        constexpr float h = 22.0f;
+        constexpr float w = 206.0f;
+        constexpr float h = 28.0f;
         const float leftLimit  = display.getX() + 6.0f;
         const float rightLimit = display.getRight() - 70.0f; // keep clear of +/- buttons
 
@@ -4115,9 +4092,25 @@ private:
         return juce::Rectangle<float> (cx - w * 0.5f, y, w, h);
     }
 
+    juce::Rectangle<float> getAdsrButtonBounds() const
+    {
+        return getExportButtonBounds().withWidth (58.0f);
+    }
+
+    juce::Rectangle<float> getDragAudioBounds() const
+    {
+        return getExportButtonBounds().withTrimmedLeft (64.0f);
+    }
+
+    bool hitTestAdsrButton (juce::Point<float> p) const
+    {
+        const auto b = getAdsrButtonBounds();
+        return ! getExportButtonBounds().isEmpty() && b.contains (p);
+    }
+
     bool hitTestExportButton (juce::Point<float> p) const
     {
-        const auto b = getExportButtonBounds();
+        const auto b = getDragAudioBounds();
         return ! b.isEmpty() && b.contains (p);
     }
 
@@ -4196,7 +4189,7 @@ private:
         juce::CallOutBox::launchAsynchronously (std::move (content), targetArea, parent);
     }
 
-    void saveChopToFile (int chopId) { beginExport (chopId, false); }
+    void saveChopToFile (int chopId) { beginExport (chopId, ExportAction::save); }
 
     void showExportSaveDialog()
     {
@@ -4226,73 +4219,46 @@ private:
 
     void paintExportButton (juce::Graphics& g)
     {
-        const auto b = getExportButtonBounds();
-        if (b.isEmpty())
-            return;
-
+        if (getExportButtonBounds().isEmpty()) return;
         const float appear = juce::jlimit (0.0f, 1.0f, exportButtonAppear);
-        if (appear <= 0.01f)
-            return;
-
-        const float pulse = 0.5f + 0.5f * std::sin (exportButtonPulse); // 0..1
-        const juce::Colour amber (0xffffb300);
-
+        if (appear <= 0.01f) return;
         juce::Graphics::ScopedSaveState ss (g);
-        juce::Path clip;
-        clip.addRoundedRectangle (getDisplayBounds().expanded (0.0f, 8.0f), 4.0f);
-        g.reduceClipRegion (clip);
+        g.setOpacity (appear);
+        const auto adsr = getAdsrButtonBounds();
+        const auto drag = getDragAudioBounds();
+        const juce::Colour amber (0xffffb300);
+        g.setColour (adsrButtonPressed ? blackPanel.brighter (0.2f) : blackPanel);
+        g.fillRoundedRectangle (adsr, 4.0f);
+        g.setColour (adsrButtonHovered ? textPrimary : textMuted);
+        g.drawRoundedRectangle (adsr.reduced (0.5f), 4.0f, 1.0f);
+        g.setFont (monoFont (11.0f));
+        g.drawText ("ADSR", adsr, juce::Justification::centred);
 
-        // Pop-in: tight scale 0.9->1.0 plus fade (snappy, minimal travel).
-        const float scale = 0.9f + 0.1f * appear;
-        auto rect = b.withSizeKeepingCentre (b.getWidth() * scale, b.getHeight() * scale);
-        const float corner = rect.getHeight() * 0.5f;
-
-        // Breathing glow behind the pill to draw the eye to it.
-        const float glowAlpha = (0.16f + 0.20f * pulse)
-                              * appear
-                              * (exportButtonHovered ? 1.4f : 1.0f);
-        for (int i = 3; i >= 1; --i)
+        const bool preparing = exportRendering && exportRequestedChopId == exportTargetChopId;
+        const bool ready = ! exportRendering && readyExportFile != juce::File()
+                        && exportRequestedChopId == exportTargetChopId;
+        g.setColour (exportButtonPressed ? amber.darker (0.15f)
+                                       : exportButtonHovered ? amber.brighter (0.15f) : amber);
+        g.fillRoundedRectangle (drag, 4.0f);
+        g.setColour (juce::Colour (0xff1a1205));
+        // Six-dot grip makes this read as a drag handle, not a menu button.
+        for (int row = 0; row < 3; ++row)
+            for (int col = 0; col < 2; ++col)
+                g.fillEllipse (drag.getX() + 9.0f + (float) col * 4.0f,
+                               drag.getCentreY() - 5.0f + (float) row * 4.0f, 2.0f, 2.0f);
+        g.setFont (monoFont (11.0f));
+        g.drawText (preparing ? "PREPARING..." : "DRAG AUDIO",
+                    drag.withTrimmedLeft (22.0f).withTrimmedRight (ready ? 17.0f : 4.0f),
+                    juce::Justification::centred);
+        if (ready)
         {
-            g.setColour (amber.withAlpha (glowAlpha / (float) (i * 2)));
-            g.fillRoundedRectangle (rect.expanded ((float) i * 3.0f), corner + (float) i * 3.0f);
+            juce::Path check;
+            const auto x = drag.getRight() - 12.0f, y = drag.getCentreY();
+            check.startNewSubPath (x - 3.0f, y);
+            check.lineTo (x, y + 3.0f);
+            check.lineTo (x + 5.0f, y - 4.0f);
+            g.strokePath (check, juce::PathStrokeType (1.5f));
         }
-
-        // Drop shadow.
-        g.setColour (juce::Colours::black.withAlpha (0.38f * appear));
-        g.fillRoundedRectangle (rect.translated (0.0f, 1.5f), corner);
-
-        // Pill body.
-        const juce::Colour base = exportButtonPressed ? amber.darker (0.18f)
-                                : exportButtonHovered ? amber.brighter (0.12f)
-                                                      : amber;
-        juce::ColourGradient grad (base.brighter (0.10f), rect.getX(), rect.getY(),
-                                   base.darker (0.18f),   rect.getX(), rect.getBottom(), false);
-        g.setGradientFill (grad);
-        g.fillRoundedRectangle (rect, corner);
-        g.setColour (juce::Colours::white.withAlpha (0.22f * appear));
-        g.drawRoundedRectangle (rect.reduced (0.5f), corner, 1.0f);
-
-        // Content: a compact envelope glyph + action label.
-        const juce::Colour ink (0xff1a1205);
-        g.setColour (ink.withAlpha (appear));
-
-        auto content  = rect.reduced (10.0f, 0.0f);
-        auto iconArea = content.removeFromLeft (12.0f);
-        const float ax = iconArea.getCentreX();
-        const float ay = iconArea.getCentreY() - 1.0f;
-
-        juce::Path envelopeIcon;
-        envelopeIcon.startNewSubPath (ax - 5.0f, ay + 4.0f);
-        envelopeIcon.lineTo (ax - 2.0f, ay - 4.0f);
-        envelopeIcon.lineTo (ax + 0.5f, ay + 0.5f);
-        envelopeIcon.lineTo (ax + 3.0f, ay + 0.5f);
-        envelopeIcon.lineTo (ax + 5.0f, ay + 4.0f);
-        g.strokePath (envelopeIcon, juce::PathStrokeType (1.5f, juce::PathStrokeType::curved,
-                                                               juce::PathStrokeType::rounded));
-
-        g.setFont (monoFont (9.5f).withExtraKerningFactor (0.06f));
-        g.drawText ("ADSR / EXPORT", content, juce::Justification::centred);
-
         paintDeleteBadge (g, appear);
     }
 
@@ -4368,20 +4334,6 @@ private:
         if (! shouldRunRealtimeUi (*this))
             return;
 
-        if (isHoldingToPlay && ! processor.isPlaying())
-            processor.startPlayback();
-
-        // Accumulate hold ticks for drag-export detection
-        if (holdChopId >= 0 && ! exportDragFired)
-        {
-            if (++holdTickCount >= holdTicksRequired() && ! exportDragReady)
-            {
-                exportDragReady = true;
-                setMouseCursor (juce::MouseCursor::DraggingHandCursor);
-                repaint();
-            }
-        }
-
         // Trigger pulse animation check. A MIDI key press lands here, so we
         // select the struck chop and repoint its export button (it instantly
         // scrolls into view). This keeps MIDI and mouse selection behaviour
@@ -4401,15 +4353,12 @@ private:
             scrollToChop (triggeredId, true); // Scroll exactly and instantly
         }
 
-        // Drive the floating export button: snappy pop-in when the target chop
-        // changes plus a gentle continuous breathing pulse so it reads as
-        // interactive. Keyed off on-screen visibility so a chop scrolled out of
-        // view doesn't keep the UI repainting needlessly. Runs after the
-        // trigger block above so a MIDI-struck chop pops in on the same frame.
+        // Keep the actions attached to the selected chop. A gesture owns its
+        // target until mouse-up even if MIDI changes the current selection.
         {
             const auto cs    = processor.getChopState();
             const int  selId = (cs != nullptr) ? cs->selectedChopId : -1;
-            if (selId != lastSeenSelectedId)
+            if (selId != lastSeenSelectedId && ! isExportGestureActive())
             {
                 lastSeenSelectedId = selId;
                 setExportTarget (selId); // click-select moves the button too
@@ -4422,8 +4371,6 @@ private:
             if (std::abs (targetAppear - exportButtonAppear) < 0.01f)
                 exportButtonAppear = targetAppear;
 
-            if (visible || exportButtonAppear > 0.01f)
-                exportButtonPulse += frameRateStep (0.10f, animHz, waveformRefreshHz);
         }
 
         // Animate scroll, zoom, and vertical scale (warning-free)
@@ -4516,7 +4463,6 @@ private:
                                     || pendingMarkerDragging
                                     || isSelectingAnalysisRegion
                                     || isHoldingToPlay
-                                    || exportDragReady
                                     || exportDragFired;
 
         const auto targetHoverAlpha = (isHoveringDisplay && ! isUserInteracting) ? 1.0f : 0.0f;
@@ -4549,8 +4495,6 @@ private:
                                 // when Shift is pressed mid-drag, which can
                                 // happen without any mouse movement.
                                 || (processor.isWarpModeActive() && warpDragChopId >= 0)
-                                || exportDragReady
-                                || (holdChopId >= 0 && ! exportDragReady && holdTickCount > 0)
                                 || ! getExportButtonBounds().isEmpty() || exportButtonAppear > 0.01f
                                 || zoomChanged || scrollChanged || vertScaleChanged
                                 || anyChopAnimationActive;
@@ -5489,8 +5433,7 @@ private:
         const auto visibleEnd = visibleStart + (double) visibleRange.visibleSamples;
         const auto sr = sampleData->sampleRate;
 
-        const auto trimBpm = (double) processor.getGridBpmTrim();
-        const auto adjustedBpm = analysis->estimatedBpm + trimBpm;
+        const auto adjustedBpm = processor.getAdjustedAnalysisBpm (*analysis);
         const auto scaleFactor = (adjustedBpm > 0.0 && analysis->estimatedBpm > 0.0)
                                ? analysis->estimatedBpm / adjustedBpm : 1.0;
         const auto anchor = processor.getResolvedGridAnchorSeconds();
@@ -5888,6 +5831,7 @@ private:
     {
         peakCache.clearQuick();
         const auto sampleData = processor.getLoadedSample();
+        peakCacheSource = sampleData;
         if (sampleData == nullptr || sampleData->buffer.getNumSamples() == 0)
             return;
 
@@ -5922,6 +5866,7 @@ private:
     AudioPluginAudioProcessor& processor;
     juce::Path waveformPath;
     juce::Array<juce::Range<float>> peakCache;
+    std::shared_ptr<const AudioPluginAudioProcessor::LoadedSampleData> peakCacheSource;
     const int cacheBlockSize = 256;
     bool isDragOver = false;
     bool wasPlayingLastTick = false;
@@ -5985,17 +5930,11 @@ private:
     bool isAnimating = false;
     bool wasAnimating = false;
 
-    // Hold-to-export drag state
-    int  holdChopId      = -1;
-    int  holdTickCount   = 0;
-    bool exportDragReady = false;
+    // The waveform previews audio; these explicit controls edit or export it.
     bool exportDragFired = false;
-    int holdTicksRequired() const noexcept { return 2 * animHz; } // 2 s hold at the active frame rate
-
-    // Floating export button (drag handle + click-to-save). This is the
-    // discoverable affordance: it appears over the selected chop so users
-    // don't have to know about the 2 s hold gesture. Dragging it starts the
-    // OS file drag into the DAW; a plain click opens a Save-As dialog.
+    bool adsrButtonHovered = false;
+    bool adsrButtonPressed = false;
+    int exportPressedChopId = -1;
     bool  exportButtonHovered   = false;
     bool  exportButtonPressed   = false;
     bool  exportButtonDragArmed = false;
@@ -6006,13 +5945,13 @@ private:
     bool  deleteBadgePressed    = false;
     juce::Point<float> exportButtonPressPos;
     float exportButtonAppear    = 0.0f; // 0->1 pop-in when the target chop changes
-    float exportButtonPulse     = 0.0f; // continuous breathing phase
     int   exportTargetChopId    = -1;   // chop the button acts on: selection OR last MIDI trigger
     int   lastSeenSelectedId    = -1;   // detects selection changes
     std::unique_ptr<juce::FileChooser> chopExportChooser;
     std::shared_ptr<const AudioPluginAudioProcessor::ChopExportRequest> exportRequest;
     juce::File readyExportFile;
     int exportRequestedChopId = -1;
+    ExportAction exportCompletionAction = ExportAction::prepare;
     bool exportRendering = false;
     bool exportWaitingForDrag = false;
 
@@ -6034,6 +5973,171 @@ private:
     static constexpr float kEdgeHitTestPixels = 6.0f;
 };
 
+// A performance view over the live chops: source positions and edits stay intact.
+class FavoritesViewComponent final : public juce::Component, private juce::Timer
+{
+public:
+    FavoritesViewComponent (AudioPluginAudioProcessor& p, WaveformDisplayComponent& waveform)
+        : processor (p), waveforms (waveform), grid (*this)
+    {
+        addAndMakeVisible (grid);
+        triggerRevision = processor.getChopTriggerRevision();
+        startTimerHz (30);
+    }
+    ~FavoritesViewComponent() override { stopTimer(); grid.releaseNote(); }
+
+    void refresh()
+    {
+        const auto state = processor.getChopState();
+        const auto count = state != nullptr ? state->favoriteChopIndices.size() : 0;
+        if (! processor.isFavoritesViewEnabled()) grid.releaseNote();
+        // Keep a familiar six-column lineup at the default size, then wrap.
+        // Dense collections gain columns as needed to retain waveform space.
+        grid.columns = juce::jlimit (1, juce::jmax (1, (int) count), grid.getWidth() / 180);
+        grid.rows = juce::jmax (1, ((int) count + grid.columns - 1) / grid.columns);
+        while (grid.rows > 3 && grid.getWidth() / grid.columns > 3 * grid.getHeight() / grid.rows)
+        {
+            ++grid.columns;
+            grid.rows = ((int) count + grid.columns - 1) / grid.columns;
+        }
+        grid.repaint();
+        repaint();
+    }
+    void resized() override
+    {
+        grid.setBounds (getLocalBounds().reduced (16).withTrimmedTop (30));
+        refresh();
+    }
+    void paint (juce::Graphics& g) override
+    {
+        fillGlassRounded (g, *this, getLocalBounds().toFloat().reduced (0.5f), mediumCorner);
+        const auto state = processor.getChopState();
+        const int count = state != nullptr ? (int) state->favoriteChopIndices.size() : 0;
+        g.setColour (juce::Colour (0xffff2db1));
+        g.setFont (heavyFont (14));
+        g.drawText ("FAVORITES  /  " + juce::String (count), 24, 10, 220, 24, juce::Justification::centredLeft);
+        g.setColour (textMuted);
+        g.setFont (monoFont (10));
+        g.drawText (count > 92 ? "FIRST 92 FAVORITES HAVE MIDI KEYS (C2–G9)" : "FAVORITE ORDER  /  MIDI FROM C2",
+                    250, 10, juce::jmax (0, getWidth() - 278), 24, juce::Justification::centredRight);
+        if (count == 0)
+        {
+            g.setColour (textPrimary);
+            g.setFont (heavyFont (19));
+            g.drawText ("NO FAVORITES YET", getLocalBounds().reduced (24).withTrimmedBottom (32), juce::Justification::centred);
+            g.setColour (textMuted);
+            g.setFont (monoFont (12));
+            g.drawText ("Switch Favorites off, then double-click chops to add them.",
+                        getLocalBounds().reduced (24).translated (0, 22), juce::Justification::centred);
+        }
+    }
+private:
+    struct Grid final : juce::Component
+    {
+        explicit Grid (FavoritesViewComponent& v) : owner (v) {}
+        int columns = 1, rows = 1;
+        juce::Rectangle<int> tileBounds (int slot) const
+        {
+            const int column = slot % columns, row = slot / columns;
+            const int x = column * getWidth() / columns;
+            const int y = row * getHeight() / rows;
+            const int width = (column + 1) * getWidth() / columns - x;
+            const int height = (row + 1) * getHeight() / rows - y;
+            const int gap = juce::jmin (4, juce::jmin (width, height) / 8);
+            return juce::Rectangle<int> (x, y, width, height).reduced (gap);
+        }
+        int pressedNote = -1;
+        void releaseNote()
+        {
+            if (pressedNote >= 0) owner.processor.keyboardState.noteOff (1, pressedNote, 0);
+            pressedNote = -1;
+        }
+        void paint (juce::Graphics& g) override
+        {
+            const auto state = owner.processor.getChopState();
+            if (state == nullptr) return;
+            for (size_t slot = 0; slot < state->favoriteChopIndices.size(); ++slot)
+            {
+                auto tile = tileBounds ((int) slot);
+                if (! g.getClipBounds().intersects (tile)) continue;
+                const int index = state->favoriteChopIndices[slot];
+                const auto& chop = state->chops[(size_t) index];
+                const int note = state->midiMap.noteForChopIndex[(size_t) index];
+                const bool selected = chop.id == state->selectedChopId;
+                const auto pink = juce::Colour (0xffff2db1);
+                g.setColour (blackPanel);
+                g.fillRoundedRectangle (tile.toFloat(), 4);
+                g.setColour (pink.withAlpha (selected ? 0.95f : 0.3f));
+                g.drawRoundedRectangle (tile.toFloat().reduced (1), 4, selected ? 2.0f : 1.0f);
+                g.setColour (pink);
+                const int padding = juce::jlimit (2, 12, tile.getHeight() / 12);
+                auto content = tile.reduced (padding);
+                const int labelHeight = juce::jmin (32, juce::jmax (12, content.getHeight() / 3));
+                g.setFont (monoFont (juce::jlimit (10.0f, 22.0f, (float) labelHeight * 0.75f)));
+                g.drawText (note >= 0 ? midiNoteName (note) : "NO MIDI", content.removeFromTop (labelHeight), juce::Justification::centredLeft);
+                if (tile.getHeight() >= 64 && tile.getWidth() >= 90)
+                {
+                    g.setColour (textMuted);
+                    g.setFont (monoFont (10));
+                    g.drawText ("CHOP " + juce::String (index + 1) + (chop.reversed ? "  /  REV" : ""),
+                                content.removeFromBottom (16), juce::Justification::centredLeft);
+                }
+                auto wave = content.reduced (2).toFloat();
+                if (! wave.isEmpty()) owner.waveforms.drawFavoriteWaveform (g, wave, chop);
+            }
+        }
+        int chopAt (juce::Point<float> pos) const
+        {
+            const auto state = owner.processor.getChopState();
+            if (state == nullptr || ! getLocalBounds().toFloat().contains (pos)) return -1;
+            // Use the painted rectangles, including their gaps and partial last row.
+            for (size_t slot = 0; slot < state->favoriteChopIndices.size(); ++slot)
+                if (tileBounds ((int) slot).toFloat().contains (pos))
+                    return state->chops[(size_t) state->favoriteChopIndices[slot]].id;
+            return -1;
+        }
+        void mouseDown (const juce::MouseEvent& e) override
+        {
+            releaseNote();
+            if (! e.mods.isLeftButtonDown()) return;
+            const int id = chopAt (e.position);
+            if (id < 0) return;
+            owner.processor.selectChopById (id);
+            pressedNote = owner.processor.getMidiNoteForChopId (id);
+            if (pressedNote >= 0) owner.processor.keyboardState.noteOn (1, pressedNote, 1.0f);
+        }
+        void mouseUp (const juce::MouseEvent&) override { releaseNote(); }
+        void mouseDoubleClick (const juce::MouseEvent& e) override
+        {
+            if (! e.mods.isLeftButtonDown()) return;
+            releaseNote();
+            const int id = chopAt (e.position);
+            if (id < 0) return;
+            owner.processor.selectChopById (id);
+            owner.processor.toggleSelectedChopFavorite();
+            owner.refresh();
+        }
+        FavoritesViewComponent& owner;
+    };
+    void timerCallback() override
+    {
+        if (! isShowing()) return;
+        const auto revision = processor.getChopTriggerRevision();
+        if (revision != triggerRevision)
+        {
+            triggerRevision = revision;
+            processor.selectChopById (processor.getLastTriggeredChopId());
+        }
+        if (processor.isPlaying() || wasPlaying) grid.repaint();
+        wasPlaying = processor.isPlaying();
+    }
+    AudioPluginAudioProcessor& processor;
+    WaveformDisplayComponent& waveforms;
+    Grid grid;
+    uint64_t triggerRevision = 0;
+    bool wasPlaying = false;
+};
+
 class TransportSectionComponent final : public juce::Component,
                                         private juce::Timer
 {
@@ -6042,24 +6146,21 @@ public:
 
     // Knob size for the condensed band's chop row (label + knob fit ~70px).
     static constexpr int bandKnobDiameter = 48;
-    // Left-bay geometry. These used to be duplicated between resized() and
-    // paint() (which hard-coded `34 + 122 + 24`), so moving anything here meant
-    // remembering to move it twice. Single definitions now.
+    // Shared left-bank geometry. The heading sits in the caption strip so
+    // the full row width is available to the buttons.
     static constexpr int sideMargin          = 34;
-    static constexpr int chopBadgeWidth      = 122;
-    static constexpr int badgeToToolsGap     = 10;
-    static constexpr int chopToolButtonWidth = 128;
-    static constexpr int chopToolButtonGap   = 8;
-    static constexpr int barsToolButtonWidth = 92;   // four 23px segments
-    static constexpr int barsToOctGap        = 10;
-    static constexpr int octStepWidth        = 20;   // two of these, side by side
+    static constexpr int chopToolButtonWidth = 160;
+    static constexpr int chopToolButtonGap   = 12;
+    static constexpr int barsToolButtonWidth = 144;  // four 36px segments
+    static constexpr int barsToOctGap        = 12;
+    static constexpr int octStepWidth        = 36;
     static constexpr int octGroupWidth       = octStepWidth * 2;
     static constexpr int toolButtonH         = 40;
     // Caption strip above the tool row. "1 2 4 8" and a bare -/+ pair mean
     // nothing unlabelled, and this band was empty.
     static constexpr int toolCaptionH        = 12;
 
-    static constexpr int chopToolsX()  { return sideMargin + chopBadgeWidth + badgeToToolsGap; }
+    static constexpr int chopToolsX()  { return sideMargin; }
     static constexpr int barsX()       { return chopToolsX() + chopToolButtonWidth + chopToolButtonGap; }
     static constexpr int octGroupX()   { return barsX() + barsToolButtonWidth + barsToOctGap; }
     // Everything the mapping status line sits under: CHOP MANUALLY | BARS | OCT.
@@ -6082,6 +6183,7 @@ public:
         configureButton (stopButton, "", textPrimary);
         configureButton (reverseButton, "REVERSE", textPrimary.withAlpha (0.90f));
         configureButton (playbackModeButton, "GATE", textPrimary.withAlpha (0.90f));
+        configureButton (oneShotModeButton, "ONE SHOT", textPrimary.withAlpha (0.90f));
         configureButton (halfSpeedButton, "HALF\nTIME", textPrimary.withAlpha (0.90f));
         configureButton (manualChopButton, "CHOP MANUALLY", textPrimary.withAlpha (0.75f));
         for (size_t i = 0; i < barsChoices.size(); ++i)
@@ -6120,14 +6222,18 @@ public:
             if (auto* parent = getParentComponent())
                 parent->repaint();
         };
-        playbackModeButton.getProperties().set ("cueStyle", "halfTime");
-        playbackModeButton.setClickingTogglesState (true);
-        playbackModeButton.setTooltip ("Chop playback mode: GATE loops while a MIDI note is held; ONE SHOT plays the chop once and ignores note-off.");
+        playbackModeButton.getProperties().set ("cueStyle", "segment");
+        oneShotModeButton.getProperties().set ("cueStyle", "segment");
+        playbackModeButton.setTooltip ("Gate: hold a chop with the mouse or hold a MIDI key to loop it. Release to stop.");
+        oneShotModeButton.setTooltip ("One Shot: click a chop or tap a MIDI key to play it once. Releasing does not stop it.");
         playbackModeButton.onClick = [this]
         {
-            processor.setChopPlaybackMode (playbackModeButton.getToggleState()
-                                               ? AudioPluginAudioProcessor::ChopPlaybackMode::OneShot
-                                               : AudioPluginAudioProcessor::ChopPlaybackMode::Gate);
+            processor.setChopPlaybackMode (AudioPluginAudioProcessor::ChopPlaybackMode::Gate);
+            updatePlaybackModeControl();
+        };
+        oneShotModeButton.onClick = [this]
+        {
+            processor.setChopPlaybackMode (AudioPluginAudioProcessor::ChopPlaybackMode::OneShot);
             updatePlaybackModeControl();
         };
         halfSpeedButton.getProperties().set ("cueStyle", "halfTime");
@@ -6177,6 +6283,7 @@ public:
                                           static_cast<juce::TextButton*> (&stopButton),
                                           static_cast<juce::TextButton*> (&reverseButton),
                                           static_cast<juce::TextButton*> (&playbackModeButton),
+                                          static_cast<juce::TextButton*> (&oneShotModeButton),
                                           static_cast<juce::TextButton*> (&halfSpeedButton),
                                           static_cast<juce::TextButton*> (&manualChopButton),
                                           static_cast<juce::TextButton*> (&loadButton) })
@@ -6301,6 +6408,15 @@ public:
         timeDisplay.setTooltip ("Shows total sample length before playback starts; shows elapsed time while playing.");
         addAndMakeVisible (tempoDisplay);
         tempoDisplay.setClickHandler ([this] { showTempoEntryDialog(); });
+        configureButton (doubleTempoButton, "2x", textPrimary.withAlpha (0.9f));
+        doubleTempoButton.getProperties().set ("cueStyle", "utilitySync");
+        doubleTempoButton.setTooltip ("Double the detected sample BPM (60 becomes 120). Updates the chop grid and DAW sync. Click again to return to the detected tempo; fine BPM trim stays applied.");
+        doubleTempoButton.onClick = [this]
+        {
+            processor.setDoubleTempoEnabled (! processor.getDoubleTempoEnabled());
+            updateTempoDisplay();
+        };
+        addAndMakeVisible (doubleTempoButton);
         addAndMakeVisible (keyDisplay);
         keyDisplay.setTooltip ("Detected musical key + Camelot code. Click to correct it.");
         keyDisplay.setClickHandler ([this] { showKeyOverrideMenu(); });
@@ -6317,7 +6433,7 @@ public:
         cueKnob.getSlider().setNumDecimalPlacesToDisplay (1);
         cueKnob.getSlider().setTextValueSuffix (" %");
         cueKnob.captureCurrentValueAsDefault();
-        cueKnob.getSlider().setTooltip ("CUE: sets where playback starts inside this chop - 0% = chop start, 100% = chop end. GATE loops return to this point; ONE SHOT plays from here once. Alt-click to reset.");
+        cueKnob.getSlider().setTooltip ("CUE: sets where playback starts inside this chop - 0% = chop start, 100% = chop end. GATE loops return to this point; ONE SHOT plays from here once.");
         addAndMakeVisible (cueKnob);
 
         gainKnob.getSlider().setRange (-24.0, 12.0, 0.1);
@@ -6325,7 +6441,7 @@ public:
         gainKnob.getSlider().setNumDecimalPlacesToDisplay (1);
         gainKnob.getSlider().setTextValueSuffix (" dB");
         gainKnob.captureCurrentValueAsDefault();
-        gainKnob.getSlider().setTooltip ("GAIN: volume for this chop only (-24 to +12 dB). Does not affect other chops. Alt-click to reset to 0 dB.");
+        gainKnob.getSlider().setTooltip ("GAIN: volume for this chop only (-24 to +12 dB). Does not affect other chops.");
         addAndMakeVisible (gainKnob);
 
         pitchKnob.getSlider().setRange (-12.0, 12.0, 0.1);
@@ -6333,7 +6449,7 @@ public:
         pitchKnob.getSlider().setNumDecimalPlacesToDisplay (1);
         pitchKnob.getSlider().setTextValueSuffix (" st");
         pitchKnob.captureCurrentValueAsDefault();
-        pitchKnob.getSlider().setTooltip ("PITCH (per-chop): pitch shift for this chop only, -12 to +12 semitones. Stacks on top of the global PITCH knob under the waveform. Alt-click to reset.");
+        pitchKnob.getSlider().setTooltip ("PITCH (per-chop): pitch shift for this chop only, -12 to +12 semitones. Stacks on top of the global PITCH knob under the waveform.");
         addAndMakeVisible (pitchKnob);
 
         updateDisplays();
@@ -6355,18 +6471,13 @@ public:
         drawPanelHole (g, { transportPanel.getX() + 13.0f, transportPanel.getCentreY() }, 6.0f);
         drawPanelHole (g, { transportPanel.getRight() - 13.0f, transportPanel.getCentreY() }, 6.0f);
 
-        // Keep the section badge in its own left-hand bay instead of
-        // straddling the panel seam above the knob tick rings.
-        auto badgeBounds = juce::Rectangle<float> (chopPanel.getX() + 34.0f,
-                                                   chopPanel.getCentreY() - 9.0f,
-                                                   122.0f,
-                                                   18.0f);
-        fillGlassRounded (g, *this, badgeBounds, 6.0f);
-
+        // The heading shares the caption strip with BARS and OCT, freeing
+        // its former 132px side bay for wider controls.
         g.setColour (themedTitleColour (accentOrange));
         g.setFont (heavyFont (10.8f).withExtraKerningFactor (0.08f));
         g.drawText ("CHOP CONTROLS",
-                    badgeBounds.toNearestInt().withY ((int) std::round (badgeBounds.getY() - 1.0f)),
+                    juce::Rectangle<int> (chopToolsX(), getChopPanelBounds().getY() + 2,
+                                          chopToolButtonWidth, toolCaptionH),
                     juce::Justification::centred, false);
 
         // Captions for the two controls whose faces carry no words of their own:
@@ -6417,9 +6528,6 @@ public:
         // The global knobs are owned by WaveformFooterComponent and overlay
         // the middle of this panel; this component fills the clear side bays.
         const auto chopPanel = getChopPanelBounds();
-
-        // Keep clear of the corner rivets (drawn at x = 13 +- 6 in paint()).
-        const int sideMargin = 34;
 
         const int toolButtonY = chopPanel.getY() + (chopPanel.getHeight() - toolButtonH) / 2;
         constexpr int warpButtonH = 44;
@@ -6472,7 +6580,8 @@ public:
         constexpr int syncW = 76;
         constexpr int modeGroupW = halfW + innerTransportGap + syncW;
         constexpr int innerDisplayGap = 8;
-        constexpr int displaysGroupW = 150 + innerDisplayGap + 76 + innerDisplayGap + 76; // 318
+        constexpr int timeW = 98, tempoW = 76, doubleTempoW = 44, keyW = 76;
+        constexpr int displaysGroupW = timeW + tempoW + doubleTempoW + keyW + 3 * innerDisplayGap; // 318
 
         // Playback bank is a compact left-hand block, like transport controls
         // on dedicated hardware rather than unrelated buttons spread edge-to-edge.
@@ -6486,7 +6595,8 @@ public:
         reverseButton.setBounds (transportX + 3 * (48 + innerTransportGap) + 16,
                                  transportCenterY - 24, 72, 48);
         playbackModeButton.setBounds (reverseButton.getRight() + innerTransportGap,
-                                      transportCenterY - 24, 76, 48);
+                                      transportCenterY - 24, 76, 23);
+        oneShotModeButton.setBounds (playbackModeButton.getX(), transportCenterY + 1, 76, 23);
 
         // Readouts anchor to the right edge; HALF TIME / SYNC form the mode
         // bank immediately before them, keeping the centre clear for chop knobs.
@@ -6496,10 +6606,10 @@ public:
         halfSpeedButton.setBounds (modeX, transportCenterY - 24, halfW, 48);
         syncButton.setBounds (modeX + halfW + innerTransportGap, transportCenterY - 24, syncW, 48);
 
-        timeDisplay.setBounds (displaysX, transportCenterY - 24, 150, 48);
-        tempoDisplay.setBounds (displaysX + 150 + innerDisplayGap, transportCenterY - 24, 76, 48);
-        keyDisplay.setBounds (displaysX + 150 + innerDisplayGap + 76 + innerDisplayGap,
-                              transportCenterY - 24, 76, 48);
+        timeDisplay.setBounds (displaysX, transportCenterY - 24, timeW, 48);
+        tempoDisplay.setBounds (timeDisplay.getRight() + innerDisplayGap, transportCenterY - 24, tempoW, 48);
+        doubleTempoButton.setBounds (tempoDisplay.getRight() + innerDisplayGap, transportCenterY - 24, doubleTempoW, 48);
+        keyDisplay.setBounds (doubleTempoButton.getRight() + innerDisplayGap, transportCenterY - 24, keyW, 48);
     }
 
     juce::TextButton& getLoadButton() noexcept { return loadButton; }
@@ -6550,6 +6660,12 @@ private:
     void updateDisplays()
     {
         refreshBarsSegments();
+        const bool editingWaveform = ! processor.isFavoritesViewEnabled();
+        manualChopButton.setEnabled (editingWaveform);
+        warpButton.setEnabled (editingWaveform);
+        clearWarpButton.setEnabled (editingWaveform);
+        warpDivisionCombo.setEnabled (editingWaveform);
+        for (auto& button : barsSegments) button.setEnabled (editingWaveform);
         manualChopButton.setToggleState (processor.isManualChopModeActive(), juce::dontSendNotification);
         syncWarpAccentState();
         updateTimeDisplay();
@@ -6564,8 +6680,8 @@ private:
     {
         const bool isOneShot = processor.getChopPlaybackMode()
                                == AudioPluginAudioProcessor::ChopPlaybackMode::OneShot;
-        playbackModeButton.setToggleState (isOneShot, juce::dontSendNotification);
-        playbackModeButton.setButtonText (isOneShot ? "ONE\nSHOT" : "GATE");
+        playbackModeButton.setToggleState (! isOneShot, juce::dontSendNotification);
+        oneShotModeButton.setToggleState (isOneShot, juce::dontSendNotification);
     }
 
     // Mirrors the selected chop's cue/gain/pitch into the knobs and greys
@@ -6657,6 +6773,10 @@ private:
     void updateTempoDisplay()
     {
         const auto sampleData = processor.getLoadedSample();
+        const auto analysis = processor.getTempoAnalysis();
+        doubleTempoButton.setToggleState (processor.getDoubleTempoEnabled(), juce::dontSendNotification);
+        doubleTempoButton.setEnabled (sampleData != nullptr && analysis != nullptr
+                                      && analysis->estimatedBpm > 0.0 && ! processor.isTempoAnalysisInProgress());
         if (sampleData == nullptr || sampleData->buffer.getNumSamples() == 0)
         {
             tempoDisplay.setScanning (false);
@@ -6674,7 +6794,6 @@ private:
 
         tempoDisplay.setScanning (false);
 
-        const auto analysis = processor.getTempoAnalysis();
         if (analysis == nullptr || analysis->estimatedBpm <= 0.0)
         {
             tempoDisplay.setValueText ("--.-");
@@ -6682,7 +6801,7 @@ private:
             return;
         }
 
-        const auto adjustedBpm = analysis->estimatedBpm + (double) processor.getGridBpmTrim();
+        const auto adjustedBpm = processor.getAdjustedAnalysisBpm (*analysis);
         tempoDisplay.setValueText (formatDetectedTempo (adjustedBpm));
 
         juce::String tooltip = "Detected: " + juce::String (analysis->estimatedBpm, 2)
@@ -6694,7 +6813,7 @@ private:
         else
             tooltip << "\nFeel: mostly steady";
 
-        tooltip << "\nUse the TEMPO trim knob (under the waveform) to nudge the grid if chops feel slightly off-beat.";
+        tooltip << "\nUse 2x to correct half-time detection. Click BPM to enter a tempo.\nUse the TEMPO trim knob (under the waveform) to nudge the grid if chops feel slightly off-beat.";
 
         tempoDisplay.setTooltip (tooltip);
     }
@@ -6749,7 +6868,7 @@ private:
             return;
         }
 
-        const auto currentBpm = analysis->estimatedBpm + (double) processor.getGridBpmTrim();
+        const auto currentBpm = processor.getAdjustedAnalysisBpm (*analysis);
         auto* alert = new juce::AlertWindow ("Set BPM",
                                              "Enter the tempo for the loaded sample:",
                                              juce::AlertWindow::NoIcon,
@@ -6851,6 +6970,7 @@ private:
 
     juce::String getMidiMappingText() const
     {
+        if (processor.isFavoritesViewEnabled()) return "FAVORITES  |  C2 UPWARD  |  ORDER ADDED";
         if (processor.isManualChopModeActive())
             return "DOUBLE-CLICK START  |  HOLD/RELEASE PAD OR DOUBLE-CLICK END";
 
@@ -6874,7 +6994,7 @@ private:
         // Each button greys out at the limit IT can reach. "-" raises the offset
         // (see the direction note where these are wired up), so it stops at the
         // maximum; "+" lowers it and stops at the minimum.
-        octDownButton.setEnabled (processor.getMidiOctaveOffset() < AudioPluginAudioProcessor::midiOctaveOffsetMax);
+        octDownButton.setEnabled (! processor.isFavoritesViewEnabled() && processor.getMidiOctaveOffset() < AudioPluginAudioProcessor::midiOctaveOffsetMax);
         octUpButton.setEnabled   (processor.getMidiOctaveOffset() > AudioPluginAudioProcessor::midiOctaveOffsetMin);
     }
 
@@ -6906,7 +7026,7 @@ private:
     SmoothHoverButton pauseButton;
     SmoothHoverButton stopButton;
     SmoothAnimatedSwitchButton reverseButton;
-    SmoothAnimatedSwitchButton playbackModeButton;
+    juce::TextButton playbackModeButton, oneShotModeButton;
     SmoothAnimatedSwitchButton halfSpeedButton;
     SmoothHoverButton manualChopButton;
     // BARS was a single button that cycled 1 -> 2 -> 4 -> 8 -> 1. Reaching 8
@@ -6929,6 +7049,7 @@ private:
     LabelledKnob gainKnob;
     LabelledKnob pitchKnob;
     SmoothAnimatedSwitchButton syncButton;
+    SmoothAnimatedSwitchButton doubleTempoButton;
 };
 
 // Transparent control layer over the upper row of the two-row hardware deck.
@@ -6951,33 +7072,33 @@ public:
 
         zoomKnob.getSlider().setValue (0.0, juce::dontSendNotification);
         zoomKnob.getSlider().setMouseDragSensitivity (preciseMiniKnobDragSensitivity);
-        zoomKnob.getSlider().setTooltip ("ZOOM: zoom into the waveform for detail. Use SCROLL to pan when zoomed in. Alt-click to reset.");
+        zoomKnob.getSlider().setTooltip ("ZOOM: zoom into the waveform for detail. Use SCROLL to pan when zoomed in.");
         zoomKnob.captureCurrentValueAsDefault();
 
         scrollKnob.getSlider().setValue (0.0, juce::dontSendNotification);
         scrollKnob.getSlider().setMouseDragSensitivity (getScrollDragSensitivity (0.0f));
-        scrollKnob.getSlider().setTooltip ("SCROLL: pan the waveform left/right when zoomed in. Has no effect at zero zoom. Alt-click to reset.");
+        scrollKnob.getSlider().setTooltip ("SCROLL: pan the waveform left/right when zoomed in. Has no effect at zero zoom.");
         scrollKnob.captureCurrentValueAsDefault();
 
         tempoKnob.getSlider().setRange (-10.0, 10.0, 0.1);
         tempoKnob.getSlider().setValue (0.0, juce::dontSendNotification);
         tempoKnob.getSlider().setNumDecimalPlacesToDisplay (1);
         tempoKnob.getSlider().setTextValueSuffix (" BPM");
-        tempoKnob.getSlider().setTooltip ("TEMPO trim: adds a fine BPM offset (-10 to +10 BPM) to shift where chop boundaries fall. Use when chops feel slightly early or late. Alt-click to reset to 0.");
+        tempoKnob.getSlider().setTooltip ("TEMPO trim: adds a fine BPM offset (-10 to +10 BPM) to shift where chop boundaries fall. Use when chops feel slightly early or late.");
         tempoKnob.captureCurrentValueAsDefault();
 
         globalGainKnob.getSlider().setRange (-24.0, 12.0, 0.1);
         globalGainKnob.getSlider().setValue (0.0, juce::dontSendNotification);
         globalGainKnob.getSlider().setNumDecimalPlacesToDisplay (1);
         globalGainKnob.getSlider().setTextValueSuffix (" dB");
-        globalGainKnob.getSlider().setTooltip ("GAIN (global): adjusts the output level of every chop, -24 to +12 dB. Alt-click to reset to 0 dB.");
+        globalGainKnob.getSlider().setTooltip ("GAIN (global): adjusts the output level of every chop, -24 to +12 dB.");
         globalGainKnob.captureCurrentValueAsDefault();
 
         globalPitchKnob.getSlider().setRange (-12.0, 12.0, 0.1);
         globalPitchKnob.getSlider().setValue (0.0, juce::dontSendNotification);
         globalPitchKnob.getSlider().setNumDecimalPlacesToDisplay (1);
         globalPitchKnob.getSlider().setTextValueSuffix (" st");
-        globalPitchKnob.getSlider().setTooltip ("PITCH (global): shifts pitch of every chop together, -12 to +12 semitones. The per-chop PITCH knob (in CHOP CONTROLS) adds on top of this. Alt-click to reset to 0.");
+        globalPitchKnob.getSlider().setTooltip ("PITCH (global): shifts pitch of every chop together, -12 to +12 semitones. The per-chop PITCH knob (in CHOP CONTROLS) adds on top of this.");
         globalPitchKnob.captureCurrentValueAsDefault();
 
         for (auto* knob : { &zoomKnob, &scrollKnob, &tempoKnob, &globalGainKnob, &globalPitchKnob })
@@ -7276,7 +7397,9 @@ public:
         if (! loadingModel)
         {
             g.setColour (textPrimary);
-            g.drawText (juce::String (pct) + "%", juce::Rectangle<int> (15, 23, 140, 13), juce::Justification::centredRight);
+            g.setFont (monoFont (26.0f));
+            // Give even 100% its own tall column above the progress bar.
+            g.drawText (juce::String (pct) + "%", juce::Rectangle<int> (87, 5, 68, 34), juce::Justification::centredRight);
         }
 
         // Recessed CUERACK slot.
@@ -7561,7 +7684,7 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
         if (analysis == nullptr || analysis->estimatedBpm <= 0.0)
             return;
 
-        const auto trimBpm = (float) (requestedBpm - analysis->estimatedBpm);
+        const auto trimBpm = (float) (requestedBpm - analysis->estimatedBpm * (processorRef.getDoubleTempoEnabled() ? 2.0 : 1.0));
         processorRef.setGridBpmTrim (trimBpm);
         waveformFooterComponent->getTempoSlider().setValue ((double) trimBpm, juce::dontSendNotification);
         transportSectionComponent->refreshDisplays();
@@ -7654,7 +7777,23 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
         contentComponent.addAndMakeVisible (*component);
 
     midiKeyboardComponent = std::make_unique<cue::GlassKeyboard> (processorRef.keyboardState);
+    midiKeyboardComponent->refreshChops (processorRef.getChopState());
     contentComponent.addAndMakeVisible (*midiKeyboardComponent);
+
+    favoritesViewComponent = std::make_unique<cue::FavoritesViewComponent> (processorRef, *waveformDisplayComponent);
+    contentComponent.addChildComponent (*favoritesViewComponent);
+    cue::configureButton (favoritesButton, "FAVORITES", juce::Colour (0xffff2db1));
+    favoritesButton.getProperties().set ("cueStyle", "segment");
+    favoritesButton.getProperties().set ("cueAccent", (int) juce::Colour (0xffff2db1).getARGB());
+    favoritesButton.setTooltip ("Show favorite chops in the order you added them, mapped from C2. Switch off to restore the full waveform and original MIDI mapping.");
+    favoritesButton.onClick = [this]
+    {
+        processorRef.setFavoritesViewEnabled (! processorRef.isFavoritesViewEnabled());
+        refreshFavoritesView();
+    };
+    contentComponent.addAndMakeVisible (favoritesButton);
+    refreshFavoritesView();
+
 
     // The audio-reactive CUE orb sits beside the header wordmark as an
     // editor-level sibling above the buffered header.
@@ -7806,6 +7945,21 @@ AudioPluginAudioProcessorEditor::~AudioPluginAudioProcessorEditor()
     uiSettingsFile.reset();
 }
 
+void AudioPluginAudioProcessorEditor::refreshFavoritesView()
+{
+    const bool enabled = processorRef.isFavoritesViewEnabled();
+    favoritesButton.setToggleState (enabled, juce::dontSendNotification);
+    waveformDisplayComponent->setVisible (! enabled);
+    waveformFooterComponent->getZoomSlider().setEnabled (! enabled);
+    waveformFooterComponent->getScrollSlider().setEnabled (! enabled);
+    if (favoritesViewComponent != nullptr)
+    {
+        favoritesViewComponent->setVisible (enabled);
+        favoritesViewComponent->refresh();
+    }
+    repaint();
+}
+
 void AudioPluginAudioProcessorEditor::timerCallback()
 {
     // Cheap atomic poll, always — reveals the banner when the background update
@@ -7923,17 +8077,12 @@ void AudioPluginAudioProcessorEditor::changeListenerCallback (juce::ChangeBroadc
                                                                            juce::dontSendNotification);
 
         editor->transportSectionComponent->refreshDisplays();
+        editor->refreshFavoritesView();
 
-        // Light the on-screen keyboard key that maps to the previewed
-        // (selected) chop; -1 clears it when nothing is selected.
+        // Refresh favorite colours and playable/selected notes after edits,
+        // restore, Undo, layer swaps and octave changes.
         if (editor->midiKeyboardComponent != nullptr)
-        {
-            editor->midiKeyboardComponent->setHighlightedNote (processor.getSelectedChopMidiNote());
-            // ...and shade every key that triggers anything at all. Driven from
-            // the same broadcast so it stays correct for chop edits, layer
-            // swaps, undo and the octave shift alike.
-            editor->midiKeyboardComponent->setMappedNotes (processor.getMappedMidiNotes());
-        }
+            editor->midiKeyboardComponent->refreshChops (processor.getChopState());
     });
 }
 
@@ -7970,8 +8119,10 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
     // Keep interaction guidance outside the waveform screen so chop fills,
     // markers, and grid lines can never obscure it.
     cue::drawHelperText (g,
-                         "Click chop: preview/select   Drag edge: resize chop   Shift-drag edge: change tempo",
-                         juce::Rectangle<int> (170, 84, juce::jmax (0, (int) fluidW - 180), 20),
+                         processorRef.isFavoritesViewEnabled()
+                             ? "Click: play/select   Double-click: remove favorite   Order: left to right, top to bottom"
+                             : "Click chop: preview   DRAG AUDIO: export to DAW   Drag edge: resize   Shift-drag: tempo",
+                         juce::Rectangle<int> (270, 84, juce::jmax (0, (int) fluidW - 280), 20),
                          juce::Justification::centred, 10.8f,
                          cue::textMuted.withAlpha (0.9f));
 }
@@ -8008,7 +8159,9 @@ void AudioPluginAudioProcessorEditor::resized()
     // third panel; its blank areas pass mouse events through to the tool buttons.
     const int coreW = fluidW - 20;
 
+    favoritesButton.setBounds (140, 82, 116, 22);
     waveformDisplayComponent->setBounds (10, 106, coreW, 316);
+    favoritesViewComponent->setBounds (10, 106, coreW, 316);
     transportSectionComponent->setBounds (10, 428, coreW, 148);
     waveformFooterComponent->setBounds (10, 428, coreW, 72);
     helpOverlayComponent->setBounds (10, 106, coreW, 470);

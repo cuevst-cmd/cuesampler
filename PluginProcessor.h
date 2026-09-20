@@ -99,6 +99,7 @@ public:
         float decayMilliseconds = 0.0f;
         float sustainLevel = 1.0f;
         float releaseMilliseconds = 5.0f;
+        int64_t favoriteOrder = 0; // creation order, independent of source position
     };
 
     // The single authority on which MIDI note plays which chop.
@@ -136,6 +137,7 @@ public:
         // publishChopState() on the way in — that is the only correct way to
         // install a new chop set.
         ChopMidiMap midiMap;
+        std::vector<int> favoriteChopIndices; // derived, ordered for Favorites view
         // Set by publishChopState once this object has been handed to the audio
         // thread. From that moment it is immutable: anything wanting to publish
         // it again (undo replays the exact shared_ptr it captured) must copy
@@ -185,6 +187,10 @@ public:
     std::shared_ptr<const LoadedSampleData> getLoadedSample() const;
 
     void startPlayback() noexcept;
+    // Mouse auditions retrigger the selected chop and latch its playback mode.
+    // Releasing the mouse leaves a One Shot running to its boundary.
+    void startChopPreview() noexcept;
+    void releaseChopPreview() noexcept;
     void pausePlayback() noexcept;
     void stopPlayback() noexcept;
     void setPlaybackSamplePosition (double newPosition) noexcept;
@@ -200,7 +206,7 @@ public:
         OneShot = 1
     };
 
-    // Global MIDI behavior for chops. Gate loops from the cue point until the
+    // Global MIDI and mouse audition behavior for chops. Gate loops from the cue point until the
     // matching note-off; OneShot ignores note-off and stops at the chop end.
     void setChopPlaybackMode (ChopPlaybackMode mode) noexcept;
     ChopPlaybackMode getChopPlaybackMode() const noexcept;
@@ -242,6 +248,9 @@ public:
     static constexpr int midiOctaveOffsetMin = -3;
     static constexpr int midiOctaveOffsetMax = 4;
     void setGridBpmTrim (float trimBpm);
+    void setDoubleTempoEnabled (bool enabled);
+    bool getDoubleTempoEnabled() const noexcept { return doubleTempoEnabled.load (std::memory_order_acquire); }
+    double getAdjustedAnalysisBpm (const TempoAnalysisData& analysis) const noexcept;
     void setGridStartOffset (float offsetSeconds);
     void setWaveformZoom (float zoomValue) noexcept;
     void setWaveformScroll (float scrollValue) noexcept;
@@ -442,6 +451,8 @@ public:
     enum class ChopEnvelopeParameter : int { Attack = 0, Decay, Sustain, Release };
     void setChopEnvelopeParameter (int chopId, ChopEnvelopeParameter parameter, float value);
     void toggleSelectedChopFavorite();
+    void setFavoritesViewEnabled (bool enabled);
+    bool isFavoritesViewEnabled() const noexcept { return favoritesViewEnabled.load (std::memory_order_acquire); }
     void toggleSelectedChopReversed();
 
     // Edit undo. Snapshots the chop list + grid trim/offset/bars before each
@@ -509,6 +520,8 @@ private:
         std::shared_ptr<ChopState> stashedChopState;
         bool restoredManualChopMode = false;
         float restoredGridBpmTrim = 0.0f;
+        bool restoredDoubleTempo = false;
+        bool restoredFavoritesView = false;
         float restoredGridStartOffset = 0.0f;
         float restoredWaveformZoom = 0.25f;
         float restoredWaveformScroll = 0.0f;
@@ -573,7 +586,8 @@ private:
         int bungeeLatencyFrames = 0;
         float midiVelocity = 1.0f;
         bool playbackTriggeredByMidi = false;
-        bool midiOneShot = false;
+        bool chopOneShot = false;
+        bool playbackTriggeredByMouse = false;
         bool manualChopCapture = false;
         juce::ADSR envelope;
         bool envelopeConfigured = false;
@@ -614,7 +628,8 @@ private:
             playbackCueStartSample = -1.0;
             activeChopId = -1;
             playbackTriggeredByMidi = false;
-            midiOneShot = false;
+            chopOneShot = false;
+            playbackTriggeredByMouse = false;
             manualChopCapture = false;
             envelope.reset();
             envelopeConfigured = false;
@@ -750,7 +765,7 @@ private:
     // UI can never see a chop list whose mapping has not caught up. Assigning
     // to chopState directly is what let the two drift apart in the first place.
     void publishChopState (std::shared_ptr<ChopState> next);
-    static void rebuildChopMidiMap (ChopState& state, int rootNote);
+    static void rebuildChopMidiMap (ChopState& state, int rootNote, bool favoritesOnly = false);
 
     std::shared_ptr<ChopState> chopState;
 
@@ -771,6 +786,7 @@ private:
         float gridBpmTrim = 0.0f;
         float gridStartOffset = 0.0f;
         int   chopBarsCount = 1;
+        bool doubleTempoEnabled = false;
     };
 
     // Captures the current edit state before a mutation. A non-empty
@@ -809,6 +825,8 @@ private:
     double lastWarmHostRate    = 0.0;
     std::shared_ptr<const VoicePitchEngineSet> pitchEngineSet;
 
+    void startPlaybackInternal (bool mousePreview) noexcept;
+
     enum class TransportCommand : int
     {
         none = 0,
@@ -831,6 +849,9 @@ private:
     std::atomic<double> pendingStartStopSample { -1.0 };
     std::atomic<double> pendingStartLoopSample { -1.0 };
     std::atomic<int> pendingStartChopId { -1 };
+    std::atomic<bool> pendingStartMousePreview { false };
+    std::atomic<bool> pendingStartOneShot { false };
+    std::atomic<bool> mousePreviewHeld { false };
     std::atomic<double> pendingStartSyncPpq { 0.0 };
     std::atomic<double> pendingStartSyncSample { 0.0 };
     std::atomic<bool> pendingStartSyncAnchorValid { false };
@@ -900,6 +921,8 @@ private:
     std::atomic<bool> halfTimeEnabled { false };
     std::atomic<int> chopPlaybackMode { (int) ChopPlaybackMode::Gate };
     std::atomic<float> gridBpmTrim { 0.0f };
+    std::atomic<bool> doubleTempoEnabled { false };
+    std::atomic<bool> favoritesViewEnabled { false };
     std::atomic<int> chopBarsCount { 1 };
     std::atomic<int> heldMidiNote { -1 };
     std::atomic<int> midiOctaveOffset { 0 };
@@ -970,7 +993,6 @@ private:
                                    double& barPeriodSeconds,
                                    double& chopPeriodSeconds,
                                    double& gridAnchorSeconds) const noexcept;
-    double getAdjustedAnalysisBpm (const TempoAnalysisData& analysis) const noexcept;
     void updateHostSyncStretchRatio (const TempoAnalysisData& analysis, double currentHostBpm) noexcept;
     void touchTempoUiRevision() noexcept;
     void requestHostStateSync();
@@ -995,6 +1017,8 @@ private:
     // time), default priority — below the host's realtime audio thread so it can
     // never glitch playback. Runs both StemSeparationJob and RemixJob.
     juce::ThreadPool stemThreadPool { 1 };
+    // Optional persistence must not hold up separation readiness or mute remixes.
+    juce::ThreadPool stemCacheWriteThreadPool { 1 };
     // Higher priority so the background bake finishes fast — and is biased onto a
     // performance core on Apple Silicon instead of a slow efficiency core. Still
     // below the host's real-time audio thread, so it cannot glitch playback.

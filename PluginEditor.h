@@ -15,6 +15,7 @@ class HeaderComponent;
 class VisualizerOrb;
 class WaveformDisplayComponent;
 class TransportSectionComponent;
+class FavoritesViewComponent;
 class WaveformFooterComponent;
 class StemRackComponent;
 class StartKnobComponent;
@@ -53,6 +54,7 @@ private:
     // per-user settings file; plugin state is untouched.
     void toggleTheme();
     void applyThemeToUi();
+    void refreshFavoritesView();
 
     AudioPluginAudioProcessor& processorRef;
     std::unique_ptr<juce::PropertiesFile> uiSettingsFile;
@@ -63,6 +65,8 @@ private:
     std::unique_ptr<cue::HeaderComponent> headerComponent;
     std::unique_ptr<cue::WaveformDisplayComponent> waveformDisplayComponent;
     std::unique_ptr<cue::TransportSectionComponent> transportSectionComponent;
+    std::unique_ptr<cue::FavoritesViewComponent> favoritesViewComponent;
+    juce::TextButton favoritesButton;
     std::unique_ptr<cue::WaveformFooterComponent> waveformFooterComponent;
     std::unique_ptr<cue::StemRackComponent> stemRackComponent;
 

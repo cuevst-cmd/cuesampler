@@ -1,4 +1,5 @@
 #include "StemCache.h"
+#include "StemProcessingSettings.h"
 
 #include <juce_cryptography/juce_cryptography.h>
 
@@ -218,9 +219,9 @@ juce::String StemCache::makeKey (const juce::AudioBuffer<float>& buffer,
 
     // Fold the buffer's shape in alongside the PCM hash: the same bytes read
     // as a different channel count or rate are a different separation.
-    // New separations must not reuse stems produced by the delayed resampler.
+    // New separations must use the current resampler and overlap settings.
     // Existing embedded/cache-key project states still load their saved sound.
-    const auto descriptor = "aligned-float-v3|" + audioHash
+    const auto descriptor = StemProcessingSettings::fromEnvironment().cacheTag() + "|" + audioHash
                           + "|" + juce::String (buffer.getNumChannels())
                           + "|" + juce::String (buffer.getNumSamples())
                           + "|" + juce::String (sampleRate, 6)

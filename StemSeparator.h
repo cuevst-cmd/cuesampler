@@ -1,6 +1,7 @@
 #pragma once
 
 #include <juce_audio_basics/juce_audio_basics.h>
+#include "StemProcessingSettings.h"
 
 #include <atomic>
 #include <functional>
@@ -89,12 +90,9 @@ public:
     static constexpr double kModelSampleRate = 44100.0;
     static constexpr int    kModelChannels   = 2;
     static constexpr int    kSegmentSamples  = 343980;  // 7.8 s @ 44.1 kHz
-    // Demucs default is 0.25; we ran 0.10, now default 0.0 (no overlap) for the
-    // fewest inferences. This is the compile-time fallback only — the live value
-    // is resolved from CUE_STEM_OVERLAP at runtime (clamped [0, 0.5]) so the
-    // speed/boundary-artifact trade can be dialled in by ear. Bump to ~0.05 if
-    // segment seams become audible.
-    static constexpr double kOverlap         = 0.0;
+    // Balanced default: overlapping predictions blend the segment boundaries.
+    // Runtime tuning is shared with the cache key via StemProcessingSettings.
+    static constexpr double kOverlap = cuesampler::StemProcessingSettings::defaultOverlap;
 
     // Standard Demucs source order in the model's [1,4,2,T] output. We keep
     // drums/bass/vocals; "other" (index 2) is recomputed by subtraction downstream.
@@ -131,7 +129,7 @@ private:
     // The three 44.1 kHz stereo stems produced by one segmented model pass.
     struct Stems44 { juce::AudioBuffer<float> drums, bass, vocals; };
 
-    // Resample with bounded, delay-compensated per-channel Lagrange. Returns a copy at
+    // Resample with a bounded, zero-phase, band-limited sinc filter. Returns a copy at
     // dstRate; returns a plain copy when the rates already match.
     static juce::AudioBuffer<float> resample (const juce::AudioBuffer<float>& src,
                                               double srcRate, double dstRate);
