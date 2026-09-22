@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "StemCache.h"
+#include "WaveformColourAnalysis.h"
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <cmath>
 #include <cstring>
@@ -726,6 +727,418 @@ struct CueSamplerStateTests
         check (! empty.getDoubleTempoEnabled(), "tempo correction cannot apply without analysis");
     }
 
+    static void setupManualFixture (P& p)
+    {
+        auto sample = std::make_shared<P::LoadedSampleData>();
+        sample->sampleRate = 8000;
+        sample->fileName = "manual chop regression";
+        sample->buffer.setSize (1, 64000);
+        sample->buffer.clear();
+        sample->buffer.setSample (0, 16, 1.0f);
+        juce::MemoryBlock data;
+        check (p.serializeSampleToStateData (*sample, data), "encode manual fixture");
+        sample->serializedStateData = juce::var (data);
+        std::atomic_store (&p.loadedSample, sample);
+        auto analysis = std::make_shared<P::TempoAnalysisData>();
+        analysis->estimatedBpm = 120;
+        analysis->beatPeriodSeconds = 0.5;
+        std::atomic_store (&p.tempoAnalysis, analysis);
+        p.restoredStateReceived.store (true);
+        p.waveformZoom.store (0);
+        p.waveformScroll.store (0);
+        p.prepareToPlay (8000, 128);
+        p.setManualChopModeActive (true);
+    }
+
+    static void manualBlock (P& p, const juce::MidiMessage& message, int offset = 23, int frames = 128)
+    {
+        juce::AudioBuffer<float> output (2, frames);
+        juce::MidiBuffer midi;
+        midi.addEvent (message, offset);
+        p.processBlock (output, midi);
+    }
+
+    static void beginManualCapture (P& p)
+    {
+        p.armManualChopCapture (1000);
+        manualBlock (p, juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 11);
+    }
+
+    static void runManualChops (const juce::File& scratch)
+    {
+        {
+            P p; setupManualFixture (p); beginManualCapture (p);
+            manualBlock (p, juce::MidiMessage::noteOff (1, 60));
+            check (p.getManualChopCaptureEndSample() == 1140, "capture endpoint respects MIDI timestamps");
+            juce::MemoryBlock saved; p.getStateInformation (saved);
+            const auto tree = juce::ValueTree::readFromData ((const char*) saved.getData() + 4, saved.getSize() - 4);
+            check (tree.getChildWithName ("ChopState").getNumChildren() == 1,
+                   "immediate save retains completed capture without an editor timer");
+            p.commitPendingManualChopCaptures();
+            check (p.getChopState()->chops.size() == 1 && p.getChopState()->chops[0].startSample == 1000
+                   && p.getChopState()->chops[0].endSample == 1140, "completed capture commits exactly once");
+            beginManualCapture (p);
+            manualBlock (p, juce::MidiMessage::noteOff (1, 60));
+            p.undoLastEdit();
+            check (p.getChopState()->chops.size() == 1 && p.getChopState()->chops[0].assignedMidiNote == 60,
+                   "immediate Undo consumes and undoes the latest completed capture");
+        }
+        {
+            P p; setupManualFixture (p); beginManualCapture (p);
+            manualBlock (p, juce::MidiMessage::noteOff (2, 60));
+            check (p.getManualChopCaptureHeldNote() == 60, "another MIDI channel cannot finish capture");
+            manualBlock (p, juce::MidiMessage::noteOff (1, 60), 0, 0);
+            p.commitPendingManualChopCaptures();
+            check (p.getChopState()->chops.size() == 1 && p.getChopState()->chops[0].endSample == 1245,
+                   "zero-frame note-off commits the held capture");
+        }
+        for (int action = 0; action < 6; ++action)
+        {
+            P p; setupManualFixture (p); beginManualCapture (p);
+            if (action == 0) p.stopPlayback();
+            if (action == 1) p.pausePlayback();
+            if (action == 2) manualBlock (p, juce::MidiMessage::allNotesOff (1));
+            if (action == 3) manualBlock (p, juce::MidiMessage::allSoundOff (1));
+            if (action == 4) p.prepareToPlay (8000, 128);
+            if (action == 5) p.releaseResources();
+            manualBlock (p, juce::MidiMessage::noteOff (1, 60));
+            p.commitPendingManualChopCaptures();
+            check (p.getChopState()->chops.empty() && p.getManualChopCaptureHeldNote() < 0 && ! p.isPlaying(),
+                   "transport, panic and audio-device resets cancel capture without creating a backwards chop");
+        }
+        {
+            P p; setupManualFixture (p);
+            const auto oldSample = std::atomic_load (&p.loadedSample);
+            std::atomic_store (&p.loadedSample, std::make_shared<P::LoadedSampleData> (*oldSample));
+            p.armManualChopCapture (1000);
+            p.handleMidiEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0,
+                               oldSample, std::atomic_load (&p.chopState), 8000, false, false, 0);
+            check (p.getManualChopCaptureHeldNote() < 0, "an old audio-block snapshot cannot begin capture for a replacement source");
+        }
+        {
+            P p; setupManualFixture (p);
+            std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+            beginManualCapture (p);
+            manualBlock (p, juce::MidiMessage::noteOff (1, 60));
+            editor.reset();
+            check (waitFor ([&] { return p.getChopState()->chops.size() == 1; }),
+                   "processor commits released capture after editor closure");
+        }
+        {
+            P p; setupManualFixture (p); beginManualCapture (p);
+            manualBlock (p, juce::MidiMessage::noteOff (1, 60));
+            p.clearAllChops();
+            p.commitPendingManualChopCaptures();
+            check (p.getChopState()->chops.empty(), "clear removes completed captures still awaiting publication");
+            p.undoLastEdit();
+            check (p.getChopState()->chops.size() == 1, "undo clear restores the completed capture");
+        }
+        {
+            P p; setupManualFixture (p);
+            const int id = p.addManualChop (1000, 2000, 60);
+            p.setChopBounds (id, 1100, 1900);
+            p.setManualChopModeActive (false);
+            p.setChopBarsCount (2);
+            p.setManualChopModeActive (true);
+            check (p.canUndoEdit(), "switching layers retains manual undo history");
+            p.undoLastEdit();
+            check (p.getChopState()->chops.size() == 1 && p.getChopState()->chops[0].startSample == 1000
+                   && p.getChopBarsCount() == 2, "manual undo restores only its chop edit, retaining current grid settings");
+            beginManualCapture (p);
+            manualBlock (p, juce::MidiMessage::noteOff (1, 60));
+            // A replacement sample must invalidate both layers and any completion
+            // still waiting in the audio-to-message-thread queue.
+            const auto sampleFile = scratch.getChildFile ("replacement.wav");
+            auto sample = std::make_shared<P::LoadedSampleData>();
+            sample->sampleRate = 8000; sample->buffer.setSize (1, 8000); sample->buffer.clear();
+            juce::MemoryBlock data;
+            p.serializeSampleToStateData (*sample, data);
+            sampleFile.replaceWithData (data.getData(), data.getSize());
+            check (p.loadAudioFile (sampleFile) == P::SampleLoadResult::loaded, "replacement sample loads");
+            p.commitPendingManualChopCaptures();
+            check (p.getChopState()->chops.empty() && ! p.canUndoEdit(), "replacement clears active chops, history and stale capture");
+            p.setManualChopModeActive (false);
+            check (p.getChopState()->chops.empty() && ! p.canUndoEdit(), "replacement also clears inactive chops and history");
+        }
+
+        const auto findWave = [] (juce::Component& root)
+        {
+            std::function<juce::Component* (juce::Component&)> find = [&] (juce::Component& c) -> juce::Component*
+            {
+                if (juce::String (typeid (c).name()).contains ("WaveformDisplayComponent")) return &c;
+                for (auto* child : c.getChildren()) if (auto* found = find (*child)) return found;
+                return nullptr;
+            };
+            return find (root);
+        };
+        {
+            P p; setupManualFixture (p);
+            const int id = p.addManualChop (16000, 32000, 60);
+            juce::MemoryBlock manualState; p.getStateInformation (manualState);
+            p.setManualChopModeActive (false);
+            std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+            p.setStateInformation (manualState.getData(), (int) manualState.getSize());
+            auto* add = findButton (*editor, "ADD CHOP");
+            auto* edit = findButton (*editor, "EDIT");
+            check (waitFor ([&] { return restored (p) && add != nullptr && add->isVisible(); }),
+                   "open-editor restore synchronizes waveform manual tools");
+            auto* wave = findWave (*editor);
+            if (wave == nullptr || add == nullptr || edit == nullptr) { check (false, "manual UI controls exist"); return; }
+            const float width = (float) wave->getWidth() - 58.0f;
+            const auto xFor = [width] (int sample) { return 27.0f + width * (float) sample / 64000.0f; };
+            const auto event = [wave] (float x, float y = 150.0f)
+            {
+                const juce::Point<float> point (x, y);
+                return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), point,
+                    juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier), 1, 0, 0, 0, 0,
+                    wave, wave, juce::Time::getCurrentTime(), point, juce::Time::getCurrentTime(), 1, false);
+            };
+            const auto click = [&] (int sample)
+            {
+                auto e = event (xFor (sample)); wave->mouseDown (e); wave->mouseUp (e);
+            };
+            // Force the saved zoom to finish synchronizing while hidden.
+            editor->setVisible (false);
+            for (int i = 0; i < 10; ++i) pump();
+            edit->onClick();
+            auto press = event (xFor (16000) + 3.0f);
+            wave->mouseDown (press); wave->mouseUp (press);
+            check (p.getChopState()->chops[0].startSample == 16000, "pressing an edge without dragging does not move it");
+            p.setChopBounds (id, 16000, 16080);
+            const auto shortPress = event (xFor (16080) + 3.0f);
+            wave->mouseDown (shortPress);
+            wave->mouseDrag (event (shortPress.position.x + 3.1f));
+            wave->mouseUp (shortPress);
+            const auto shortChop = p.getChopState()->chops[0];
+            check (shortChop.endSample - shortChop.startSample < 400,
+                   "trimming a short chop does not impose a 50ms minimum");
+            add->onClick(); click (40000); click (48000);
+            const auto chops = p.getChopState();
+            check (chops->chops.size() == 2 && chops->chops[1].startSample == 40000 && chops->chops[1].endSample == 48000,
+                   "two single clicks create an independent chop");
+            check (edit->getToggleState(), "finishing a chop returns to audition/edit");
+            p.setChopPlaybackMode (P::ChopPlaybackMode::OneShot);
+            click (44000);
+            manualBlock (p, juce::MidiMessage::controllerEvent (1, 1, 0));
+            check (p.voice.playbackTriggeredByMouse && p.voice.playbackActive, "clicking a completed manual chop auditions it");
+            add->onClick(); click (52000);
+            check (wave->keyPressed (juce::KeyPress (juce::KeyPress::escapeKey)), "Escape cancels pending manual placement");
+            beginManualCapture (p); p.cancelManualChopCapture();
+            check (p.getChopState()->chops.size() == 2, "cancelled placement does not create a chop");
+            auto* warp = findButton (*editor, "WARP");
+            check (warp != nullptr, "warp control exists");
+            if (warp != nullptr)
+            {
+                const auto before = p.getChopState();
+                warp->setToggleState (true, juce::dontSendNotification); warp->onClick();
+                check (p.isManualChopModeActive() && p.isWarpModeActive() && p.getChopState() == before,
+                       "WARP edits the current manual layout instead of switching layers");
+            }
+        }
+        {
+            P p; setupManualFixture (p); p.waveformZoom.store (1.0f);
+            p.addManualChop (16, 24, 60);
+            std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+            auto* wave = findWave (*editor);
+            if (wave == nullptr) { check (false, "precision waveform exists"); return; }
+            wave->resized();
+            const auto image = wave->createComponentSnapshot (wave->getLocalBounds());
+            const int markerX = 27 + (wave->getWidth() - 58) / 2;
+            const int y = wave->getHeight() / 2 - 25;
+            check (image.getPixelAt (markerX, y).getRed() > 140 && image.getPixelAt (43, y).getRed() < 100,
+                   "deep-zoom impulse aligns with its sample-16 chop marker");
+            juce::FileOutputStream output (scratch.getSiblingFile ("manual-chop-precision.png"));
+            output.setPosition (0); output.truncate();
+            juce::PNGImageFormat().writeImageToStream (image, output);
+            juce::FileOutputStream editorOutput (scratch.getSiblingFile ("manual-chop-editor.png"));
+            editorOutput.setPosition (0); editorOutput.truncate();
+            juce::PNGImageFormat().writeImageToStream (editor->createComponentSnapshot (editor->getLocalBounds()), editorOutput);
+        }
+    }
+
+    static void runWaveformColour (const juce::File& scratch)
+    {
+        using Analysis = cuesampler::WaveformColourAnalysis;
+        for (const int rate : { 8000, 44100, 48000, 96000 })
+        {
+            const std::array<double, 3> frequencies { 80.0, 1000.0, juce::jmin (10000.0, rate * 0.46) };
+            for (size_t band = 0; band < frequencies.size(); ++band)
+            {
+                juce::AudioBuffer<float> tone (2, rate / 2);
+                for (int i = 0; i < tone.getNumSamples(); ++i)
+                {
+                    const auto x = (float) (0.5 * std::sin (juce::MathConstants<double>::twoPi * frequencies[band] * i / rate));
+                    tone.setSample (0, i, x); tone.setSample (1, i, -x);
+                }
+                const auto data = Analysis::analyse (tone, rate);
+                const auto energy = data->bands (rate / 4, rate / 3);
+                check (energy[band] > 2.0 * energy[(band + 1) % 3] && energy[band] > 2.0 * energy[(band + 2) % 3],
+                       "known tones map to low/mid/high bands across sample rates, including inverted stereo");
+            }
+        }
+        juce::AudioBuffer<float> audio (1, 48000); audio.clear();
+        auto data = Analysis::analyse (audio, 48000);
+        check (data->attacks.empty() && data->bands (0, 48000) == std::array<double, 3> {}, "silence has no false colours or transients");
+        for (const int sample : { 2400, 12000, 36000 }) audio.setSample (0, sample, 1.0f);
+        data = Analysis::analyse (audio, 48000);
+        check (data->attacks == std::vector<int> { 2400, 12000, 36000 }, "isolated attacks retain their source-sample positions");
+        int polls = 0;
+        check (Analysis::analyse (audio, 48000, [&] { return ++polls > 2; }) == nullptr,
+               "obsolete analysis cancels within a short analysis frame");
+        for (int i = 0; i < audio.getNumSamples(); ++i) audio.setSample (0, i, 0.5f);
+        check (Analysis::analyse (audio, 48000)->attacks.size() == 1, "sustained energy does not generate repeated attack markers");
+
+        P p; setupManualFixture (p);
+        check (p.getWaveformColourMode() == 0, "colour display is optional and defaults to Classic");
+        p.setWaveformColourMode (3);
+        juce::MemoryBlock saved; p.getStateInformation (saved);
+        P reopened; reopened.setStateInformation (saved.getData(), (int) saved.getSize());
+        check (waitFor ([&] { return restored (reopened); }) && reopened.getWaveformColourMode() == 3,
+               "waveform colour preference survives project restore");
+        juce::MemoryInputStream input (saved.getData(), saved.getSize(), false); input.skipNextBytes (4);
+        auto legacy = juce::ValueTree::readFromStream (input); legacy.removeProperty ("waveformColourMode", nullptr);
+        juce::MemoryBlock legacyData;
+        { juce::MemoryOutputStream out (legacyData, false); out.write ("CSB2", 4); legacy.writeToStream (out); }
+        reopened.setStateInformation (legacyData.getData(), (int) legacyData.getSize());
+        check (waitFor ([&] { return restored (reopened); }) && reopened.getWaveformColourMode() == 0,
+               "older projects retain the Classic waveform");
+
+        auto source = std::make_shared<P::LoadedSampleData>();
+        source->sampleRate = 48000; source->fileName = "Waveform colour: low / mid / high / attacks";
+        source->buffer.setSize (2, 192000); source->buffer.clear();
+        for (int region = 0; region < 3; ++region)
+            for (int i = 0; i < 38400; ++i)
+            {
+                const double envelope = juce::jmin (1.0, i / 400.0) * juce::jmin (1.0, (38400 - i) / 2000.0);
+                const double hz = region == 0 ? 80.0 : region == 1 ? 1000.0 : 10000.0;
+                const float x = (float) (0.72 * envelope * std::sin (juce::MathConstants<double>::twoPi * hz * i / 48000));
+                source->buffer.setSample (0, region * 48000 + i, x);
+                source->buffer.setSample (1, region * 48000 + i, -x);
+            }
+        for (const int begin : { 148800, 163200, 177600 })
+            for (int i = 0; i < 5000; ++i)
+            {
+                const float x = (float) (std::exp (-i / 700.0) * std::cos (i * 0.8));
+                source->buffer.setSample (0, begin + i, x); source->buffer.setSample (1, begin + i, -x);
+            }
+        std::atomic_store (&p.loadedSample, source);
+        p.setWaveformColourMode (3);
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+        auto* mode = findButton (*editor, "WAVE: BOTH");
+        check (mode != nullptr, "waveform display selector reflects the saved preference");
+        juce::Component* wave = mode != nullptr ? mode->getParentComponent() : nullptr;
+        if (wave == nullptr) return;
+        const auto sampleColour = [&] (int sample)
+        {
+            const auto image = wave->createComponentSnapshot (wave->getLocalBounds());
+            const int x = 27 + (wave->getWidth() - 58) * sample / source->buffer.getNumSamples();
+            return image.getPixelAt (x, wave->getHeight() / 2 - 30);
+        };
+        check (waitFor ([&]
+        {
+            const auto low = sampleColour (24000), mid = sampleColour (72000), high = sampleColour (120000);
+            return low.getRed() > low.getBlue() * 1.5 && mid.getGreen() > mid.getRed() * 1.5 && high.getBlue() > high.getRed() * 1.5;
+        }), "background analysis paints distinct frequency colours without stereo cancellation");
+        {
+            juce::FileOutputStream out (scratch.getSiblingFile ("waveform-colour-both.png"));
+            out.setPosition (0); out.truncate();
+            juce::PNGImageFormat().writeImageToStream (editor->createComponentSnapshot (editor->getLocalBounds()), out);
+        }
+        p.setWaveformColourMode (0);
+        check (waitFor ([&] { return findButton (*editor, "WAVE: CLASSIC") != nullptr; }), "Classic switch updates an open editor");
+        const auto classic = sampleColour (24000);
+        check (classic.getRed() < classic.getBlue() * 1.5, "Classic removes the frequency colour overlay");
+        p.setWaveformColourMode (3);
+        check (waitFor ([&] { return findButton (*editor, "WAVE: BOTH") != nullptr; }), "colour mode can reuse completed analysis");
+        auto warpedLayout = std::make_shared<P::ChopState>();
+        P::ChopDefinition warpedChop;
+        warpedChop.id = 1; warpedChop.startSample = 0; warpedChop.endSample = 144000;
+        warpedChop.warpMarkers.push_back ({ 48000, 1.5, false, 0.0 });
+        warpedLayout->chops.push_back (warpedChop); warpedLayout->nextChopId = 2;
+        p.publishChopState (warpedLayout);
+        const auto warpedColour = sampleColour (48000);
+        check (warpedColour.getRed() > warpedColour.getGreen() * 1.5,
+               "warped waveform colours follow the source-to-playback time map");
+        p.publishChopState (std::make_shared<P::ChopState>());
+        auto replacement = std::make_shared<P::LoadedSampleData> (*source);
+        replacement->buffer.clear();
+        std::atomic_store (&p.loadedSample, replacement);
+        p.sampleChangeBroadcaster.sendChangeMessage();
+        check (waitFor ([&] { const auto colour = sampleColour (24000); return colour.getRed() < 80 && colour.getGreen() < 80; }),
+               "sample replacement cannot retain the previous coloured waveform");
+    }
+
+    static void runCueRecall()
+    {
+        P original;
+        auto source = std::make_shared<P::LoadedSampleData>();
+        source->sampleRate = 8000;
+        source->fileName = "cue recall fixture";
+        source->buffer.setSize (1, 64000);
+        source->buffer.clear();
+        // Different silent lead-ins make unwanted onset detection observable.
+        for (int i = 0; i < 4; ++i)
+            for (int frame = i * 16000 + (i + 1) * 160; frame < (i + 1) * 16000; ++frame)
+                source->buffer.setSample (0, frame, 0.5f);
+        juce::MemoryBlock encoded;
+        check (original.serializeSampleToStateData (*source, encoded), "encode cue recall fixture");
+        source->serializedStateData = juce::var (encoded);
+        std::atomic_store (&original.loadedSample, source);
+        auto analysis = std::make_shared<P::TempoAnalysisData>();
+        analysis->estimatedBpm = 120;
+        analysis->beatPeriodSeconds = 0.5;
+        analysis->analysisEndSeconds = 8;
+        std::atomic_store (&original.tempoAnalysis, analysis);
+        original.chopBarsCount.store (1);
+        original.buildChopsFromAnalysis (*analysis);
+        const auto generated = original.getChopState();
+        check (generated->chops.size() == 4
+               && std::all_of (generated->chops.begin(), generated->chops.end(),
+                               [] (const auto& chop) { return chop.cueOffsetSamples > 0; }),
+               "new chops still auto-cue past silent lead-ins");
+        if (generated->chops.size() != 4) return;
+
+        const std::array<float, 4> cueValues { 0.0f, 0.0f, 0.25f, 1.0f };
+        for (size_t i = 0; i < cueValues.size(); ++i)
+        {
+            original.selectChopById (generated->chops[i].id);
+            original.setSelectedChopCueNormalized (cueValues[i]);
+        }
+        const auto expected = original.getChopState();
+        const auto cuesMatch = [&] (const std::shared_ptr<const P::ChopState>& actual)
+        {
+            if (actual == nullptr || actual->chops.size() != expected->chops.size()) return false;
+            for (size_t i = 0; i < expected->chops.size(); ++i)
+                if (actual->chops[i].startSample != expected->chops[i].startSample
+                    || actual->chops[i].endSample != expected->chops[i].endSample
+                    || actual->chops[i].cueOffsetSamples != expected->chops[i].cueOffsetSamples)
+                    return false;
+            return true;
+        };
+        std::atomic_store (&original.stashedChopState, std::make_shared<P::ChopState> (*expected));
+
+        P reopened;
+        for (bool manual : { false, true })
+        {
+            original.manualChopModeActive.store (manual);
+            juce::MemoryBlock saved;
+            original.getStateInformation (saved);
+            for (int recall = 0; recall < 2; ++recall)
+            {
+                reopened.setStateInformation (saved.getData(), (int) saved.getSize());
+                check (waitFor ([&] { return restored (reopened); }), "cue fixture async recall completes");
+                check (cuesMatch (reopened.getChopState()), "zero, edited and end cues survive repeated recall in either layer");
+                check (cuesMatch (std::atomic_load (&reopened.stashedChopState)), "inactive layer cue positions survive recall");
+                check (reopened.manualChopModeActive.load() == manual, "cue recall preserves active layer");
+                reopened.getStateInformation (saved);
+            }
+        }
+
+        original.manualChopModeActive.store (false);
+        original.buildChopsFromAnalysis (*analysis);
+        check (cuesMatch (original.getChopState()), "grid rebuild preserves explicitly zeroed cues");
+    }
+
     static void run (bool testSeparation)
     {
         P original;
@@ -932,12 +1345,23 @@ int main (int argc, char** argv)
    #else
     ::setenv ("CUE_STEM_CACHE_DIR", scratch.getFullPathName().toRawUTF8(), 1);
    #endif
-    CueSamplerStateTests::runExports (scratch);
-    CueSamplerStateTests::runMousePlaybackModes();
-    CueSamplerStateTests::runExportHandle();
-    CueSamplerStateTests::runFavorites();
-    CueSamplerStateTests::runDoubleTempo (scratch);
-    CueSamplerStateTests::run (argc > 2 && juce::String (argv[2]) == "--separate");
+    const auto filter = argc > 2 ? juce::String (argv[2]) : juce::String();
+    const bool full = filter.isEmpty() || filter == "--separate";
+    if (full || filter == "--cue-recall") CueSamplerStateTests::runCueRecall();
+    if (full || filter == "--manual-chops") CueSamplerStateTests::runManualChops (scratch);
+    if (full || filter == "--waveform-colour") CueSamplerStateTests::runWaveformColour (scratch);
+    if (full || filter == "--state-only")
+    {
+        if (filter != "--state-only")
+        {
+            CueSamplerStateTests::runExports (scratch);
+            CueSamplerStateTests::runMousePlaybackModes();
+            CueSamplerStateTests::runExportHandle();
+        }
+        CueSamplerStateTests::runFavorites();
+        CueSamplerStateTests::runDoubleTempo (scratch);
+        CueSamplerStateTests::run (argc > 2 && juce::String (argv[2]) == "--separate");
+    }
     scratch.deleteRecursively();
     std::cout << (failures == 0 ? "ALL PASSED" : "FAILED") << std::endl;
     return failures == 0 ? 0 : 1;

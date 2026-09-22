@@ -2468,10 +2468,12 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
 
     cachePollerThread = std::make_unique<CachePollerThread> (*this);
     cachePollerThread->startThread (juce::Thread::Priority::low);
+    startTimerHz (60);
 }
 
 AudioPluginAudioProcessor::~AudioPluginAudioProcessor()
 {
+    stopTimer();
     if (cachePollerThread != nullptr)
     {
         cachePollerThread->signalThreadShouldExit();
@@ -2622,6 +2624,7 @@ void AudioPluginAudioProcessor::changeProgramName (int index, const juce::String
 //==============================================================================
 void AudioPluginAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    cancelManualChopCapture();
     juce::ignoreUnused (samplesPerBlock);
     hostSampleRate.store (sampleRate, std::memory_order_release);
     outputMeterLevel.store (0.0f, std::memory_order_release);
@@ -2643,6 +2646,7 @@ void AudioPluginAudioProcessor::prepareToPlay (double sampleRate, int samplesPer
 
 void AudioPluginAudioProcessor::releaseResources()
 {
+    cancelManualChopCapture();
     voice.reset();
 
     std::atomic_store (&pitchEngineSet, std::shared_ptr<const VoicePitchEngineSet> {});
@@ -2791,6 +2795,17 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     const auto currentHostRate = juce::jmax (1.0, hostSampleRate.load (std::memory_order_acquire));
     const auto enginesForBlock = std::atomic_load (&pitchEngineSet);
 
+    if (voice.manualChopCapture
+        && (voice.manualCaptureGeneration != manualCaptureGeneration.load (std::memory_order_acquire)
+            || voice.manualCaptureSource != sampleForBlock.get()))
+    {
+        // Do not disarm a newer placement when retiring the previous voice.
+        if (voice.manualCaptureGeneration == manualCaptureGeneration.load (std::memory_order_acquire))
+            cancelManualChopCapture();
+        voice.reset();
+        manualChopCaptureHeldNote.store (-1, std::memory_order_release);
+    }
+
     // Consume message-thread voice mutation requests (single consumer: here).
     if (voiceResetRequest.exchange (false, std::memory_order_acq_rel))
         voice.bungeeResetPending = true;
@@ -2934,6 +2949,12 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
     auto renderVoiceSegment = [&](VoiceState& v, int segmentOffset, int segmentSamples)
     {
+        if (v.manualChopCapture
+            && v.manualCaptureGeneration != manualCaptureGeneration.load (std::memory_order_acquire))
+        {
+            v.reset();
+            manualChopCaptureHeldNote.store (-1, std::memory_order_release);
+        }
         if (! v.playbackActive || sampleForBlock == nullptr)
             return;
 
@@ -3689,13 +3710,27 @@ void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg,
     // Manual-chop capture is deliberately handled before normal pad playback.
     // The audio thread only mutates its voice and atomics here: no allocation,
     // locking, state-tree work, or UI callbacks.
+    if (msg.isAllNotesOff() || msg.isAllSoundOff())
+    {
+        if (! voice.manualChopCapture || msg.getChannel() == voice.manualCaptureChannel)
+        {
+            cancelManualChopCapture();
+            voice.reset();
+            heldMidiNote.store (-1, std::memory_order_release);
+            playbackActive.store (false, std::memory_order_release);
+        }
+        return;
+    }
+
     if (manualChopModeActive.load (std::memory_order_acquire)
         && manualChopCaptureArmed.load (std::memory_order_acquire))
     {
         if (msg.isNoteOff())
         {
             const int heldNote = manualChopCaptureHeldNote.load (std::memory_order_acquire);
-            if (heldNote >= 0 && msg.getNoteNumber() == heldNote)
+            if (heldNote >= 0 && msg.getNoteNumber() == heldNote
+                && msg.getChannel() == voice.manualCaptureChannel
+                && voice.manualCaptureGeneration == manualCaptureGeneration.load (std::memory_order_acquire))
             {
                 const int endLimit = currentSample != nullptr
                     ? juce::jmax (0, currentSample->buffer.getNumSamples())
@@ -3703,6 +3738,13 @@ void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg,
                 const int capturedEnd = juce::jlimit (0, endLimit,
                     (int) std::round (voice.playbackSamplePosition));
 
+                if (capturedEnd - voice.manualCaptureStart >= 2)
+                {
+                    const auto write = manualCaptureFifo.write (1);
+                    if (write.blockSize1 > 0)
+                        manualCaptureResults[(size_t) write.startIndex1] = {
+                            voice.manualCaptureStart, capturedEnd, heldNote, voice.manualCaptureContext };
+                }
                 manualChopCaptureEndSample.store (capturedEnd, std::memory_order_release);
                 manualChopCaptureCompletedNote.store (heldNote, std::memory_order_release);
                 manualChopCaptureHeldNote.store (-1, std::memory_order_release);
@@ -3723,12 +3765,19 @@ void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg,
             if (manualChopCaptureHeldNote.load (std::memory_order_acquire) >= 0)
                 return;
 
-            if (currentSample == nullptr || currentSample->buffer.getNumSamples() <= 0)
+            const auto captureGeneration = manualCaptureGeneration.load (std::memory_order_acquire);
+            if (currentSample == nullptr || currentSample->buffer.getNumSamples() <= 0
+                || currentSample.get() != manualCaptureSource.load (std::memory_order_acquire))
                 return;
+            if (manualCaptureFifo.getFreeSpace() == 0)
+                return; // never begin a capture whose completion cannot be retained
 
             const int sourceLength = currentSample->buffer.getNumSamples();
             const int startSample = juce::jlimit (0, sourceLength - 1,
                 manualChopCaptureStartSample.load (std::memory_order_acquire));
+            if (captureGeneration != manualCaptureGeneration.load (std::memory_order_acquire)
+                || ! manualChopCaptureArmed.load (std::memory_order_acquire))
+                return;
 
             auto& captureVoice = voice;
             captureVoice.reset();
@@ -3742,6 +3791,11 @@ void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg,
             captureVoice.playbackTriggeredByMidi = true;
             captureVoice.chopOneShot = true;
             captureVoice.manualChopCapture = true;
+            captureVoice.manualCaptureGeneration = captureGeneration;
+            captureVoice.manualCaptureContext = manualCaptureContext.load (std::memory_order_acquire);
+            captureVoice.manualCaptureStart = startSample;
+            captureVoice.manualCaptureChannel = msg.getChannel();
+            captureVoice.manualCaptureSource = currentSample.get();
             captureVoice.fadeGain = 1.0f;
             captureVoice.fadeTarget = 1.0f;
             captureVoice.fadeStep = 0.0f;
@@ -3853,6 +3907,7 @@ juce::AudioProcessorEditor* AudioPluginAudioProcessor::createEditor()
 void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
+    commitPendingManualChopCaptures();
     if (pendingRestoreState.isValid())
     {
         juce::MemoryOutputStream output (destData, false);
@@ -3868,6 +3923,7 @@ void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData
     state.setProperty ("gridStartOffset", (double) gridStartOffset.load (std::memory_order_acquire), nullptr);
     state.setProperty ("waveformZoom", (double) waveformZoom.load (std::memory_order_acquire), nullptr);
     state.setProperty ("waveformScroll", (double) waveformScroll.load (std::memory_order_acquire), nullptr);
+    state.setProperty ("waveformColourMode", getWaveformColourMode(), nullptr);
     state.setProperty ("globalPitchSemitones", (double) pitchSemitones.load (std::memory_order_acquire), nullptr);
     state.setProperty ("globalGainDecibels", (double) globalGainDecibels.load (std::memory_order_acquire), nullptr);
     state.setProperty ("syncToHost", syncToHost.load (std::memory_order_acquire), nullptr);
@@ -4023,6 +4079,8 @@ void AudioPluginAudioProcessor::setStateInformation (const void* data, int sizeI
 
     const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     pendingRestoreState = state;
+    cancelManualChopCapture();
+    manualCaptureContext.fetch_add (1, std::memory_order_acq_rel);
     resetStemState();
     const auto restoreStateGeneration = restoreGeneration.fetch_add (1, std::memory_order_acq_rel) + 1;
 
@@ -4212,6 +4270,7 @@ AudioPluginAudioProcessor::parseDeferredRestoreState (const juce::ValueTree& sta
                                                       (float) (double) state.getProperty ("waveformZoom", 0.25));
     restoreState.restoredWaveformScroll = juce::jlimit (0.0f, 1.0f,
                                                         (float) (double) state.getProperty ("waveformScroll", 0.0));
+    restoreState.restoredWaveformColourMode = juce::jlimit (0, 3, (int) state.getProperty ("waveformColourMode", 0));
     restoreState.restoredGlobalPitch = juce::jlimit (-24.0f, 24.0f,
                                                      (float) (double) state.getProperty ("globalPitchSemitones", 0.0));
     restoreState.restoredGlobalGainDecibels = juce::jlimit (-24.0f, 12.0f,
@@ -4259,6 +4318,7 @@ void AudioPluginAudioProcessor::applyParsedRestoreState (const DeferredRestoreSt
     gridStartOffset.store (restoreState.restoredGridStartOffset, std::memory_order_release);
     waveformZoom.store (restoreState.restoredWaveformZoom, std::memory_order_release);
     waveformScroll.store (restoreState.restoredWaveformScroll, std::memory_order_release);
+    waveformColourMode.store (restoreState.restoredWaveformColourMode, std::memory_order_release);
     pitchSemitones.store (restoreState.restoredGlobalPitch, std::memory_order_release);
     globalGainDecibels.store (restoreState.restoredGlobalGainDecibels, std::memory_order_release);
     syncToHost.store (restoreState.restoredSyncToHost, std::memory_order_release);
@@ -4350,61 +4410,66 @@ void AudioPluginAudioProcessor::completeDeferredSampleRestore (const DeferredRes
                                                            restoredEditState->regionEndSample);
     }
 
-    int highestChopId = 0;
-    for (auto& chop : restoredChopState->chops)
+    const auto validateChops = [totalSamples] (ChopState& state)
     {
-        chop.startSample = juce::jlimit (0, totalSamples - 1, chop.startSample);
-        chop.endSample = juce::jlimit (chop.startSample + 1, totalSamples, chop.endSample);
-        const auto maxCueOffset = juce::jmax (0, chop.endSample - chop.startSample - 1);
-        chop.cueOffsetSamples = juce::jlimit (0, maxCueOffset, chop.cueOffsetSamples);
-        if (chop.cueOffsetSamples == 0)
+        int highestChopId = 0;
+        for (auto& chop : state.chops)
         {
-            const auto autoCueStart = findAutoCueStartSample (*restoredSample, chop.startSample, chop.endSample);
-            chop.cueOffsetSamples = juce::jlimit (0, maxCueOffset, autoCueStart - chop.startSample);
+            chop.startSample = juce::jlimit (0, totalSamples - 1, chop.startSample);
+            chop.endSample = juce::jlimit (chop.startSample + 1, totalSamples, chop.endSample);
+            const auto maxCueOffset = juce::jmax (0, chop.endSample - chop.startSample - 1);
+            // Zero is an intentional cue at the chop start, not an unset value.
+            // Recall must preserve saved cues rather than run onset detection again.
+            chop.cueOffsetSamples = juce::jlimit (0, maxCueOffset, chop.cueOffsetSamples);
+
+            // Drop warp markers that fall outside the (possibly clamped) chop range.
+            chop.warpMarkers.erase (std::remove_if (chop.warpMarkers.begin(),
+                                                    chop.warpMarkers.end(),
+                                                    [&chop] (const ChopWarpMarker& m)
+                                                    {
+                                                        return m.sourceSample <= chop.startSample
+                                                            || m.sourceSample >= chop.endSample;
+                                                    }),
+                                    chop.warpMarkers.end());
+
+            highestChopId = juce::jmax (highestChopId, chop.id);
         }
 
-        // Drop warp markers that fall outside the (possibly clamped) chop range.
-        chop.warpMarkers.erase (std::remove_if (chop.warpMarkers.begin(),
-                                                chop.warpMarkers.end(),
-                                                [&chop] (const ChopWarpMarker& m)
-                                                {
-                                                    return m.sourceSample <= chop.startSample
-                                                        || m.sourceSample >= chop.endSample;
-                                                }),
-                                chop.warpMarkers.end());
+        state.chops.erase (std::remove_if (state.chops.begin(),
+                                          state.chops.end(),
+                                          [] (const ChopDefinition& chop)
+                                          {
+                                              return chop.id <= 0 || chop.endSample <= chop.startSample;
+                                          }),
+                           state.chops.end());
 
-        highestChopId = juce::jmax (highestChopId, chop.id);
-    }
+        std::sort (state.chops.begin(), state.chops.end(),
+                   [] (const ChopDefinition& lhs, const ChopDefinition& rhs)
+                   {
+                       if (lhs.startSample != rhs.startSample)
+                           return lhs.startSample < rhs.startSample;
 
-    restoredChopState->chops.erase (std::remove_if (restoredChopState->chops.begin(),
-                                                    restoredChopState->chops.end(),
-                                                    [] (const ChopDefinition& chop)
-                                                    {
-                                                        return chop.id <= 0 || chop.endSample <= chop.startSample;
-                                                    }),
-                                    restoredChopState->chops.end());
+                       return lhs.id < rhs.id;
+                   });
 
-    std::sort (restoredChopState->chops.begin(), restoredChopState->chops.end(),
-               [] (const ChopDefinition& lhs, const ChopDefinition& rhs)
-               {
-                   if (lhs.startSample != rhs.startSample)
-                       return lhs.startSample < rhs.startSample;
+        if (state.nextChopId <= highestChopId)
+            state.nextChopId = highestChopId + 1;
 
-                   return lhs.id < rhs.id;
-               });
-
-    if (restoredChopState->nextChopId <= highestChopId)
-        restoredChopState->nextChopId = highestChopId + 1;
-
-    const auto hasSelectedChop = std::any_of (restoredChopState->chops.begin(),
-                                              restoredChopState->chops.end(),
-                                              [selectedChopId = restoredChopState->selectedChopId] (const auto& chop)
-                                              {
-                                                  return chop.id == selectedChopId;
-                                              });
-    if (! hasSelectedChop)
-        restoredChopState->selectedChopId = restoredChopState->chops.empty() ? -1
-                                                                              : restoredChopState->chops.front().id;
+        const auto hasSelectedChop = std::any_of (state.chops.begin(),
+                                                 state.chops.end(),
+                                                 [selectedChopId = state.selectedChopId] (const auto& chop)
+                                                 {
+                                                     return chop.id == selectedChopId;
+                                                 });
+        if (! hasSelectedChop)
+            state.selectedChopId = state.chops.empty() ? -1
+                                                      : state.chops.front().id;
+    };
+    auto restoredStash = restoreState.stashedChopState != nullptr
+        ? std::make_shared<ChopState> (*restoreState.stashedChopState)
+        : std::make_shared<ChopState>();
+    validateChops (*restoredChopState);
+    validateChops (*restoredStash);
 
     if (completedRestoreGeneration != restoreGeneration.load (std::memory_order_acquire))
         return;
@@ -4432,14 +4497,8 @@ void AudioPluginAudioProcessor::completeDeferredSampleRestore (const DeferredRes
     std::atomic_store (&tempoAnalysis, restoredAnalysis);
     publishChopState (restoredChopState);
 
-    // The inactive chop layer and which layer was live when the project was
-    // saved. Restored verbatim — the stashed set is not re-validated against
-    // the sample here because it is not playable until swapped in, and
-    // swapChopLayers()/the next edit will clamp it if the sample differs.
-    std::atomic_store (&stashedChopState,
-                       restoreState.stashedChopState != nullptr
-                           ? std::make_shared<ChopState> (*restoreState.stashedChopState)
-                           : std::make_shared<ChopState>());
+    // Both layers are validated against the decoded sample before publication.
+    std::atomic_store (&stashedChopState, restoredStash);
     manualChopModeActive.store (restoreState.restoredManualChopMode, std::memory_order_release);
 
     loadedFileName = restoredSample->fileName;
@@ -4639,6 +4698,9 @@ AudioPluginAudioProcessor::loadAudioFile (const juce::File& file)
     const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     resetStemState();
     favoritesViewEnabled.store (false, std::memory_order_release);
+    cancelManualChopCapture();
+    manualCaptureContext.fetch_add (1, std::memory_order_acq_rel);
+    std::atomic_store (&stashedChopState, std::make_shared<ChopState>());
     pendingRestoreState = {};
     restoreGeneration.fetch_add (1, std::memory_order_acq_rel);
     restoreThreadPool.removeAllJobs (false, 0);
@@ -4952,6 +5014,7 @@ void AudioPluginAudioProcessor::releaseChopPreview() noexcept
 
 void AudioPluginAudioProcessor::startPlaybackInternal (bool mousePreview) noexcept
 {
+    cancelManualChopCapture();
     const auto currentSample = std::atomic_load (&loadedSample);
     if (currentSample == nullptr || currentSample->buffer.getNumSamples() == 0)
         return;
@@ -5032,12 +5095,14 @@ void AudioPluginAudioProcessor::startPlaybackInternal (bool mousePreview) noexce
 
 void AudioPluginAudioProcessor::pausePlayback() noexcept
 {
+    cancelManualChopCapture();
     pendingTransportCommand.store ((int) TransportCommand::pause, std::memory_order_release);
     playbackActive.store (false, std::memory_order_release);
 }
 
 void AudioPluginAudioProcessor::stopPlayback() noexcept
 {
+    cancelManualChopCapture();
     pendingTransportCommand.store ((int) TransportCommand::stop, std::memory_order_release);
     playbackActive.store (false, std::memory_order_release);
     playbackSamplePosition.store (0.0, std::memory_order_release);
@@ -5045,6 +5110,7 @@ void AudioPluginAudioProcessor::stopPlayback() noexcept
 
 void AudioPluginAudioProcessor::setPlaybackSamplePosition (double newPosition) noexcept
 {
+    cancelManualChopCapture();
     const auto requestedPosition = std::isfinite (newPosition) ? newPosition : 0.0;
     double clampedPosition = 0.0;
 
@@ -5393,7 +5459,7 @@ int AudioPluginAudioProcessor::getSelectedChopMidiNote() const noexcept
 void AudioPluginAudioProcessor::setGridBpmTrim (float trimBpm)
 {
     if (! juce::approximatelyEqual (trimBpm, gridBpmTrim.load (std::memory_order_acquire)))
-        pushEditUndoSnapshot ("gridBpmTrim");
+        pushEditUndoSnapshot ("gridBpmTrim", true);
     gridBpmTrim.store (trimBpm, std::memory_order_release);
     const auto analysis = std::atomic_load (&tempoAnalysis);
     if (analysis != nullptr)
@@ -5416,7 +5482,7 @@ void AudioPluginAudioProcessor::setDoubleTempoEnabled (bool enabled)
     if (analysis == nullptr || analysis->estimatedBpm <= 0.0 || isTempoAnalysisInProgress())
         return;
 
-    pushEditUndoSnapshot ({});
+    pushEditUndoSnapshot ({}, true);
     doubleTempoEnabled.store (enabled, std::memory_order_release);
     buildChopsFromAnalysis (*analysis);
     if (syncToHost.load (std::memory_order_acquire))
@@ -5481,7 +5547,7 @@ double AudioPluginAudioProcessor::getResolvedGridAnchorSeconds() const noexcept
 void AudioPluginAudioProcessor::setGridStartOffset (float offsetSeconds)
 {
     if (! juce::approximatelyEqual (offsetSeconds, gridStartOffset.load (std::memory_order_acquire)))
-        pushEditUndoSnapshot ("gridStartOffset");
+        pushEditUndoSnapshot ("gridStartOffset", true);
     gridStartOffset.store (offsetSeconds, std::memory_order_release);
     const auto analysis = std::atomic_load (&tempoAnalysis);
     if (analysis != nullptr)
@@ -5522,7 +5588,7 @@ void AudioPluginAudioProcessor::resizeChopBoundaryAndTempo (int chopId, int newS
     if (newChopPeriodSec <= 0.0)
         return;
 
-    pushEditUndoSnapshot ("resizeChop");
+    pushEditUndoSnapshot ("resizeChop", true);
 
     // Reverse the BPM that would produce this chop length at the current
     // bars-per-chop setting, then convert that into a trim relative to the
@@ -5584,6 +5650,7 @@ void AudioPluginAudioProcessor::resizeChopBoundaryAndTempo (int chopId, int newS
 
 void AudioPluginAudioProcessor::setChopBounds (int chopId, int newStartSample, int newEndSample)
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     if (newEndSample <= newStartSample)
         return;
 
@@ -5609,6 +5676,8 @@ void AudioPluginAudioProcessor::setChopBounds (int chopId, int newStartSample, i
                                 });
 
     if (chopIt == nextState->chops.end())
+        return;
+    if (chopIt->startSample == clampedStart && chopIt->endSample == clampedEnd)
         return;
 
     pushEditUndoSnapshot ("chopBounds:" + juce::String (chopId));
@@ -5667,6 +5736,12 @@ void AudioPluginAudioProcessor::setWaveformScroll (float scrollValue) noexcept
     requestHostStateSync();
 }
 
+void AudioPluginAudioProcessor::setWaveformColourMode (int mode) noexcept
+{
+    waveformColourMode.store (juce::jlimit (0, 3, mode), std::memory_order_release);
+    requestHostStateSync();
+}
+
 bool AudioPluginAudioProcessor::isTempoAnalysisInProgress() const noexcept
 {
     return tempoAnalysisInProgress.load (std::memory_order_acquire);
@@ -5718,6 +5793,7 @@ void AudioPluginAudioProcessor::launchTempoAnalysis (std::shared_ptr<const Loade
 void AudioPluginAudioProcessor::publishTempoAnalysis (std::shared_ptr<TempoAnalysisData> analysisResult,
                                                       uint64_t analysisGeneration)
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     if (analysisGeneration != tempoAnalysisGeneration.load (std::memory_order_acquire))
         return;
 
@@ -6016,6 +6092,7 @@ bool AudioPluginAudioProcessor::areStemModelsAvailable() const noexcept
 
 void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData& analysis)
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     // Manual mode owns the chop list until the user exits it. In particular,
     // an analysis job that finishes after the button was pressed must not
     // repopulate the clean slate behind the user's first marker.
@@ -6058,6 +6135,9 @@ void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData&
     }
 
     auto newChopState = std::make_shared<ChopState>();
+    const auto stashed = std::atomic_load (&stashedChopState);
+    newChopState->nextChopId = juce::jmax (existingState != nullptr ? existingState->nextChopId : 1,
+                                          stashed != nullptr ? stashed->nextChopId : 1);
 
     // Per-chop edits follow the AUDIO, not the list position.
     //
@@ -6156,7 +6236,7 @@ void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData&
                 // whenever it was non-zero, which silently moved the cue to a
                 // different moment every time a boundary shifted.
                 const int rebasedCue = (old.startSample + old.cueOffsetSamples) - def.startSample;
-                if (rebasedCue > 0 && rebasedCue < def.endSample - def.startSample)
+                if (rebasedCue >= 0 && rebasedCue < def.endSample - def.startSample)
                     def.cueOffsetSamples = rebasedCue;
 
                 def.gainDecibels     = old.gainDecibels;
@@ -6303,7 +6383,7 @@ void AudioPluginAudioProcessor::setChopBarsCount (int bars)
     if (clamped == chopBarsCount.load (std::memory_order_acquire))
         return;
 
-    pushEditUndoSnapshot ({});
+    pushEditUndoSnapshot ({}, true);
     chopBarsCount.store (clamped, std::memory_order_release);
 
     const auto analysis = std::atomic_load (&tempoAnalysis);
@@ -6764,12 +6844,15 @@ bool AudioPluginAudioProcessor::clearChopWarpMarkers (int chopId)
 
 void AudioPluginAudioProcessor::setManualChopModeActive (bool active)
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     if (manualChopModeActive.load (std::memory_order_acquire) == active)
         return;
 
+    commitPendingManualChopCaptures();
     cancelManualChopCapture();
-    swapChopLayers();
+    manualCaptureContext.fetch_add (1, std::memory_order_acq_rel);
     manualChopModeActive.store (active, std::memory_order_release);
+    swapChopLayers();
 }
 
 // Exchanges the live chop set with the stashed one. Called only when the mode
@@ -6784,14 +6867,13 @@ void AudioPluginAudioProcessor::swapChopLayers()
     if (incoming == nullptr)
         incoming = std::make_shared<ChopState>();
 
-    // Deliberately NOT undoable, and the history is dropped rather than kept.
-    // Two reasons. First, the swap is its own undo: pressing the button again
-    // puts everything back, so an undo entry would only add a confusing
-    // half-state where the layers had traded places but the mode flag had not.
-    // Second, existing snapshots describe the layer we are leaving — applying
-    // one after the swap would paste the old layer's chops over the incoming
-    // set. Undo history is per-layer, so it starts fresh here.
-    clearEditUndoHistory();
+    // Histories travel with their layers; merely inspecting the other layout
+    // must not destroy the ability to undo an edit on return.
+    {
+        const juce::ScopedLock sl (editUndoLock);
+        editUndoStack.swap (stashedEditUndoStack);
+        editUndoCoalesceKey.clear();
+    }
 
     // Chop ids must stay unique across BOTH layers: chopAudioCache and the
     // warp render jobs are keyed by id, so a reused id on the other layer
@@ -6813,8 +6895,12 @@ void AudioPluginAudioProcessor::swapChopLayers()
     // The chop the voice was playing may not exist on the incoming layer, and
     // cached/warped audio is keyed to the outgoing one.
     warpRenderThreadPool.removeAllJobs (false, 0);
+    warpRenderGeneration.fetch_add (1, std::memory_order_acq_rel);
     chopAudioCache.clear();
     stopPlayback();
+    for (const auto& chop : nextLive->chops)
+        if (! chop.warpMarkers.empty())
+            requestChopWarpRender (chop.id);
     touchTempoUiRevision();
     notifyEditStateChanged();
 }
@@ -6826,6 +6912,10 @@ bool AudioPluginAudioProcessor::isManualChopModeActive() const noexcept
 
 void AudioPluginAudioProcessor::clearAllChops()
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
+    commitPendingManualChopCaptures();
+    cancelManualChopCapture();
+    manualCaptureContext.fetch_add (1, std::memory_order_acq_rel);
     const auto current = std::atomic_load (&chopState);
     if (current == nullptr || current->chops.empty())
         return;
@@ -6845,6 +6935,7 @@ void AudioPluginAudioProcessor::clearAllChops()
 
 int AudioPluginAudioProcessor::addManualChop (int startSample, int endSample, int assignedMidiNote)
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     const auto currentSample = std::atomic_load (&loadedSample);
     if (currentSample == nullptr || currentSample->buffer.getNumSamples() == 0)
         return -1;
@@ -6852,6 +6943,8 @@ int AudioPluginAudioProcessor::addManualChop (int startSample, int endSample, in
     const int totalSamples = currentSample->buffer.getNumSamples();
     const int clampedStart = juce::jlimit (0, totalSamples - 1, juce::jmin (startSample, endSample));
     const int clampedEnd = juce::jlimit (clampedStart + 1, totalSamples, juce::jmax (startSample, endSample));
+    if (clampedEnd - clampedStart < 2)
+        return -1;
     const int note = assignedMidiNote >= 0 ? juce::jlimit (0, 127, assignedMidiNote)
                                            : (assignedMidiNote == -1 ? -1 : -2);
 
@@ -6921,8 +7014,10 @@ int AudioPluginAudioProcessor::getNextManualChopMidiNote() const noexcept
 
 void AudioPluginAudioProcessor::armManualChopCapture (int startSample) noexcept
 {
+    cancelManualChopCapture();
     const auto sample = std::atomic_load (&loadedSample);
     const int lastSample = sample != nullptr ? juce::jmax (0, sample->buffer.getNumSamples() - 1) : 0;
+    manualCaptureSource.store (sample.get(), std::memory_order_release);
     manualChopCaptureStartSample.store (juce::jlimit (0, lastSample, startSample), std::memory_order_release);
     manualChopCaptureHeldNote.store (-1, std::memory_order_release);
     manualChopCaptureCompletedNote.store (-1, std::memory_order_release);
@@ -6931,11 +7026,37 @@ void AudioPluginAudioProcessor::armManualChopCapture (int startSample) noexcept
 
 void AudioPluginAudioProcessor::cancelManualChopCapture() noexcept
 {
+    manualCaptureGeneration.fetch_add (1, std::memory_order_acq_rel);
     const bool wasPlayingCapture = manualChopCaptureHeldNote.exchange (-1, std::memory_order_acq_rel) >= 0;
-    manualChopCaptureArmed.store (false, std::memory_order_release);
+    const bool wasArmed = manualChopCaptureArmed.exchange (false, std::memory_order_acq_rel);
     manualChopCaptureCompletedNote.store (-1, std::memory_order_release);
+    if (wasArmed)
+        manualChopCaptureCompletionRevision.fetch_add (1, std::memory_order_acq_rel);
     if (wasPlayingCapture)
         pendingTransportCommand.store ((int) TransportCommand::silence, std::memory_order_release);
+}
+
+void AudioPluginAudioProcessor::timerCallback()
+{
+    commitPendingManualChopCaptures();
+}
+
+void AudioPluginAudioProcessor::commitPendingManualChopCaptures()
+{
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
+    // A fixed upper bound also keeps save/restore work bounded if the producer
+    // completes another capture while this batch is being consumed.
+    const int ready = manualCaptureFifo.getNumReady();
+    for (int i = 0; i < ready; ++i)
+    {
+        const auto read = manualCaptureFifo.read (1);
+        if (read.blockSize1 == 0)
+            break;
+        const auto result = manualCaptureResults[(size_t) read.startIndex1];
+        if (result.context == manualCaptureContext.load (std::memory_order_acquire)
+            && isManualChopModeActive() && result.end - result.start >= 2)
+            addManualChop (result.start, result.end, result.note);
+    }
 }
 
 int AudioPluginAudioProcessor::getManualChopCaptureHeldNote() const noexcept
@@ -7149,6 +7270,7 @@ int AudioPluginAudioProcessor::chopAtTransients (TransientSensitivity sensitivit
 
 void AudioPluginAudioProcessor::selectChopById (int chopId)
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     const auto currentState = std::atomic_load (&chopState);
     if (currentState == nullptr || currentState->selectedChopId == chopId)
         return;
@@ -7170,6 +7292,7 @@ void AudioPluginAudioProcessor::selectChopById (int chopId)
 
 void AudioPluginAudioProcessor::selectChopAtSample (double samplePosition)
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     const auto currentState = std::atomic_load (&chopState);
     if (currentState == nullptr)
         return;
@@ -7184,6 +7307,7 @@ void AudioPluginAudioProcessor::selectChopAtSample (double samplePosition)
 
 void AudioPluginAudioProcessor::clearSelectedChop()
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     const auto currentState = std::atomic_load (&chopState);
     if (currentState == nullptr)
         return;
@@ -7198,6 +7322,7 @@ void AudioPluginAudioProcessor::clearSelectedChop()
 
 void AudioPluginAudioProcessor::removeSelectedChop()
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     const auto currentState = std::atomic_load (&chopState);
     if (currentState == nullptr || currentState->selectedChopId < 0)
         return;
@@ -7223,6 +7348,7 @@ void AudioPluginAudioProcessor::removeSelectedChop()
 
 void AudioPluginAudioProcessor::setSelectedChopCueNormalized (float normalizedValue)
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     const auto currentState = std::atomic_load (&chopState);
     if (currentState == nullptr || currentState->selectedChopId < 0)
         return;
@@ -7248,6 +7374,7 @@ void AudioPluginAudioProcessor::setSelectedChopCueNormalized (float normalizedVa
 
 void AudioPluginAudioProcessor::setSelectedChopGainDecibels (float gainDecibels)
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     const auto currentState = std::atomic_load (&chopState);
     if (currentState == nullptr || currentState->selectedChopId < 0)
         return;
@@ -7271,6 +7398,7 @@ void AudioPluginAudioProcessor::setSelectedChopGainDecibels (float gainDecibels)
 
 void AudioPluginAudioProcessor::setSelectedChopPitchSemitones (float newPitchSemitones)
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     const auto currentState = std::atomic_load (&chopState);
     if (currentState == nullptr || currentState->selectedChopId < 0)
         return;
@@ -7296,6 +7424,7 @@ void AudioPluginAudioProcessor::setChopEnvelopeParameter (int chopId,
                                                           ChopEnvelopeParameter parameter,
                                                           float value)
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     const auto currentState = std::atomic_load (&chopState);
     if (currentState == nullptr || chopId < 0)
         return;
@@ -7351,7 +7480,7 @@ void AudioPluginAudioProcessor::handleAsyncUpdate()
     updateHostDisplay (AudioProcessor::ChangeDetails{}.withNonParameterStateChanged (true));
 }
 
-void AudioPluginAudioProcessor::pushEditUndoSnapshot (const juce::String& coalesceKey)
+void AudioPluginAudioProcessor::pushEditUndoSnapshot (const juce::String& coalesceKey, bool restoresGrid)
 {
     const juce::ScopedLock sl (editUndoLock);
 
@@ -7379,7 +7508,7 @@ void AudioPluginAudioProcessor::pushEditUndoSnapshot (const juce::String& coales
                                gridBpmTrim.load (std::memory_order_acquire),
                                gridStartOffset.load (std::memory_order_acquire),
                                chopBarsCount.load (std::memory_order_acquire),
-                               getDoubleTempoEnabled() });
+                               getDoubleTempoEnabled(), restoresGrid });
 
     if (editUndoStack.size() > maxEditUndoDepth)
         editUndoStack.erase (editUndoStack.begin());
@@ -7389,6 +7518,7 @@ void AudioPluginAudioProcessor::clearEditUndoHistory()
 {
     const juce::ScopedLock sl (editUndoLock);
     editUndoStack.clear();
+    stashedEditUndoStack.clear();
     editUndoCoalesceKey.clear();
 }
 
@@ -7400,6 +7530,8 @@ bool AudioPluginAudioProcessor::canUndoEdit() const noexcept
 
 void AudioPluginAudioProcessor::undoLastEdit()
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
+    commitPendingManualChopCaptures();
     EditUndoSnapshot snap;
     {
         const juce::ScopedLock sl (editUndoLock);
@@ -7411,19 +7543,30 @@ void AudioPluginAudioProcessor::undoLastEdit()
         editUndoCoalesceKey.clear(); // the next edit must begin a fresh undo step
     }
 
-    gridBpmTrim.store (snap.gridBpmTrim, std::memory_order_release);
-    doubleTempoEnabled.store (snap.doubleTempoEnabled, std::memory_order_release);
-    if (const auto analysis = std::atomic_load (&tempoAnalysis); analysis != nullptr && getSyncToHost())
-        updateHostSyncStretchRatio (*analysis, hostBpm.load (std::memory_order_acquire));
-    gridStartOffset.store (snap.gridStartOffset, std::memory_order_release);
-    chopBarsCount.store (snap.chopBarsCount, std::memory_order_release);
+    // A chop-only undo must not roll back global grid settings changed while
+    // another layer was active.
+    if (snap.restoresGrid)
+    {
+        gridBpmTrim.store (snap.gridBpmTrim, std::memory_order_release);
+        doubleTempoEnabled.store (snap.doubleTempoEnabled, std::memory_order_release);
+        if (const auto analysis = std::atomic_load (&tempoAnalysis); analysis != nullptr && getSyncToHost())
+            updateHostSyncStretchRatio (*analysis, hostBpm.load (std::memory_order_acquire));
+        gridStartOffset.store (snap.gridStartOffset, std::memory_order_release);
+        chopBarsCount.store (snap.chopBarsCount, std::memory_order_release);
+    }
 
-    publishChopState (snap.chopState != nullptr ? snap.chopState
-                                                : std::make_shared<ChopState>());
+    auto restoredState = snap.chopState != nullptr ? std::make_shared<ChopState> (*snap.chopState)
+                                                    : std::make_shared<ChopState>();
+    if (const auto current = std::atomic_load (&chopState))
+        restoredState->nextChopId = juce::jmax (restoredState->nextChopId, current->nextChopId);
+    if (const auto inactive = std::atomic_load (&stashedChopState))
+        restoredState->nextChopId = juce::jmax (restoredState->nextChopId, inactive->nextChopId);
+    publishChopState (restoredState);
 
     // Chop ids / bounds / markers may all differ now — drop the warp cache and
     // re-bake any chops that carry markers, mirroring the restore path.
     warpRenderThreadPool.removeAllJobs (false, 0);
+    warpRenderGeneration.fetch_add (1, std::memory_order_acq_rel);
     chopAudioCache.clear();
     if (const auto restored = std::atomic_load (&chopState); restored != nullptr)
         for (const auto& c : restored->chops)
@@ -7466,6 +7609,7 @@ void AudioPluginAudioProcessor::setFavoritesViewEnabled (bool enabled)
 
 void AudioPluginAudioProcessor::toggleSelectedChopFavorite()
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     const auto currentState = std::atomic_load (&chopState);
     if (currentState == nullptr || currentState->selectedChopId < 0)
         return;
@@ -7493,6 +7637,7 @@ void AudioPluginAudioProcessor::toggleSelectedChopFavorite()
 
 void AudioPluginAudioProcessor::toggleSelectedChopReversed()
 {
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     const auto currentState = std::atomic_load (&chopState);
     if (currentState == nullptr || currentState->selectedChopId < 0)
         return;

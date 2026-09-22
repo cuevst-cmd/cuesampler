@@ -20,7 +20,8 @@
 
 //==============================================================================
 class AudioPluginAudioProcessor final : public juce::AudioProcessor,
-                                        private juce::AsyncUpdater
+                                        private juce::AsyncUpdater,
+                                        private juce::Timer
 {
 public:
     struct LoadedSampleData
@@ -254,6 +255,9 @@ public:
     void setGridStartOffset (float offsetSeconds);
     void setWaveformZoom (float zoomValue) noexcept;
     void setWaveformScroll (float scrollValue) noexcept;
+    // Display preference only: 0 classic, 1 frequency, 2 transients, 3 both.
+    void setWaveformColourMode (int mode) noexcept;
+    int getWaveformColourMode() const noexcept { return waveformColourMode.load (std::memory_order_acquire); }
 
     // Shift-resize: the implied chop length sets the new BPM trim, and the grid
     // offset is adjusted so the dragged edge becomes a fresh chop boundary.
@@ -394,7 +398,11 @@ public:
     };
 
     bool isWarpModeActive() const noexcept { return warpModeActive.load (std::memory_order_acquire); }
-    void setWarpModeActive (bool active) noexcept { warpModeActive.store (active, std::memory_order_release); }
+    void setWarpModeActive (bool active) noexcept
+    {
+        if (active) cancelManualChopCapture();
+        warpModeActive.store (active, std::memory_order_release);
+    }
 
     int  getWarpDivision() const noexcept { return warpDivision.load (std::memory_order_acquire); }
     void setWarpDivision (int division) noexcept;
@@ -525,6 +533,7 @@ private:
         float restoredGridStartOffset = 0.0f;
         float restoredWaveformZoom = 0.25f;
         float restoredWaveformScroll = 0.0f;
+        int restoredWaveformColourMode = 0;
         float restoredGlobalPitch = 0.0f;
         float restoredGlobalGainDecibels = 0.0f;
         bool restoredSyncToHost = false;
@@ -589,6 +598,11 @@ private:
         bool chopOneShot = false;
         bool playbackTriggeredByMouse = false;
         bool manualChopCapture = false;
+        uint64_t manualCaptureGeneration = 0;
+        uint64_t manualCaptureContext = 0;
+        int manualCaptureStart = 0;
+        int manualCaptureChannel = 0;
+        const LoadedSampleData* manualCaptureSource = nullptr;
         juce::ADSR envelope;
         bool envelopeConfigured = false;
         bool envelopeReleaseTriggered = false;
@@ -787,16 +801,18 @@ private:
         float gridStartOffset = 0.0f;
         int   chopBarsCount = 1;
         bool doubleTempoEnabled = false;
+        bool restoresGrid = false;
     };
 
     // Captures the current edit state before a mutation. A non-empty
     // coalesceKey collapses a rapid run of same-kind edits (e.g. a knob/edge
     // drag) into a single undo step.
-    void pushEditUndoSnapshot (const juce::String& coalesceKey);
+    void pushEditUndoSnapshot (const juce::String& coalesceKey, bool restoresGrid = false);
     void clearEditUndoHistory();
 
     mutable juce::CriticalSection editUndoLock;
     std::vector<EditUndoSnapshot> editUndoStack;
+    std::vector<EditUndoSnapshot> stashedEditUndoStack;
     juce::String editUndoCoalesceKey;
     double editUndoLastSnapshotMs = 0.0;
     static constexpr size_t maxEditUndoDepth = 64;
@@ -933,9 +949,24 @@ private:
     std::atomic<int> manualChopCaptureCompletedNote { -1 };
     std::atomic<int> manualChopCaptureEndSample { 0 };
     std::atomic<uint64_t> manualChopCaptureCompletionRevision { 0 };
+    std::atomic<uint64_t> manualCaptureGeneration { 0 };
+    std::atomic<uint64_t> manualCaptureContext { 0 };
+    std::atomic<const LoadedSampleData*> manualCaptureSource { nullptr };
+    struct ManualCaptureResult
+    {
+        int start = 0, end = 0, note = -1;
+        uint64_t context = 0;
+    };
+    // Audio thread is the sole producer. Non-audio consumers serialize through
+    // sampleStateMutex; saving and editor closure never depend on a UI timer.
+    juce::AbstractFifo manualCaptureFifo { 16 };
+    std::array<ManualCaptureResult, 16> manualCaptureResults;
+    void commitPendingManualChopCaptures();
+    void timerCallback() override;
     std::atomic<float> gridStartOffset { 0.0f };
     std::atomic<float> waveformZoom { 0.25f };
     std::atomic<float> waveformScroll { 0.0f };
+    std::atomic<int> waveformColourMode { 0 };
     std::atomic<bool> restoredStateReceived { false };
     std::atomic<bool> initialLoadSamplePromptClaimed { false };
 

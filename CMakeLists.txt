@@ -438,6 +438,9 @@ if(CUE_BUILD_STATE_TEST)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DIRECTML_DLL}" "$<TARGET_FILE_DIR:test_project_restore>/DirectML.dll")
     endif()
     add_test(NAME project_restore COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}")
+    add_test(NAME cue_recall COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --cue-recall)
+    add_test(NAME manual_chops COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --manual-chops)
+    add_test(NAME waveform_colour COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --waveform-colour)
 endif()
 
 # ── Optional offline StemSeparator test ───────────────────────────────────────

@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "WaveformColourAnalysis.h"
 
 #include <array>
 #include <bitset>
@@ -2423,6 +2424,37 @@ public:
         : processor (p),
           horizontalScrollBar (false)
     {
+        setWantsKeyboardFocus (true);
+        for (auto* button : { &manualEditButton, &manualAddButton })
+        {
+            button->getProperties().set ("cueStyle", "segment");
+            addChildComponent (*button);
+        }
+        manualEditButton.setButtonText ("EDIT");
+        manualAddButton.setButtonText ("ADD CHOP");
+        manualEditButton.setTooltip ("Select and audition chops; drag their independent start/end handles.");
+        manualAddButton.setTooltip ("Click a start, then an end to add a chop, including overlapping chops. Escape cancels.");
+        manualEditButton.onClick = [this] { setManualAddTool (false); };
+        manualAddButton.onClick = [this] { setManualAddTool (true); };
+        waveformColourButton.getProperties().set ("cueStyle", "segment");
+        waveformColourButton.setTooltip ("Optional waveform display. Red: lows, green: mids, blue: highs. Bright accents mark sharp attacks. Audio and chop positions stay the same.");
+        waveformColourButton.onClick = [this]
+        {
+            juce::PopupMenu menu;
+            menu.addSectionHeader ("WAVEFORM DISPLAY");
+            const char* labels[] { "Classic", "Frequency colours", "Transient accents", "Frequency + transients" };
+            for (int i = 0; i < 4; ++i)
+                menu.addItem (i + 1, labels[i], true, processor.getWaveformColourMode() == i);
+            menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&waveformColourButton),
+                [safe = juce::Component::SafePointer<WaveformDisplayComponent> (this)] (int choice)
+                {
+                    if (safe == nullptr || choice == 0) return;
+                    safe->processor.setWaveformColourMode (choice - 1);
+                    safe->refreshWaveformColourMode();
+                });
+        };
+        addAndMakeVisible (waveformColourButton);
+        refreshWaveformColourMode();
         setTooltip ("Click a chop to preview it. Use DRAG AUDIO to export, or ADSR to adjust its envelope and save a WAV.  "
                     "Double-click to toggle favourite (pink highlight).  "
                     "Drag a selected chop edge to change only that chop's start or end.  "
@@ -2501,6 +2533,8 @@ public:
     ~WaveformDisplayComponent() override
     {
         stopTimer();
+        colourAnalysisMailbox->generation.fetch_add (1);
+        colourAnalysisPool.removeAllJobs (true, 1000);
         if (isHoldingToPlay) processor.releaseChopPreview();
         readyExportFile.deleteFile();
         // Cancel any in-flight capture, but deliberately do NOT leave manual
@@ -2515,29 +2549,71 @@ public:
 
     void setManualChopMode (bool active)
     {
+        if (manualChopMode == active)
+            return;
         manualChopMode = active;
         pendingManualStartSample = -1;
         pendingMarkerDragging = false;
         pendingMarkerHovered = false;
         deleteBadgeHovered = false;
         deleteBadgePressed = false;
-        lastManualCaptureCompletionRevision = processor.getManualChopCaptureCompletionRevision();
         processor.cancelManualChopCapture();
+        lastManualCaptureCompletionRevision = processor.getManualChopCaptureCompletionRevision();
+        edgeDragChopId = -1;
+        const auto chops = processor.getChopState();
+        manualAddTool = active && (chops == nullptr || chops->chops.empty());
+        refreshManualTools();
         setTooltip (active
-            ? "Manual chopping: double-click to place a start marker, then hold and release a MIDI pad to set the end and assignment, or double-click the end."
+            ? "Manual chopping: click empty audio or ADD CHOP, then click a start and end. EDIT selects and auditions chops. Drag S/E handles; Escape cancels."
             : "Click a chop to select and preview it. Double-click to toggle favourite. Drag a selected chop edge to resize it.");
         updateCursorForMode (getMouseXYRelative().toFloat());
         repaint();
     }
 
+    void setManualAddTool (bool adding)
+    {
+        clearPendingMarker();
+        manualAddTool = adding;
+        refreshManualTools();
+    }
+
+    void refreshManualTools()
+    {
+        const bool visible = manualChopMode && ! processor.isWarpModeActive();
+        manualEditButton.setVisible (visible);
+        manualAddButton.setVisible (visible);
+        manualEditButton.setToggleState (! manualAddTool, juce::dontSendNotification);
+        manualAddButton.setToggleState (manualAddTool, juce::dontSendNotification);
+        repaint();
+    }
+
+    bool keyPressed (const juce::KeyPress& key) override
+    {
+        if (key == juce::KeyPress::escapeKey && manualChopMode)
+        {
+            clearPendingMarker();
+            edgeDragChopId = -1;
+            pendingMarkerDragging = false;
+            if (isHoldingToPlay) processor.releaseChopPreview();
+            isHoldingToPlay = false;
+            return true;
+        }
+        return false;
+    }
+
     void changeListenerCallback (juce::ChangeBroadcaster* source) override
     {
+        refreshWaveformColourMode();
+        setManualChopMode (processor.isManualChopModeActive());
+        refreshManualTools();
         if (source == &processor.sampleChangeBroadcaster)
         {
             isSelectingAnalysisRegion = false;
             pendingManualStartSample = -1;
             pendingMarkerDragging = false;
             processor.cancelManualChopCapture();
+            edgeDragChopId = -1;
+            isHoldingToPlay = false;
             targetZoomLevel = zoomLevel = 0.07f;
             targetScrollPosition = scrollPosition = 0.0f;
             targetWaveformVerticalScale = waveformVerticalScale = defaultWaveformVerticalScale;
@@ -2627,6 +2703,8 @@ public:
     void mouseExit (const juce::MouseEvent&) override
     {
         isHoveringDisplay = false;
+        if (pendingManualStartSample >= 0)
+            repaint();
         hoveredChopId = -1;
         if (edgeDragChopId < 0)
             edgeHoverKind = 0;
@@ -2641,8 +2719,10 @@ public:
 
     void mouseDown (const juce::MouseEvent& event) override
     {
-        if (! isPositionInsideDisplay (event.position))
+        if (! event.mods.isLeftButtonDown() || ! isPositionInsideDisplay (event.position))
             return;
+        grabKeyboardFocus();
+        updateHoverState (event.position);
 
         // Separate envelope and audio-drag controls remain available for
         // completed manual chops and take priority over waveform gestures.
@@ -2674,47 +2754,50 @@ public:
             return;
         }
 
-        // Manual mode keeps ordinary click-to-audition disabled, but
-        // completed chop boundaries remain directly draggable. Any chop can
-        // be grabbed by either edge; its exact MIDI assignment is untouched.
-        if (manualChopMode)
-        {
-            if (event.getNumberOfClicks() == 1)
-            {
-                // The pending marker is the thing the user is actively working
-                // with, so it outranks completed chop edges underneath it.
-                if (hitTestPendingMarker (event.position))
-                {
-                    pendingMarkerDragging = true;
-                    setMouseCursor (juce::MouseCursor::LeftRightResizeCursor);
-                    repaint();
-                    return;
-                }
-
-                int hitKind = 0;
-                int hitChopId = -1;
-                if (hitTestAnyChopEdge (event.position, hitKind, hitChopId))
-                {
-                    processor.selectChopById (hitChopId);
-                    edgeDragChopId = hitChopId;
-                    edgeDragKind = hitKind;
-                    edgeDragChangesTempo = false;
-                    edgeDragLiveSample = sampleForDisplayPosition (event.position.x);
-                    setMouseCursor (juce::MouseCursor::LeftRightResizeCursor);
-                    repaint();
-                    return;
-                }
-
-                // A plain click inside a completed chop selects it for its
-                // controls. New marker placement still requires double-click.
-                processor.selectChopAtSample (sampleForDisplayPosition (event.position.x));
-            }
-            return;
-        }
-
         if (processor.isWarpModeActive())
         {
             handleWarpMouseDown (event);
+            return;
+        }
+
+        // Layout and editing tool are independent. EDIT auditions; ADD owns
+        // the two placement clicks, including inside existing chops.
+        if (manualChopMode)
+        {
+            if (hitTestPendingMarker (event.position))
+            {
+                pendingMarkerDragging = true;
+                pendingMarkerGrabOffset = (double) pendingManualStartSample - sampleForDisplayPosition (event.position.x);
+                setMouseCursor (juce::MouseCursor::LeftRightResizeCursor);
+                return;
+            }
+
+            if (manualAddTool || pendingManualStartSample >= 0)
+            {
+                placeManualChopPoint (event.position.x);
+                return;
+            }
+
+            int hitKind = 0, hitChopId = -1;
+            if (hitTestAnyChopEdge (event.position, hitKind, hitChopId))
+            {
+                processor.selectChopById (hitChopId);
+                beginEdgeDrag (hitChopId, hitKind, event.position.x, false);
+                return;
+            }
+
+            processor.selectChopAtSample (sampleForDisplayPosition (event.position.x));
+            const auto state = processor.getChopState();
+            if (state != nullptr && state->selectedChopId >= 0)
+            {
+                isHoldingToPlay = true;
+                processor.startChopPreview();
+            }
+            else
+            {
+                manualAddTool = true;
+                placeManualChopPoint (event.position.x);
+            }
             return;
         }
 
@@ -2726,12 +2809,7 @@ public:
             int hitChopId = -1;
             if (hitTestSelectedChopEdge (event.position, hitKind, hitChopId))
             {
-                edgeDragChopId    = hitChopId;
-                edgeDragKind      = hitKind;
-                edgeDragChangesTempo = event.mods.isShiftDown();
-                edgeDragLiveSample = sampleForDisplayPosition (event.position.x);
-                setMouseCursor (juce::MouseCursor::LeftRightResizeCursor);
-                repaint();
+                beginEdgeDrag (hitChopId, hitKind, event.position.x, event.mods.isShiftDown());
                 return;
             }
         }
@@ -2743,6 +2821,50 @@ public:
         updateHoverState (event.position);
 
 
+    }
+
+    void placeManualChopPoint (float x)
+    {
+        const auto sample = processor.getLoadedSample();
+        if (sample == nullptr || sample->buffer.getNumSamples() < 2
+            || processor.getManualChopCaptureHeldNote() >= 0)
+            return;
+        const int point = juce::jlimit (0, sample->buffer.getNumSamples(),
+                                        (int) std::round (sampleForDisplayPosition (x)));
+        if (pendingManualStartSample < 0)
+        {
+            pendingManualStartSample = juce::jmin (point, sample->buffer.getNumSamples() - 2);
+            processor.armManualChopCapture (pendingManualStartSample);
+            lastManualCaptureCompletionRevision = processor.getManualChopCaptureCompletionRevision();
+        }
+        else if (std::abs (point - pendingManualStartSample) >= 2)
+        {
+            const int start = pendingManualStartSample;
+            clearPendingMarker();
+            processor.addManualChop (start, point, processor.getNextManualChopMidiNote());
+            manualAddTool = false;
+        }
+        refreshManualTools();
+    }
+
+    void beginEdgeDrag (int chopId, int kind, float x, bool changesTempo)
+    {
+        const auto state = processor.getChopState();
+        if (state == nullptr) return;
+        for (const auto& chop : state->chops)
+        {
+            if (chop.id != chopId) continue;
+            edgeDragChopId = chopId;
+            edgeDragKind = kind;
+            edgeDragChangesTempo = changesTempo;
+            edgeDragLiveSample = kind == 1 ? chop.startSample : chop.endSample;
+            edgeDragGrabOffset = edgeDragLiveSample - sampleForDisplayPosition (x);
+            edgeDragDownX = x;
+            edgeDragMoved = false;
+            setMouseCursor (juce::MouseCursor::LeftRightResizeCursor);
+            repaint();
+            return;
+        }
     }
 
     void updateCursorForMode (juce::Point<float> pos)
@@ -2783,7 +2905,7 @@ public:
             return;
         }
 
-        if (manualChopMode && isPositionInsideDisplay (pos))
+        if (manualChopMode && ! processor.isWarpModeActive() && isPositionInsideDisplay (pos))
         {
             const bool overPendingMarker = hitTestPendingMarker (pos);
             if (overPendingMarker != pendingMarkerHovered)
@@ -2792,7 +2914,7 @@ public:
                 repaint();
             }
 
-            if (edgeDragChopId < 0 && ! overPendingMarker)
+            if (edgeDragChopId < 0 && ! overPendingMarker && ! manualAddTool)
             {
                 int hitKind = 0;
                 int hitChopId = -1;
@@ -2893,8 +3015,8 @@ public:
         return false;
     }
 
-    // The pending start marker — placed by double-click, not yet turned into a
-    // chop. Draggable to reposition, double-clickable to remove. Locked while a
+    // The pending start marker — placed by a click, not yet turned into a
+    // chop. Draggable to reposition; Escape cancels placement. Locked while a
     // MIDI pad is held, because the capture start is already committed on the
     // audio thread by then and moving it would desync the captured range.
     bool hitTestPendingMarker (juce::Point<float> mousePos) const
@@ -2925,12 +3047,13 @@ public:
             return;
 
         const int moved = juce::jlimit (0, sampleData->buffer.getNumSamples() - 1,
-                                        (int) std::round (sampleForDisplayPosition (mousePos.x)));
+                                        (int) std::round (sampleForDisplayPosition (mousePos.x) + pendingMarkerGrabOffset));
         if (moved == pendingManualStartSample)
             return;
 
         pendingManualStartSample = moved;
         processor.armManualChopCapture (moved);
+        lastManualCaptureCompletionRevision = processor.getManualChopCaptureCompletionRevision();
         repaint();
     }
 
@@ -2962,6 +3085,7 @@ public:
         const auto displayBounds = getDisplayBounds();
         const auto visibleRange = getVisibleRange (sampleData->buffer.getNumSamples());
         float bestDistance = kEdgeHitTestPixels + 1.0f;
+        const bool onHandleRows = mousePos.y >= displayBounds.getBottom() - 50.0f;
 
         const auto testChop = [&] (const AudioPluginAudioProcessor::ChopDefinition& chop)
         {
@@ -2972,13 +3096,15 @@ public:
             const float startDistance = std::abs (mousePos.x - startX);
             const float endDistance = std::abs (mousePos.x - endX);
 
-            if (startDistance <= kEdgeHitTestPixels && startDistance < bestDistance)
+            if ((onHandleRows ? getEdgeHandleBounds (startX, 1).contains (mousePos)
+                              : startDistance <= kEdgeHitTestPixels) && startDistance < bestDistance)
             {
                 bestDistance = startDistance;
                 edgeKind = 1;
                 chopId = chop.id;
             }
-            if (endDistance <= kEdgeHitTestPixels && endDistance < bestDistance)
+            if ((onHandleRows ? getEdgeHandleBounds (endX, 2).contains (mousePos)
+                              : endDistance <= kEdgeHitTestPixels) && endDistance < bestDistance)
             {
                 bestDistance = endDistance;
                 edgeKind = 2;
@@ -2997,8 +3123,16 @@ public:
         return chopId >= 0;
     }
 
+    juce::Rectangle<float> getEdgeHandleBounds (float x, int kind) const
+    {
+        return { x - 6.0f, getDisplayBounds().getBottom() - (kind == 1 ? 30.0f : 48.0f), 12.0f, 15.0f };
+    }
+
     void updateEdgeDragLiveSample (juce::Point<float> mousePos)
     {
+        if (! edgeDragMoved && std::abs (mousePos.x - edgeDragDownX) < 3.0f)
+            return;
+        edgeDragMoved = true;
         const auto sampleData = processor.getLoadedSample();
         const auto chopState  = processor.getChopState();
         if (sampleData == nullptr || chopState == nullptr)
@@ -3017,10 +3151,9 @@ public:
         }
 
         const int    totalSamples = sampleData->buffer.getNumSamples();
-        const double sr           = sampleData->sampleRate > 0.0 ? sampleData->sampleRate : 48000.0;
-        const int    minLen       = juce::jmax (1, (int) std::round (sr * 0.05)); // 50 ms minimum chop
+        constexpr int minLen = 2;
 
-        double newSample = sampleForDisplayPosition (mousePos.x);
+        double newSample = sampleForDisplayPosition (mousePos.x) + edgeDragGrabOffset;
 
         if (edgeDragKind == 1) // left edge
         {
@@ -3048,7 +3181,7 @@ public:
             for (const auto& c : chopState->chops)
                 if (c.id == edgeDragChopId) { chop = &c; break; }
 
-        if (chop != nullptr)
+        if (chop != nullptr && edgeDragMoved)
         {
             int newStart = chop->startSample;
             int newEnd   = chop->endSample;
@@ -3070,6 +3203,7 @@ public:
         edgeDragKind       = 0;
         edgeDragLiveSample = 0.0;
         edgeDragChangesTempo = false;
+        edgeDragMoved = false;
     }
 
     // ---- Warp-mode interaction helpers (step 9) ---------------------------
@@ -3468,6 +3602,7 @@ public:
         if (pendingMarkerDragging)
         {
             pendingMarkerDragging = false;
+            updateHoverState (event.position);
             updateCursorForMode (event.position);
             repaint();
             return;
@@ -3498,46 +3633,8 @@ public:
         if (hitTestExportButton (event.position) || hitTestAdsrButton (event.position)
             || hitTestDeleteBadge (event.position)) return;
 
-        if (manualChopMode)
-        {
-            const auto sampleData = processor.getLoadedSample();
-            if (sampleData == nullptr || sampleData->buffer.getNumSamples() <= 1)
-                return;
-
-            // Double-clicking the pending marker itself removes it, so a
-            // misplaced start can be undone without leaving manual mode. This
-            // is checked first: on the marker, remove wins over set-end.
-            if (hitTestPendingMarker (event.position))
-            {
-                clearPendingMarker();
-                updateCursorForMode (event.position);
-                return;
-            }
-
-            const int clickedSample = juce::jlimit (0, sampleData->buffer.getNumSamples() - 1,
-                (int) std::round (sampleForDisplayPosition (event.position.x)));
-
-            if (pendingManualStartSample < 0)
-            {
-                pendingManualStartSample = clickedSample;
-                processor.armManualChopCapture (clickedSample);
-            }
-            else
-            {
-                const int start = pendingManualStartSample;
-                pendingManualStartSample = -1;
-                processor.cancelManualChopCapture();
-                // No pad was held, so give the chop an explicit assignment
-                // starting at C3 instead of leaving it on the positional map.
-                // Explicit notes are stable: inserting a chop earlier in the
-                // timeline no longer shifts what any existing pad triggers.
-                processor.addManualChop (start, clickedSample,
-                                         processor.getNextManualChopMidiNote());
-            }
-
-            repaint();
+        if (manualChopMode && ! processor.isWarpModeActive())
             return;
-        }
 
         // Warp mode reserves double-click for marker actions (wired in step 9).
         if (processor.isWarpModeActive())
@@ -3669,12 +3766,11 @@ public:
                 g.strokePath (waveformPath, juce::PathStrokeType (4.0f));
             }
 
-            // Filled waveform — cream ink, per the CUERACK palette
-            g.setColour (glassText.withAlpha (0.55f));
+            setWaveformInk (g, waveformColourStrip, getDisplayBounds().getX(), getDisplayBounds(), 0.55f);
             g.fillPath (waveformPath);
 
             // Bright outline
-            g.setColour (glassText.withAlpha (0.85f));
+            setWaveformInk (g, waveformColourStrip, getDisplayBounds().getX(), getDisplayBounds(), 0.85f);
             g.strokePath (waveformPath, juce::PathStrokeType (1.0f));
 
             // Centre line
@@ -3784,8 +3880,10 @@ public:
 
         const auto waveformBounds = getDisplayBounds();
         paintWarpedChopAudio (g, waveformBounds);
+        paintSourceAttackTicks (g, waveformBounds);
         paintChops (g, waveformBounds);
         paintManualChopMarkers (g, waveformBounds);
+        paintWaveformColourLegend (g, waveformBounds);
         paintWarpMarkers (g, waveformBounds);
         paintWarpHintBar (g, waveformBounds);
         paintTempoGrid (g, waveformBounds);
@@ -3831,6 +3929,9 @@ public:
         const int xMinus = xPlus - btnGap - btnSize;
         verticalMinusButton.setBounds (xMinus, yTop, btnSize, btnSize);
         verticalPlusButton .setBounds (xPlus,  yTop, btnSize, btnSize);
+        waveformColourButton.setBounds (xMinus - 116, yTop, 110, btnSize);
+        manualEditButton.setBounds (display.getX() + 8, display.getY() + 2, 48, 20);
+        manualAddButton.setBounds (display.getX() + 60, display.getY() + 2, 74, 20);
 
         horizontalScrollBar.setBounds (getHorizontalScrollBarBounds().toNearestInt());
         updateHorizontalScrollBar();
@@ -3840,14 +3941,24 @@ public:
     {
         targetZoomLevel = juce::jlimit (0.0f, 1.0f, newZoom);
         if (! isShowing())
+        {
             zoomLevel = targetZoomLevel;
+            rebuildWaveformPath();
+            updateHorizontalScrollBar();
+            repaint();
+        }
     }
 
     void setScroll (float newScroll)
     {
         targetScrollPosition = juce::jlimit (0.0f, 1.0f, newScroll);
         if (! isShowing())
+        {
             scrollPosition = targetScrollPosition;
+            rebuildWaveformPath();
+            updateHorizontalScrollBar();
+            repaint();
+        }
     }
 
     std::function<void(float)> onZoomChanged;
@@ -4309,6 +4420,14 @@ private:
 
     void timerCallback() override
     {
+        refreshWaveformColourMode();
+        if (const auto completed = std::atomic_load (&colourAnalysisMailbox->result);
+            completed != colourAnalysis && completed != nullptr && completed->source == processor.getLoadedSample())
+        {
+            colourAnalysis = completed;
+            rebuildWaveformColourStrip();
+            repaint();
+        }
         if (const int hz = animationFrameRateHz(); hz != animHz)
         {
             animHz = hz;
@@ -4321,13 +4440,9 @@ private:
             lastManualCaptureCompletionRevision = manualCaptureRevision;
             if (manualChopMode && pendingManualStartSample >= 0)
             {
-                const int start = pendingManualStartSample;
-                const int end = processor.getManualChopCaptureEndSample();
-                const int note = processor.getManualChopCaptureCompletedNote();
                 pendingManualStartSample = -1;
-                if (note >= 0)
-                    processor.addManualChop (start, end, note);
-                repaint();
+                manualAddTool = false;
+                refreshManualTools();
             }
         }
 
@@ -4456,7 +4571,7 @@ private:
         const auto currentPlayheadPosition = processor.getPlaybackSamplePosition();
         
         // Manual mode deliberately KEEPS the hover guide: it is the ghost line
-        // showing where a double-click would drop a marker. It is still
+        // showing where a click would drop a marker. It is still
         // suppressed during an actual drag, same as every other mode.
         const bool isUserInteracting = (edgeDragChopId >= 0)
                                     || (warpDragChopId >= 0)
@@ -4510,13 +4625,22 @@ private:
     {
         int sampleOffset = 0;
         int visibleSamples = 0;
+
+        double sampleAt (double proportion) const noexcept
+        {
+            return (double) sampleOffset + proportion * (double) visibleSamples;
+        }
+        double proportionAt (double sample) const noexcept
+        {
+            return (sample - (double) sampleOffset) / (double) juce::jmax (1, visibleSamples);
+        }
     };
 
     VisibleRange getVisibleRange (int numSamples) const noexcept
     {
         const float effectiveZoomLevel = getEffectiveZoomLevel (zoomLevel);
         const float zoomFactor = std::pow (10000.0f, effectiveZoomLevel);
-        const int visibleSamples = juce::jmax (32, (int) ((float) numSamples / zoomFactor));
+        const int visibleSamples = juce::jmin (numSamples, juce::jmax (32, (int) ((float) numSamples / zoomFactor)));
         const int maxOffset = juce::jmax (0, numSamples - visibleSamples);
         const int sampleOffset = (int) (scrollPosition * (float) maxOffset);
         return { sampleOffset, visibleSamples };
@@ -4548,8 +4672,7 @@ private:
         const auto visibleRange = getVisibleRange (sampleData->buffer.getNumSamples());
         const auto relativePosition = (double) ((clampedX - displayBounds.getX()) / displayBounds.getWidth());
 
-        return (double) visibleRange.sampleOffset
-             + relativePosition * (double) juce::jmax (1, visibleRange.visibleSamples - 1);
+        return visibleRange.sampleAt (relativePosition);
     }
 
     float getSamplesPerDisplayPixel() const
@@ -4565,8 +4688,7 @@ private:
 
     float displayXForSamplePosition (double samplePosition, const VisibleRange& visibleRange, juce::Rectangle<float> displayBounds) const
     {
-        const auto relativePosition = (float) ((samplePosition - (double) visibleRange.sampleOffset)
-                                             / (double) juce::jmax (1, visibleRange.visibleSamples));
+        const auto relativePosition = (float) visibleRange.proportionAt (samplePosition);
         return displayBounds.getX() + relativePosition * displayBounds.getWidth();
     }
 
@@ -4642,6 +4764,9 @@ private:
         
         if (isHoveringDisplay)
             hoveredDisplayX = juce::jlimit (displayBounds.getX(), displayBounds.getRight(), position.x);
+
+        if (manualChopMode && pendingManualStartSample >= 0)
+            repaint();
 
         hoveredChopId = -1;
         if (isHoveringDisplay)
@@ -5089,7 +5214,9 @@ private:
             hint = "CLICK INSIDE A CHOP TO DROP A MARKER  |  DRAG TO SHIFT TIMING"
                    "  |  RIGHT-CLICK A MARKER FOR OPTIONS  |  ? BUTTON FOR FULL GUIDE";
 
-        auto bar = displayBounds.withHeight (22.0f).reduced (8.0f, 2.0f);
+        auto bar = displayBounds.withHeight (22.0f)
+            .withTrimmedLeft (processor.getWaveformColourMode() == 0 ? 8.0f : 156.0f)
+            .withTrimmedRight (196.0f).reduced (2.0f);
         g.setColour (juce::Colours::black.withAlpha (0.58f));
         g.fillRoundedRectangle (bar, 3.0f);
         g.setColour (accent.withAlpha (0.30f));
@@ -5101,7 +5228,7 @@ private:
 
     void paintManualChopMarkers (juce::Graphics& g, juce::Rectangle<float> displayBounds)
     {
-        if (! manualChopMode)
+        if (! manualChopMode || processor.isWarpModeActive())
             return;
 
         const auto sampleData = processor.getLoadedSample();
@@ -5118,20 +5245,43 @@ private:
         clip.addRoundedRectangle (displayBounds, 4.0f);
         g.reduceClipRegion (clip);
 
-        juce::String instruction = "DOUBLE-CLICK TO PLACE CHOP START";
+        juce::String instruction = manualAddTool ? "CLICK TO PLACE CHOP START"
+                                               : "CLICK A CHOP TO AUDITION  |  DRAG S / E TO TRIM";
         if (pendingMarkerDragging)
             instruction = "DRAG TO REPOSITION CHOP START";
         else if (pendingManualStartSample >= 0)
             instruction = processor.getManualChopCaptureHeldNote() >= 0
                 ? "RELEASE MIDI PAD TO SET CHOP END"
-                : "HOLD A PAD OR DOUBLE-CLICK THE END  |  DRAG MARKER TO MOVE, DOUBLE-CLICK IT TO REMOVE";
+                : "CLICK THE END OR HOLD / RELEASE A PAD  |  ESC TO CANCEL";
 
-        auto instructionBounds = displayBounds.withHeight (22.0f).reduced (8.0f, 2.0f);
+        auto instructionBounds = displayBounds.withHeight (22.0f)
+            .withTrimmedLeft (processor.getWaveformColourMode() == 0 ? 142.0f : 290.0f)
+            .withTrimmedRight (196.0f).reduced (2.0f);
         g.setColour (juce::Colours::black.withAlpha (0.58f));
         g.fillRoundedRectangle (instructionBounds, 3.0f);
         g.setColour (instructionColour.withAlpha (0.96f));
         g.setFont (monoFont (9.5f).boldened().withExtraKerningFactor (0.05f));
         g.drawText (instruction, instructionBounds.toNearestInt(), juce::Justification::centred, false);
+
+        if (const auto chops = processor.getChopState())
+        {
+            g.setFont (monoFont (9.0f).boldened());
+            for (const auto& chop : chops->chops)
+            {
+                const float alpha = chop.id == chops->selectedChopId ? 1.0f : 0.65f;
+                for (int kind : { 1, 2 })
+                {
+                    const auto sample = kind == 1 ? chop.startSample : chop.endSample;
+                    const float x = displayXForSamplePosition ((double) sample, visibleRange, displayBounds);
+                    const auto handle = getEdgeHandleBounds (x, kind);
+                    g.setColour (juce::Colours::black.withAlpha (0.85f));
+                    g.fillRoundedRectangle (handle, 2.0f);
+                    g.setColour (instructionColour.withAlpha (alpha));
+                    g.drawRoundedRectangle (handle, 2.0f, 1.0f);
+                    g.drawText (kind == 1 ? "S" : "E", handle, juce::Justification::centred, false);
+                }
+            }
+        }
 
         if (pendingManualStartSample < 0)
             return;
@@ -5169,15 +5319,18 @@ private:
         g.setFont (monoFont (9.0f).boldened());
         g.drawText (juce::String (pendingNumber), numberTab.toNearestInt(), juce::Justification::centred, false);
 
-        if (processor.getManualChopCaptureHeldNote() >= 0)
+        const bool capturing = processor.getManualChopCaptureHeldNote() >= 0;
+        if (capturing || (isHoveringDisplay && ! pendingMarkerDragging))
         {
-            const auto liveEnd = juce::jlimit (0.0,
-                (double) sampleData->buffer.getNumSamples() - 1.0,
-                processor.getPlaybackSamplePosition());
+            // Use the same rounded sample coordinate as the end-point click,
+            // so the highlighted range is exactly what that click will create.
+            const auto liveEnd = juce::jlimit (0.0, (double) sampleData->buffer.getNumSamples(),
+                capturing ? processor.getPlaybackSamplePosition()
+                          : std::round (sampleForDisplayPosition (hoveredDisplayX)));
             const float endX = displayXForSamplePosition (liveEnd, visibleRange, displayBounds);
             g.setColour (instructionColour.withAlpha (0.75f));
             g.drawLine (endX, displayBounds.getY() + 22.0f, endX, displayBounds.getBottom(), 1.6f);
-            g.setColour (instructionColour.withAlpha (0.10f));
+            g.setColour (instructionColour.withAlpha (0.16f));
             g.fillRect (juce::Rectangle<float> (juce::jmin (startX, endX), displayBounds.getY() + 22.0f,
                                                 std::abs (endX - startX), displayBounds.getHeight() - 22.0f));
         }
@@ -5242,11 +5395,14 @@ private:
             // the warped one over it.
             fillRectGradient (g, chopBounds, panelInnerDark.brighter (0.1f), panelInnerDark.darker (0.16f));
 
-            const int leftPx  = (int) std::floor (chopBounds.getX());
-            const int rightPx = (int) std::ceil  (chopBounds.getRight());
-            const float widthPx = (float) (rightPx - leftPx);
-            if (widthPx <= 0.0f)
+            const int leftPx  = (int) std::floor (juce::jmax (chopBounds.getX(), displayBounds.getX()));
+            const int rightPx = (int) std::ceil (juce::jmin (chopBounds.getRight(), displayBounds.getRight()));
+            const float widthPx = chopBounds.getWidth();
+            if (rightPx <= leftPx || widthPx <= 0.0f)
                 continue;
+
+            juce::Image colourStrip;
+            if (hasWaveformColours()) colourStrip = juce::Image (juce::Image::RGB, rightPx - leftPx, 1, false);
 
             juce::Path topPath;
             juce::Array<float> bottomYs;
@@ -5255,12 +5411,13 @@ private:
 
             for (int px = leftPx; px < rightPx; ++px)
             {
-                const double leftLocal  = ((double) (px      - leftPx) / (double) widthPx) * chopDurationSec;
-                const double rightLocal = ((double) (px + 1  - leftPx) / (double) widthPx) * chopDurationSec;
+                const double leftLocal  = (((double) px - chopBounds.getX()) / (double) widthPx) * chopDurationSec;
+                const double rightLocal = (((double) px + 1.0 - chopBounds.getX()) / (double) widthPx) * chopDurationSec;
                 const double srcA = warpMap.sourceSampleAtLocalTime (leftLocal);
                 const double srcB = warpMap.sourceSampleAtLocalTime (rightLocal);
                 const int srcStart = juce::jlimit (0, numSamples - 1, (int) std::floor (juce::jmin (srcA, srcB)));
                 const int srcEnd   = juce::jlimit (srcStart + 1, numSamples, (int) std::ceil (juce::jmax (srcA, srcB)) + 1);
+                if (colourStrip.isValid()) colourStrip.setPixelAt (px - leftPx, 0, waveformColourForSamples (srcStart, srcEnd));
 
                 float maxVal = 0.0f;
                 float minVal = 0.0f;
@@ -5319,10 +5476,28 @@ private:
 
             g.setColour (glassText.withAlpha (0.06f));
             g.strokePath (combined, juce::PathStrokeType (4.0f));
-            g.setColour (glassText.withAlpha (0.55f));
+            setWaveformInk (g, colourStrip, (float) leftPx, displayBounds, 0.55f);
             g.fillPath (combined);
-            g.setColour (glassText.withAlpha (0.85f));
+            setWaveformInk (g, colourStrip, (float) leftPx, displayBounds, 0.85f);
             g.strokePath (combined, juce::PathStrokeType (1.0f));
+
+            if (hasWaveformColours() && (processor.getWaveformColourMode() & 2) != 0)
+            {
+                const auto& attacks = colourAnalysis->analysis->attacks;
+                const int firstVisibleSource = (int) warpMap.sourceSampleAtLocalTime (
+                    ((double) leftPx - chopBounds.getX()) / widthPx * chopDurationSec);
+                const int lastVisibleSource = (int) std::ceil (warpMap.sourceSampleAtLocalTime (
+                    ((double) rightPx - chopBounds.getX()) / widthPx * chopDurationSec));
+                for (auto it = std::lower_bound (attacks.begin(), attacks.end(), firstVisibleSource);
+                     it != attacks.end() && *it < lastVisibleSource;)
+                {
+                    const auto localTime = warpMap.localTimeAtSourceSample (*it);
+                    paintAttackTick (g, chopBounds.getX() + (float) (localTime / chopDurationSec) * widthPx, displayBounds);
+                    const int nextSource = juce::jmax (*it + 1,
+                        (int) warpMap.sourceSampleAtLocalTime (localTime + 3.0 / widthPx * chopDurationSec));
+                    it = std::lower_bound (it + 1, attacks.end(), nextSource);
+                }
+            }
 
             g.setColour (glassText.withAlpha (0.15f));
             g.drawHorizontalLine ((int) centreY, chopBounds.getX(), chopBounds.getRight());
@@ -5574,7 +5749,7 @@ private:
         const auto hoverX = juce::jlimit (displayBounds.getX(), displayBounds.getRight(), hoveredDisplayX);
         // Vibrant glowing neon red — but follows the WARP accent and turns purple in warp-edit mode.
         // In manual chop mode it becomes the orange ghost line marking where a
-        // double-click would drop a marker, matching the placed-marker colour
+        // click would drop a marker, matching the placed-marker colour
         // so the preview and the result read as the same object.
         const auto guideColour = manualChopMode        ? (currentTheme == Theme::light
                                                              ? juce::Colour (0xff8c4b00)
@@ -5712,9 +5887,161 @@ private:
             onScrollChanged (newScroll);
     }
 
+    void refreshWaveformColourMode()
+    {
+        const int mode = processor.getWaveformColourMode();
+        if (mode == lastWaveformColourMode) return;
+        lastWaveformColourMode = mode;
+        static const char* names[] { "CLASSIC", "FREQ", "ATTACKS", "BOTH" };
+        waveformColourButton.setButtonText (juce::String ("WAVE: ") + names[mode]);
+        requestWaveformColourAnalysis();
+        rebuildWaveformColourStrip();
+        repaint();
+    }
+
+    void requestWaveformColourAnalysis()
+    {
+        const auto source = processor.getLoadedSample();
+        if (source == colourAnalysisRequestedSource) return;
+        const auto generation = colourAnalysisMailbox->generation.fetch_add (1) + 1;
+        colourAnalysisPool.removeAllJobs (true, 0);
+        colourAnalysis.reset();
+        colourAnalysisRequestedSource.reset();
+        std::atomic_store (&colourAnalysisMailbox->result, std::shared_ptr<const ColourAnalysisResult>());
+        waveformColourStrip = {};
+        if (processor.getWaveformColourMode() == 0 || source == nullptr || source->buffer.getNumSamples() == 0)
+            return;
+        colourAnalysisRequestedSource = source;
+        const auto mailbox = colourAnalysisMailbox;
+        colourAnalysisPool.addJob ([source, mailbox, generation]
+        {
+            const auto cancelled = [mailbox, generation] { return mailbox->generation.load() != generation; };
+            const auto analysis = cuesampler::WaveformColourAnalysis::analyse (source->buffer, source->sampleRate, cancelled);
+            if (analysis == nullptr || cancelled()) return;
+            auto result = std::make_shared<ColourAnalysisResult>();
+            result->source = source;
+            result->analysis = analysis;
+            std::atomic_store (&mailbox->result, std::shared_ptr<const ColourAnalysisResult> (result));
+        });
+    }
+
+    bool hasWaveformColours() const
+    {
+        return processor.getWaveformColourMode() != 0 && colourAnalysis != nullptr
+            && colourAnalysis->source == processor.getLoadedSample();
+    }
+
+    juce::Colour waveformColourForSamples (int begin, int end) const
+    {
+        auto colour = glassText;
+        const int mode = processor.getWaveformColourMode();
+        const auto& analysis = *colourAnalysis->analysis;
+        if ((mode & 1) != 0)
+        {
+            const auto energy = analysis.bands (begin, end);
+            const double total = energy[0] + energy[1] + energy[2];
+            if (total > 1.0e-10)
+            {
+                // Weighted band energies preserve mixtures instead of assigning
+                // every frame to one abruptly changing dominant band.
+                const auto mix = [&] (double low, double mid, double high)
+                { return (float) ((low * energy[0] + mid * energy[1] + high * energy[2]) / (255.0 * total)); };
+                colour = juce::Colour::fromFloatRGBA (mix (255, 88, 79), mix (104, 221, 167), mix (90, 143, 255), 1.0f);
+            }
+        }
+        if ((mode & 2) != 0 && analysis.hasAttack (begin, end))
+            colour = juce::Colour (0xffffefb0);
+        return colour;
+    }
+
+    void rebuildWaveformColourStrip()
+    {
+        waveformColourStrip = {};
+        if (! hasWaveformColours()) return;
+        const auto bounds = getDisplayBounds();
+        const int width = (int) std::ceil (bounds.getWidth());
+        if (width < 1) return;
+        const auto range = getVisibleRange (colourAnalysis->source->buffer.getNumSamples());
+        waveformColourStrip = juce::Image (juce::Image::RGB, width, 1, false);
+        for (int x = 0; x < width; ++x)
+        {
+            const int begin = (int) std::floor (range.sampleAt ((double) x / bounds.getWidth()));
+            const int end = juce::jmax (begin + 1, (int) std::ceil (range.sampleAt ((double) (x + 1) / bounds.getWidth())));
+            waveformColourStrip.setPixelAt (x, 0, waveformColourForSamples (begin, end));
+        }
+    }
+
+    void setWaveformInk (juce::Graphics& g, const juce::Image& strip, float x,
+                         juce::Rectangle<float> bounds, float opacity) const
+    {
+        if (strip.isNull()) { g.setColour (glassText.withAlpha (opacity)); return; }
+        juce::FillType ink (strip, juce::AffineTransform::scale (1.0f, bounds.getHeight()).translated (x, bounds.getY()));
+        ink.setOpacity (juce::jmin (1.0f, opacity + 0.15f));
+        g.setFillType (ink);
+    }
+
+    void paintAttackTick (juce::Graphics& g, float x, juce::Rectangle<float> bounds) const
+    {
+        if (x < bounds.getX() || x > bounds.getRight()) return;
+        g.setColour (juce::Colour (0xffffefb0).withAlpha (0.95f));
+        g.fillRect (x - 1.0f, bounds.getY() + 38.0f, 2.0f, 7.0f);
+    }
+
+    void paintSourceAttackTicks (juce::Graphics& g, juce::Rectangle<float> bounds) const
+    {
+        if (! hasWaveformColours() || (processor.getWaveformColourMode() & 2) == 0) return;
+        const auto range = getVisibleRange (colourAnalysis->source->buffer.getNumSamples());
+        const auto& attacks = colourAnalysis->analysis->attacks;
+        const auto chops = processor.getChopState();
+        for (auto it = std::lower_bound (attacks.begin(), attacks.end(), range.sampleOffset);
+             it != attacks.end() && *it < range.sampleOffset + range.visibleSamples;)
+        {
+            bool warped = false;
+            if (chops != nullptr)
+                for (const auto& chop : chops->chops)
+                    if (! chop.warpMarkers.empty() && *it >= chop.startSample && *it < chop.endSample) { warped = true; break; }
+            if (! warped) paintAttackTick (g, displayXForSamplePosition (*it, range, bounds), bounds);
+            // At overview zoom, coalesce attacks within three screen pixels.
+            // Drawing work stays tied to the viewport rather than file length.
+            const int nextSource = *it + juce::jmax (1, (int) (3.0 * range.visibleSamples / bounds.getWidth()));
+            it = std::lower_bound (it + 1, attacks.end(), nextSource);
+        }
+    }
+
+    void paintWaveformColourLegend (juce::Graphics& g, juce::Rectangle<float> bounds) const
+    {
+        const int mode = processor.getWaveformColourMode();
+        if (mode == 0) return;
+        auto area = juce::Rectangle<float> (bounds.getX() + (manualChopMode && ! processor.isWarpModeActive() ? 142.0f : 8.0f), bounds.getY() + 3.0f, 144.0f, 17.0f);
+        g.setColour (juce::Colours::black.withAlpha (0.65f));
+        g.fillRoundedRectangle (area, 2.0f);
+        g.setFont (monoFont (9.0f));
+        if (! hasWaveformColours())
+        {
+            g.setColour (glassText);
+            g.drawText (processor.getLoadedSample() != nullptr ? "ANALYSING COLOUR..." : "LOAD AUDIO", area, juce::Justification::centred);
+            return;
+        }
+        if ((mode & 1) != 0)
+        {
+            for (const auto& entry : { std::pair<const char*, juce::Colour> { "LOW", juce::Colour (0xffff685a) },
+                                      { "MID", juce::Colour (0xff58dd8f) }, { "HIGH", juce::Colour (0xff4fa7ff) } })
+            {
+                g.setColour (entry.second);
+                g.drawText (entry.first, area.removeFromLeft (35.0f), juce::Justification::centred);
+            }
+        }
+        if ((mode & 2) != 0)
+        {
+            g.setColour (juce::Colour (0xffffefb0));
+            g.drawText ("ATK", area, juce::Justification::centred);
+        }
+    }
+
     void rebuildWaveformPath (bool simplified = false)
     {
         waveformPath.clear();
+        rebuildWaveformColourStrip();
 
         const auto sampleData = processor.getLoadedSample();
         if (sampleData == nullptr || sampleData->buffer.getNumSamples() == 0)
@@ -5729,13 +6056,11 @@ private:
         auto displayHeight = displayBounds.getHeight();
         auto centreY = displayBounds.getCentreY();
 
-        int samplesPerPixel = juce::jmax (1, numSamples / (int) displayWidth);
+        if (displayWidth < 1.0f || displayHeight <= 0.0f)
+            return;
 
         const auto visibleRange = getVisibleRange (numSamples);
-        const int visibleSamples = visibleRange.visibleSamples;
-        const int sampleOffset = visibleRange.sampleOffset;
-
-        samplesPerPixel = juce::jmax (1, visibleSamples / (int) displayWidth);
+        const double samplesPerPixel = (double) visibleRange.visibleSamples / (double) displayWidth;
 
         const int step = simplified ? 2 : 1;
 
@@ -5747,46 +6072,54 @@ private:
 
         for (int pixel = 0; pixel < (int) displayWidth; pixel += step)
         {
-            int startSample = sampleOffset + pixel * samplesPerPixel;
-            int endSample = juce::jmin (startSample + step * samplesPerPixel, numSamples);
+            const double sourcePosition = visibleRange.sampleAt ((double) pixel / (double) displayWidth);
+            const int startSample = juce::jlimit (0, numSamples - 1, (int) std::floor (sourcePosition));
+            const int endSample = juce::jlimit (startSample + 1, numSamples,
+                (int) std::ceil (visibleRange.sampleAt ((double) (pixel + step) / (double) displayWidth)));
 
             float maxVal = 0.0f;
             float minVal = 0.0f;
 
-            if (samplesPerPixel < cacheBlockSize)
+            if (samplesPerPixel < 1.0)
             {
+                // At sample-level zoom, interpolate at the same source
+                // coordinate used by markers rather than drawing one sample
+                // per pixel and stretching the view out of alignment.
+                const int nextSample = juce::jmin (startSample + 1, numSamples - 1);
+                const float fraction = (float) (sourcePosition - (double) startSample);
                 for (int ch = 0; ch < numChannels; ++ch)
                 {
-                    auto* data = buffer.getReadPointer (ch);
-                    for (int s = startSample; s < endSample; ++s)
-                    {
-                        auto sample = data[s];
-                        if (sample > maxVal) maxVal = sample;
-                        if (sample < minVal) minVal = sample;
-                    }
+                    const auto* data = buffer.getReadPointer (ch);
+                    const float value = data[startSample] + fraction * (data[nextSample] - data[startSample]);
+                    maxVal = juce::jmax (maxVal, value);
+                    minVal = juce::jmin (minVal, value);
                 }
             }
             else
             {
-                int startBlock = startSample / cacheBlockSize;
-                int endBlock = endSample / cacheBlockSize;
-
-                if (startBlock == endBlock)
+                // Cache only complete blocks. Read partial blocks exactly so
+                // peaks outside a pixel's source interval cannot drift into it.
+                for (int sample = startSample; sample < endSample;)
                 {
-                    if (startBlock < peakCache.size())
+                    const int block = sample / cacheBlockSize;
+                    if (sample % cacheBlockSize == 0 && sample + cacheBlockSize <= endSample
+                        && block < peakCache.size())
                     {
-                        auto range = peakCache.getReference (startBlock);
-                        maxVal = range.getEnd();
-                        minVal = range.getStart();
+                        const auto range = peakCache.getReference (block);
+                        maxVal = juce::jmax (maxVal, range.getEnd());
+                        minVal = juce::jmin (minVal, range.getStart());
+                        sample += cacheBlockSize;
                     }
-                }
-                else
-                {
-                    for (int b = startBlock; b < endBlock && b < peakCache.size(); ++b)
+                    else
                     {
-                        auto range = peakCache.getReference (b);
-                        if (range.getEnd() > maxVal) maxVal = range.getEnd();
-                        if (range.getStart() < minVal) minVal = range.getStart();
+                        const int end = juce::jmin (endSample, (block + 1) * cacheBlockSize);
+                        for (int ch = 0; ch < numChannels; ++ch)
+                        {
+                            const auto range = buffer.findMinMax (ch, sample, end - sample);
+                            maxVal = juce::jmax (maxVal, range.getEnd());
+                            minVal = juce::jmin (minVal, range.getStart());
+                        }
+                        sample = end;
                     }
                 }
             }
@@ -5829,6 +6162,7 @@ private:
     
     void updatePeakCache()
     {
+        requestWaveformColourAnalysis();
         peakCache.clearQuick();
         const auto sampleData = processor.getLoadedSample();
         peakCacheSource = sampleData;
@@ -5864,6 +6198,23 @@ private:
     }
 
     AudioPluginAudioProcessor& processor;
+    struct ColourAnalysisResult
+    {
+        std::shared_ptr<const AudioPluginAudioProcessor::LoadedSampleData> source;
+        std::shared_ptr<const cuesampler::WaveformColourAnalysis> analysis;
+    };
+    struct ColourAnalysisMailbox
+    {
+        std::atomic<uint64_t> generation { 0 };
+        std::shared_ptr<const ColourAnalysisResult> result;
+    };
+    juce::ThreadPool colourAnalysisPool { 1 };
+    std::shared_ptr<ColourAnalysisMailbox> colourAnalysisMailbox = std::make_shared<ColourAnalysisMailbox>();
+    std::shared_ptr<const ColourAnalysisResult> colourAnalysis;
+    std::shared_ptr<const AudioPluginAudioProcessor::LoadedSampleData> colourAnalysisRequestedSource;
+    juce::Image waveformColourStrip;
+    juce::TextButton waveformColourButton;
+    int lastWaveformColourMode = -1;
     juce::Path waveformPath;
     juce::Array<juce::Range<float>> peakCache;
     std::shared_ptr<const AudioPluginAudioProcessor::LoadedSampleData> peakCacheSource;
@@ -5874,7 +6225,10 @@ private:
     bool isSelectingAnalysisRegion = false;
     bool isHoldingToPlay = false;
     bool manualChopMode = false;
+    bool manualAddTool = false;
+    juce::TextButton manualEditButton, manualAddButton;
     int pendingManualStartSample = -1;
+    double pendingMarkerGrabOffset = 0.0;
     // True while the placed-but-not-yet-completed start marker is being
     // dragged to a new position, and while the mouse is within grab range
     // of it (drives the hover highlight).
@@ -5970,6 +6324,9 @@ private:
     int    edgeDragKind      = 0;
     double edgeDragLiveSample = 0.0;
     bool   edgeDragChangesTempo = false;
+    bool   edgeDragMoved = false;
+    float  edgeDragDownX = 0.0f;
+    double edgeDragGrabOffset = 0.0;
     static constexpr float kEdgeHitTestPixels = 6.0f;
 };
 
@@ -6275,7 +6632,7 @@ public:
         stopButton.setTooltip ("Stop playback and return to the beginning of the current chop.");
         reverseButton.setTooltip ("Reverse playback for the currently selected chop. Active when lit.");
         halfSpeedButton.setTooltip ("Half-Time: plays at half speed while preserving pitch. Active when lit.");
-        manualChopButton.setTooltip ("Start manual chopping from a clean slate. Double-click the waveform for a start marker, then hold and release a MIDI pad to set the end and assignment, or double-click the end manually.");
+        manualChopButton.setTooltip ("Switch between automatic and manual chop layouts. Use ADD CHOP for a start/end pair, or EDIT to select, audition and trim.");
         loadButton.setTooltip ("Open a file browser to load a new audio sample (WAV, AIFF, MP3, FLAC, OGG). You can also drag a file onto the waveform.");
 
         for (juce::TextButton* button : { static_cast<juce::TextButton*> (&playButton),
@@ -6309,13 +6666,6 @@ public:
         warpButton.onClick = [this]
         {
             const auto active = warpButton.getToggleState();
-            if (active && manualChopButton.getToggleState())
-            {
-                manualChopButton.setToggleState (false, juce::dontSendNotification);
-                processor.setManualChopModeActive (false);
-                if (onManualChopToggled)
-                    onManualChopToggled (false);
-            }
             processor.setWarpModeActive (active);
             cue::isWarpModeActive = active;
             if (onModeThemeChanged)
@@ -6665,7 +7015,7 @@ private:
         warpButton.setEnabled (editingWaveform);
         clearWarpButton.setEnabled (editingWaveform);
         warpDivisionCombo.setEnabled (editingWaveform);
-        for (auto& button : barsSegments) button.setEnabled (editingWaveform);
+        for (auto& button : barsSegments) button.setEnabled (editingWaveform && ! processor.isManualChopModeActive());
         manualChopButton.setToggleState (processor.isManualChopModeActive(), juce::dontSendNotification);
         syncWarpAccentState();
         updateTimeDisplay();
@@ -6944,20 +7294,6 @@ private:
     {
         manualChopButton.setToggleState (active, juce::dontSendNotification);
 
-        if (active)
-        {
-            // Manual and warp placement both own waveform clicks, so entering
-            // manual mode always leaves warp mode in a predictable state.
-            processor.setWarpModeActive (false);
-            warpButton.setToggleState (false, juce::dontSendNotification);
-            cue::isWarpModeActive = false;
-
-            // Tell the editor warp just closed so the warp guide card can't
-            // stay up over a mode that is no longer active.
-            if (onWarpToggled)
-                onWarpToggled (false);
-        }
-
         // Swaps the live and stashed chop sets. No-op if already on this
         // layer, which is what makes it safe to call from start-up sync.
         processor.setManualChopModeActive (active);
@@ -6972,7 +7308,12 @@ private:
     {
         if (processor.isFavoritesViewEnabled()) return "FAVORITES  |  C2 UPWARD  |  ORDER ADDED";
         if (processor.isManualChopModeActive())
-            return "DOUBLE-CLICK START  |  HOLD/RELEASE PAD OR DOUBLE-CLICK END";
+        {
+            const int unreachable = processor.getUnreachableChopCount();
+            if (unreachable > 0)
+                return "MANUAL  |  " + juce::String (unreachable) + " UNASSIGNED  |  PAD REUSE REASSIGNS THE NOTE";
+            return "ADD: CLICK START / END  |  EDIT: CLICK TO AUDITION";
+        }
 
         // Every chop now carries its own key name on its header tab, so this
         // line no longer has to recite the mapping — and reciting it was how it
@@ -7816,6 +8157,7 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
 
     transportSectionComponent->onWarpToggled = [this] (bool active)
     {
+        waveformDisplayComponent->setManualAddTool (false);
         if (warpHelpOverlayComponent == nullptr)
             return;
 
@@ -8062,6 +8404,10 @@ void AudioPluginAudioProcessorEditor::changeListenerCallback (juce::ChangeBroadc
                                                                        juce::sendNotificationSync);
             editor->waveformFooterComponent->getScrollSlider().setValue ((double) processor.getWaveformScroll(),
                                                                          juce::sendNotificationSync);
+            // A slider already at the saved value emits no callback. Restore
+            // the viewport explicitly after the waveform's sample-load reset.
+            editor->waveformDisplayComponent->setZoom (processor.getWaveformZoom());
+            editor->waveformDisplayComponent->setScroll (processor.getWaveformScroll());
         }
 
         // Always re-sync the global controls from the processor so the UI
@@ -8077,6 +8423,8 @@ void AudioPluginAudioProcessorEditor::changeListenerCallback (juce::ChangeBroadc
                                                                            juce::dontSendNotification);
 
         editor->transportSectionComponent->refreshDisplays();
+        editor->waveformDisplayComponent->setManualChopMode (processor.isManualChopModeActive());
+        editor->waveformDisplayComponent->refreshManualTools();
         editor->refreshFavoritesView();
 
         // Refresh favorite colours and playable/selected notes after edits,
@@ -8121,6 +8469,8 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
     cue::drawHelperText (g,
                          processorRef.isFavoritesViewEnabled()
                              ? "Click: play/select   Double-click: remove favorite   Order: left to right, top to bottom"
+                             : processorRef.isManualChopModeActive()
+                             ? "ADD CHOP: click start / end   EDIT: select + audition   Drag S / E: trim   Escape: cancel"
                              : "Click chop: preview   DRAG AUDIO: export to DAW   Drag edge: resize   Shift-drag: tempo",
                          juce::Rectangle<int> (270, 84, juce::jmax (0, (int) fluidW - 280), 20),
                          juce::Justification::centred, 10.8f,
