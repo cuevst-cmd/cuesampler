@@ -843,6 +843,17 @@
     if (n.indexOf("CUERACK") !== -1 || n.indexOf("CUE RACK") !== -1) return 1;
     return 2;
   }
+
+  function productThumbnailUrl(p) {
+    var n = String(p.name || "").toUpperCase();
+    if (n.indexOf("CUE SAMPLER") !== -1 || n.indexOf("CUESAMPLER") !== -1) {
+      return "assets/cue-sampler-thumbnail.png";
+    }
+    if (n.indexOf("CUERACK") !== -1 || n.indexOf("CUE RACK") !== -1) {
+      return "assets/cue-rack-thumbnail.png";
+    }
+    return p.thumbnail_url || "";
+  }
   products.sort(function(a, b) { return productRank(a) - productRank(b); });
 
   function isFreeProduct(p) {
@@ -869,12 +880,13 @@
       // Thumbnail image or flat fallback
       var thumb = document.createElement("div");
       thumb.className = "thumb";
-      if (p.thumbnail_url) {
+      var thumbnailUrl = productThumbnailUrl(p);
+      if (thumbnailUrl) {
         var img = document.createElement("img");
         img.alt = "";
         img.loading = "lazy";
         img.decoding = "async";
-        img.src = p.thumbnail_url;
+        img.src = thumbnailUrl;
         img.addEventListener("error", function() {
           img.remove();
           thumb.appendChild(createFallbackCard(p.name, p.native_type));

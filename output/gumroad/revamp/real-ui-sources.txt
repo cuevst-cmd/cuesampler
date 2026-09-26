@@ -1,0 +1,7 @@
+CueSampler: /Volumes/PMCO/REPOS/SAMPLERv3/assets/web-hero/cue-main.jpg
+Chop Station waveform, Zoom / Scroll / Tempo / Pitch controls, piano keyboard.
+
+CueRack: /Volumes/PMCO/REPOS/CUERACK/outputs/cuerack-instagram-carousel-sharp/cuerack-instagram-03.png
+EQ and Compressor panel crops.
+
+The SVGs embed the original screenshots without repainting or regenerating their controls. The 1024 x 1024 PNGs are rendered from the SVG compositions. Earlier designs remain alongside these versions.
