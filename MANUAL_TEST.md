@@ -40,6 +40,15 @@ prefixed `StemSeparator:`.
 - [ ] Enter manual-chop mode, complete and select a chop, then open the same ADSR/export callout.
       Changing the selection while a callout is open must not redirect its knobs to another chop.
 
+## Cue points during grid edits
+- [ ] Set the chops' **CUE** knobs to 0%, then adjust **TEMPO** and **GRID** in both
+      directions and back. Select each chop: its cue stays at its new start and reads 0%.
+- [ ] Repeat with **2x**, bars-per-chop changes, and Shift-dragging a chop edge.
+      Zero cues stay at the chop starts, including chops with silent lead-ins.
+- [ ] Set a nonzero cue, then nudge the grid: the cue stays on the same source audio
+      while that position remains inside the rebuilt chop. If it falls outside, the cue
+      resets to 0%. Undo restores the previous grid and cue; save/reopen preserves them.
+
 ## Manual chopping
 - [ ] Press **CHOP MANUALLY** after automatic chops exist. The waveform immediately becomes
       a clean slate and shows the double-click start instruction.

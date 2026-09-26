@@ -1137,6 +1137,73 @@ struct CueSamplerStateTests
         original.manualChopModeActive.store (false);
         original.buildChopsFromAnalysis (*analysis);
         check (cuesMatch (original.getChopState()), "grid rebuild preserves explicitly zeroed cues");
+
+        // Moving boundaries must not turn a start cue into an absolute audio
+        // anchor. Silent lead-ins also expose unwanted auto-cue fallback.
+        const auto beforeZeroing = original.getChopState();
+        for (const auto& chop : beforeZeroing->chops)
+        {
+            original.selectChopById (chop.id);
+            original.setSelectedChopCueNormalized (0.0f);
+        }
+        const auto zeroCues = original.getChopState();
+        const auto allCuesAtStart = [&]
+        {
+            const auto state = original.getChopState();
+            return state != nullptr && ! state->chops.empty()
+                && std::all_of (state->chops.begin(), state->chops.end(),
+                                [] (const auto& chop) { return chop.cueOffsetSamples == 0; });
+        };
+        for (float trim : { 1.0f, 2.0f, -1.0f, 0.0f })
+        {
+            original.setGridBpmTrim (trim);
+            check (allCuesAtStart(), "tempo nudges in either direction keep zero cues at the new chop starts");
+        }
+        for (float offset : { 0.01f, -0.01f, 0.02f, 0.0f })
+        {
+            original.setGridStartOffset (offset);
+            check (allCuesAtStart(), "grid nudges and reset never invent cues or rerun onset detection");
+        }
+        original.setDoubleTempoEnabled (true);
+        check (allCuesAtStart(), "double tempo keeps split chops at zero cue");
+        original.setDoubleTempoEnabled (false);
+        original.setChopBarsCount (2);
+        check (allCuesAtStart(), "merging bars keeps zero cues");
+        original.setChopBarsCount (1);
+        check (allCuesAtStart(), "splitting bars keeps zero cues");
+        const auto beforeResize = original.getChopState();
+        original.resizeChopBoundaryAndTempo (beforeResize->chops[0].id, 80, 16000);
+        check (allCuesAtStart(), "shift-resize keeps zero cues while changing tempo and grid together");
+        original.undoLastEdit();
+        check (allCuesAtStart() && original.getGridBpmTrim() == 0.0f
+               && original.getGridStartOffset() == 0.0f,
+               "undo restores cue and grid state after shift-resize");
+
+        original.publishChopState (std::make_shared<P::ChopState> (*zeroCues));
+        original.selectChopById (zeroCues->chops[0].id);
+        original.setSelectedChopCueNormalized (0.25f);
+        const auto edited = original.getChopState();
+        const int cueSource = edited->chops[0].startSample + edited->chops[0].cueOffsetSamples;
+        original.setGridStartOffset (0.01f);
+        const auto shifted = original.getChopState();
+        check (shifted->chops[0].startSample + shifted->chops[0].cueOffsetSamples == cueSource,
+               "nonzero cue stays on its authored audio position when the grid moves");
+        original.undoLastEdit();
+        check (original.getChopState()->chops[0].cueOffsetSamples == edited->chops[0].cueOffsetSamples,
+               "undo restores the edited cue exactly");
+
+        auto beforeStart = std::make_shared<P::ChopState> (*zeroCues);
+        beforeStart->chops[0].cueOffsetSamples = 40;
+        original.publishChopState (beforeStart);
+        original.setGridStartOffset (0.01f); // Start moves to sample 80; onset is still ahead.
+        check (allCuesAtStart(), "cue before the new start resets to zero instead of finding another onset");
+        original.setGridStartOffset (0.0f);
+        auto afterEnd = std::make_shared<P::ChopState> (*zeroCues);
+        afterEnd->chops[0].cueOffsetSamples = 12000;
+        original.publishChopState (afterEnd);
+        original.setDoubleTempoEnabled (true); // First chop now ends at sample 8000.
+        check (original.getChopState()->chops[0].cueOffsetSamples == 0,
+               "cue beyond the new end resets to zero instead of finding another onset");
     }
 
     static void run (bool testSeparation)

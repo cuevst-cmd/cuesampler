@@ -6182,12 +6182,8 @@ void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData&
                                               (int) std::round (chopEnd * sampleRate));
         if (endSample > startSample)
         {
-            const auto autoCueStart = findAutoCueStartSample (*currentSample, startSample, endSample);
-            const auto autoCueOffset = juce::jlimit (0,
-                                                     juce::jmax (0, endSample - startSample - 1),
-                                                     autoCueStart - startSample);
             ChopDefinition def { newChopState->nextChopId++, startSample, endSample,
-                                 autoCueOffset, 0.0f, 0.0f, false, false, {} };
+                                 0, 0.0f, 0.0f, false, false, {} };
 
             // Walk the cursor up to the first old chop that could still overlap
             // this new one. Never rewinds, so the whole rebuild stays O(n + m).
@@ -6228,15 +6224,13 @@ void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData&
             {
                 const auto& old = *match;
 
-                // cueOffsetSamples is relative to the chop start, so it only
-                // transfers verbatim when the start has not moved. Re-basing it
-                // onto the new start keeps the cue pointing at the same moment
-                // of audio; if that now falls outside the chop, the auto-cue
-                // computed above stands. The old code copied the raw offset
-                // whenever it was non-zero, which silently moved the cue to a
-                // different moment every time a boundary shifted.
+                // Zero means play from the chop start, including after a grid
+                // edit. Only nonzero cues anchor to a moment in the audio. If
+                // that moment leaves the rebuilt chop, fall back to its start;
+                // rerunning auto-cue here would silently choose a new cue.
                 const int rebasedCue = (old.startSample + old.cueOffsetSamples) - def.startSample;
-                if (rebasedCue >= 0 && rebasedCue < def.endSample - def.startSample)
+                if (old.cueOffsetSamples > 0
+                    && rebasedCue >= 0 && rebasedCue < def.endSample - def.startSample)
                     def.cueOffsetSamples = rebasedCue;
 
                 def.gainDecibels     = old.gainDecibels;
@@ -6281,6 +6275,14 @@ void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData&
                         def.warpMarkers.push_back (rebased);
                     }
                 }
+            }
+            else
+            {
+                // Onset detection is only for new chops, never a replacement
+                // for an existing chop's cue during tempo/grid edits.
+                const auto autoCueStart = findAutoCueStartSample (*currentSample, startSample, endSample);
+                def.cueOffsetSamples = juce::jlimit (0, endSample - startSample - 1,
+                                                    autoCueStart - startSample);
             }
 
             newChopState->chops.push_back (def);
