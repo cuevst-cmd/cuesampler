@@ -17,7 +17,7 @@
 #
 # Usage:
 #     ./release-mac.sh                 # version auto-read from CMakeLists.txt
-#     ./release-mac.sh 1.0.2           # override the version
+#     ./release-mac.sh 1.0.2           # verify the project version
 #     SKIP_BUILD=1 ./release-mac.sh    # re-package existing build/ (no recompile)
 #     PKG_TAG=osx11 ./release-mac.sh    # dist/CUESAMPLER-1.0.6-osx11.pkg
 # =============================================================================
@@ -25,11 +25,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # --- Version: single source of truth is project(CUESAMPLER VERSION x.y.z) -----
-VERSION="${1:-}"
-if [ -z "$VERSION" ]; then
-  VERSION="$(sed -nE 's/^[[:space:]]*project\((CueSampler|CUESAMPLER)[[:space:]]+VERSION[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+).*/\2/p' CMakeLists.txt | head -1)"
-fi
-[ -n "$VERSION" ] || { echo "ERROR: could not read version from CMakeLists.txt — pass it explicitly: ./release-mac.sh 1.0.1"; exit 1; }
+PROJECT_VERSION="$(sed -nE 's/^[[:space:]]*project\(CueSampler VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt)"
+VERSION="${1:-$PROJECT_VERSION}"
+[ -n "$PROJECT_VERSION" ] && [ "$VERSION" = "$PROJECT_VERSION" ] || {
+  echo "ERROR: requested version must match CMakeLists.txt ($PROJECT_VERSION)"; exit 1;
+}
 
 APP_ID="Developer ID Application: JERRY OTTAVIO VOLPE (KUU9K5SWA8)"
 INSTALLER_ID="Developer ID Installer: JERRY OTTAVIO VOLPE (KUU9K5SWA8)"
@@ -46,6 +46,7 @@ echo "  CUE SAMPLER — macOS release"
 echo "    version     : $VERSION"
 echo "    package tag : ${PKG_TAG:-none}"
 echo "    skip build  : ${SKIP_BUILD:-0}"
+echo "    notarize    : ${CUE_NOTARIZE:-1}"
 echo "    output      : $PKG"
 echo "=================================================================="
 
@@ -83,6 +84,9 @@ AU="build/CueSampler_artefacts/Release/AU/CUE SAMPLER.component"
 [ -d "$VST3" ] || { echo "ERROR: VST3 not found after build: $VST3"; exit 1; }
 [ -d "$AU"   ] || { echo "ERROR: AU not found after build: $AU"; exit 1; }
 
+# Also refresh legal resources when reusing a build, before signing it.
+python3 tools/prepare_release_legal.py --bundle "$VST3" --bundle "$AU"
+
 # --- 2. Sign + notarize + staple the plug-in bundles --------------------------
 # (notarize.sh signs nested dylibs inside-out, hardened-runtime-signs each
 #  bundle, then submits to Apple and staples the ticket. It blocks until Apple
@@ -100,7 +104,11 @@ PKG_TAG="$PKG_TAG" ./make-installer.sh "$VERSION"
 # --- Done ---------------------------------------------------------------------
 echo
 echo "=================================================================="
-echo "  DONE — Gatekeeper-clean installer ready to ship:"
+if [ "${CUE_NOTARIZE:-1}" = "1" ]; then
+  echo "  DONE — signed, notarized, stapled installer ready to ship:"
+else
+  echo "  DONE — Developer ID signed installer (not notarized or stapled):"
+fi
 ls -lh "$PKG" "${PKG}.sha256" 2>/dev/null || true
 echo
 echo "  Publish to GitHub Releases (the tag is what the in-app updater"

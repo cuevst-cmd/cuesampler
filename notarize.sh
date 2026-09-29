@@ -12,6 +12,7 @@ set -euo pipefail
 
 IDENTITY="Developer ID Application: JERRY OTTAVIO VOLPE (KUU9K5SWA8)"
 PROFILE="cue-notary"
+CUE_NOTARIZE="${CUE_NOTARIZE:-1}"
 
 VST3="build/CueSampler_artefacts/Release/VST3/CUE SAMPLER.vst3"
 AU="build/CueSampler_artefacts/Release/AU/CUE SAMPLER.component"
@@ -54,10 +55,18 @@ notarize_bundle () {
 for b in "$VST3" "$AU"; do
   [ -e "$b" ] || { echo "MISSING: $b"; exit 1; }
   sign_bundle "$b"
-  notarize_bundle "$b"
+  if [ "$CUE_NOTARIZE" = "1" ]; then
+    notarize_bundle "$b"
+  else
+    echo "==> CUE_NOTARIZE=0 — skipping Apple submission and stapling for: $b"
+  fi
 done
 
 echo
-echo "All done. Final Gatekeeper assessment:"
-spctl -a -vvv -t install "$VST3" 2>&1 || true
-echo "CUE SAMPLER is signed, notarized, and stapled."
+if [ "$CUE_NOTARIZE" = "1" ]; then
+  echo "All done. Final Gatekeeper assessment:"
+  spctl -a -vvv -t install "$VST3"
+  echo "CUE SAMPLER is signed, notarized, and stapled."
+else
+  echo "CUE SAMPLER bundles are Developer ID signed (not notarized or stapled)."
+fi

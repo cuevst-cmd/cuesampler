@@ -533,6 +533,253 @@ struct CueSamplerStateTests
         check (findButton (*editor, "SAVE WAV...") != nullptr, "ADSR opens the envelope menu with a separate Save WAV action");
     }
 
+    // Opt-in CPU paint benchmark; timings are reported, never used as flaky CI assertions.
+    static void runUiBenchmark()
+    {
+        P p;
+        auto source = std::make_shared<P::LoadedSampleData>();
+        source->sampleRate = 48000;
+        source->buffer.setSize (2, 48000 * 60);
+        juce::Random random (12345);
+        for (int i = 0; i < source->buffer.getNumSamples(); ++i)
+        {
+            const float envelope = 0.15f + 0.8f * std::abs (std::sin ((float) i * 0.000023f));
+            for (int ch = 0; ch < 2; ++ch)
+                source->buffer.setSample (ch, i, envelope * (random.nextFloat() * 2.0f - 1.0f));
+        }
+        std::atomic_store (&p.loadedSample, source);
+        auto layout = std::make_shared<P::ChopState>();
+        for (int i = 0; i < 32; ++i)
+        {
+            P::ChopDefinition chop;
+            chop.id = i + 1;
+            chop.startSample = i * 90000;
+            chop.endSample = (i + 1) * 90000;
+            layout->chops.push_back (chop);
+        }
+        layout->nextChopId = 33;
+        layout->selectedChopId = 1;
+        p.publishChopState (layout);
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+        std::function<juce::Component* (juce::Component&)> findWave = [&] (juce::Component& c) -> juce::Component*
+        {
+            if (juce::String (typeid (c).name()).contains ("WaveformDisplayComponent")) return &c;
+            for (auto* child : c.getChildren()) if (auto* found = findWave (*child)) return found;
+            return nullptr;
+        };
+        auto* wave = findWave (*editor);
+        check (wave != nullptr, "benchmark waveform exists");
+        if (wave == nullptr) return;
+        for (int scale : { 1, 2 })
+            for (int scenario = 0; scenario < 4; ++scenario)
+            {
+                juce::Image image (juce::Image::ARGB, wave->getWidth() * scale, wave->getHeight() * scale, true);
+                std::vector<double> times;
+                for (int frame = 0; frame < 100; ++frame)
+                {
+                    auto edited = std::make_shared<P::ChopState> (*layout);
+                    for (auto& chop : edited->chops)
+                        if (scenario != 0)
+                            chop.warpMarkers.push_back ({ chop.startSample + 45000,
+                                (scenario == 2 || (scenario == 3 && chop.id == 1)) ? 0.55 + (frame % 20) * 0.025 : 0.7, false, 0.0 });
+                    edited->chops[0].setCueNormalized ((frame % 50) * 0.01);
+                    p.publishChopState (edited);
+                    const auto start = juce::Time::getMillisecondCounterHiRes();
+                    juce::Graphics g (image);
+                    g.addTransform (juce::AffineTransform::scale ((float) scale));
+                    wave->paintEntireComponent (g, true);
+                    if (frame >= 10) times.push_back (juce::Time::getMillisecondCounterHiRes() - start);
+                }
+                std::sort (times.begin(), times.end());
+                double sum = 0.0;
+                for (auto t : times) sum += t;
+                std::cout << "BENCH scale=" << scale << " scenario=" << scenario
+                          << " size=" << image.getWidth() << "x" << image.getHeight()
+                          << " mean_ms=" << sum / (double) times.size()
+                          << " p95_ms=" << times[times.size() * 95 / 100]
+                          << " max_ms=" << times.back() << std::endl;
+            }
+    }
+
+    static void runPerformanceUi (const juce::File& scratch)
+    {
+        const auto findType = [] (juce::Component& root, const juce::String& name)
+        {
+            std::function<juce::Component* (juce::Component&)> visit = [&] (juce::Component& c) -> juce::Component*
+            {
+                if (juce::String (typeid (c).name()).contains (name)) return &c;
+                for (auto* child : c.getChildren()) if (auto* found = visit (*child)) return found;
+                return nullptr;
+            };
+            return visit (root);
+        };
+        {
+            P p; setup (p);
+            p.publishChopState (std::make_shared<P::ChopState>());
+            p.setWaveformZoom (0.15f);
+            p.playbackSamplePosition.store (1000);
+            std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+            editor->addToDesktop (juce::ComponentPeer::windowIsTemporary);
+            editor->setVisible (true);
+            auto* wave = findType (*editor, "WaveformDisplayComponent");
+            auto* bar = wave != nullptr ? dynamic_cast<juce::ScrollBar*> (findType (*wave, "ScrollBar")) : nullptr;
+            check (bar != nullptr && bar->isVisible(), "zoomed waveform exposes its horizontal scrollbar");
+            if (bar != nullptr && wave != nullptr)
+            {
+                const auto region = juce::Rectangle<int> (30, 110, wave->getWidth() - 60, 80);
+                const auto before = wave->createComponentSnapshot (region);
+                const auto sameImage = [&] (const juce::Image& image)
+                {
+                    for (int y = 0; y < before.getHeight(); ++y)
+                        for (int x = 0; x < before.getWidth(); ++x)
+                            if (before.getPixelAt (x, y) != image.getPixelAt (x, y)) return false;
+                    return true;
+                };
+                const double requested = (1.0 - bar->getCurrentRangeSize()) * 0.7;
+                bar->setCurrentRangeStart (requested, juce::sendNotificationSync);
+                check (std::abs (p.getWaveformScroll() - 0.7f) < 0.0001f,
+                       "scrollbar updates the bound scroll value immediately");
+                check (sameImage (wave->createComponentSnapshot (region)),
+                       "scrollbar defers waveform movement to animation instead of jumping per drag event");
+                check (waitFor ([&] { return ! sameImage (wave->createComponentSnapshot (region)); }),
+                       "scrollbar moves the waveform on animation frames");
+                for (int i = 0; i < 30; ++i) pump();
+                check (std::abs (bar->getCurrentRangeStart() - requested) < 0.0001
+                       && std::abs (p.getWaveformScroll() - 0.7f) < 0.0001f,
+                       "animation never feeds its lagging position back into the thumb or scroll parameter");
+            }
+        }
+        P p; setup (p);
+        auto layout = std::make_shared<P::ChopState>();
+        // Overlap deliberately: only the triggered tile should show a playhead.
+        for (int id : { 1, 2 })
+        {
+            P::ChopDefinition chop;
+            chop.id = id; chop.startSample = 0; chop.endSample = 16000;
+            chop.favorite = true; chop.favoriteOrder = id;
+            layout->chops.push_back (chop);
+        }
+        layout->nextChopId = 3; layout->selectedChopId = 1;
+        p.publishChopState (layout);
+        p.setFavoritesViewEnabled (true);
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+        editor->addToDesktop (juce::ComponentPeer::windowIsTemporary);
+        editor->setVisible (true);
+        auto* view = findType (*editor, "FavoritesViewComponent");
+        auto* grid = view != nullptr ? view->getChildComponent (0) : nullptr;
+        check (grid != nullptr && grid->isShowing(), "favorites tiles are visible for performance tests");
+        if (grid == nullptr) return;
+        const auto greenX = [&] (int slot)
+        {
+            const auto image = grid->createComponentSnapshot (grid->getLocalBounds());
+            int sum = 0, count = 0;
+            for (int x = slot * grid->getWidth() / 2; x < (slot + 1) * grid->getWidth() / 2; ++x)
+            {
+                const auto colour = image.getPixelAt (x, grid->getHeight() / 2);
+                if (colour.getGreen() > 120 && colour.getRed() < 30 && colour.getBlue() < 110)
+                { sum += x; ++count; }
+            }
+            return count > 0 ? sum / count : -1;
+        };
+        p.lastTriggeredChopId.store (1); p.playbackActive.store (true);
+        p.playbackSamplePosition.store (4000);
+        p.selectChopById (2);
+        const int quarter = greenX (0);
+        check (quarter > 0 && greenX (1) < 0, "playhead follows the playing chop, not selection or overlapping neighbors");
+        p.playbackSamplePosition.store (12000);
+        check (greenX (0) > quarter + grid->getWidth() / 6, "favorite playhead advances with playback");
+        p.playbackSamplePosition.store (4000);
+        check (greenX (0) == quarter, "favorite playhead returns to the cue on loop or retrigger");
+        auto reverse = std::make_shared<P::ChopState> (*layout);
+        reverse->chops[0].reversed = true; reverse->chops[0].cueOffsetSamples = 4000;
+        p.publishChopState (reverse); p.playbackSamplePosition.store (8000);
+        check (std::abs (greenX (0) - quarter) <= 2, "reverse cue playback tracks the mirrored waveform");
+        auto warp = std::make_shared<P::ChopState> (*layout);
+        warp->chops[0].warpMarkers.push_back ({ 8000, 0.5, false, 0.0 });
+        p.publishChopState (warp); p.playbackSamplePosition.store (4000);
+        check (greenX (0) > quarter + grid->getWidth() / 12, "warped playhead maps playback time onto source waveform");
+        {
+            juce::FileOutputStream out (scratch.getSiblingFile ("favorites-playhead.png"));
+            out.setPosition (0); out.truncate();
+            juce::PNGImageFormat().writeImageToStream (editor->createComponentSnapshot (editor->getLocalBounds()), out);
+        }
+        p.playbackActive.store (false);
+        check (greenX (0) < 0 && greenX (1) < 0, "stopping playback clears favorite playheads");
+        p.publishChopState (std::make_shared<P::ChopState> (*layout));
+        p.prepareToPlay (8000, 64);
+        const auto point = juce::Point<float> ((float) grid->getWidth() * 0.25f, (float) grid->getHeight() * 0.5f);
+        const auto now = juce::Time::getCurrentTime();
+        const auto click = juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), point,
+            juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier), 1, 0, 0, 0, 0,
+            grid, grid, now, point, now, 2, false);
+        grid->mouseDown (click); grid->mouseDoubleClick (click);
+        juce::AudioBuffer<float> audio (2, 64); juce::MidiBuffer midi;
+        p.processBlock (audio, midi);
+        check (p.getChopState()->favoriteChopIndices.size() == 2
+               && p.getMidiNoteForChopId (1) == 36 && p.getMidiNoteForChopId (2) == 37,
+               "double-clicking a favorite preserves membership, order and MIDI assignments");
+        check (p.isPlaying() && p.getLastTriggeredChopId() == 1,
+               "double-clicking a favorite still auditions the pad");
+        grid->mouseUp (click);
+        for (int i = 0; i < 10; ++i) { midi.clear(); p.processBlock (audio, midi); }
+        check (! p.isPlaying(), "favorite double-click releases Gate playback normally");
+
+        auto navigation = std::make_shared<P::ChopState>();
+        P::ChopDefinition early, late, plain;
+        early.id = 10; early.startSample = 0; early.endSample = 8000;
+        early.favorite = true; early.favoriteOrder = 2;
+        late.id = 73; late.startSample = 48000; late.endSample = 56000;
+        late.favorite = true; late.favoriteOrder = 1; late.setCueNormalized (0.3);
+        late.assignedMidiNote = 84;
+        plain.id = 100; plain.startSample = 56000; plain.endSample = 64000;
+        navigation->chops = { early, late, plain };
+        navigation->nextChopId = 101; navigation->selectedChopId = 73;
+        p.publishChopState (navigation);
+        p.editChangeBroadcaster.sendChangeMessage();
+        auto* editFavorite = findButton (*editor, "EDIT CHOP");
+        check (editFavorite != nullptr && editFavorite->isVisible() && editFavorite->isEnabled(),
+               "favorites expose an Edit Chop action for the selected favorite");
+        if (editFavorite == nullptr) return;
+        {
+            juce::FileOutputStream out (scratch.getSiblingFile ("favorites-edit-action.png"));
+            out.setPosition (0); out.truncate();
+            juce::PNGImageFormat().writeImageToStream (editor->createComponentSnapshot (editor->getLocalBounds()), out);
+        }
+        editFavorite->onClick();
+        auto* wave = findType (*editor, "WaveformDisplayComponent");
+        auto* bar = wave != nullptr ? dynamic_cast<juce::ScrollBar*> (findType (*wave, "ScrollBar")) : nullptr;
+        check (! p.isFavoritesViewEnabled() && ! view->isVisible() && wave != nullptr && wave->isVisible()
+               && p.getChopState()->selectedChopId == 73,
+               "Edit Chop returns to the original chop by ID, not its favorite slot");
+        check (bar != nullptr && bar->getCurrentRangeStart() * 64000 <= 48000
+               && (bar->getCurrentRangeStart() + bar->getCurrentRangeSize()) * 64000 >= 56000
+               && bar->getCurrentRangeSize() < 0.2,
+               "Edit Chop immediately frames both edges of an offscreen favorite");
+        check (p.getChopState()->favoriteChopIndices == std::vector<int> { 1, 0 }
+               && std::abs (p.getChopState()->chops[1].getCueNormalized() - 0.3) < 0.0001
+               && p.getMidiNoteForChopId (73) == 84,
+               "Edit Chop preserves favorites and cue values and restores the normal MIDI mapping");
+        for (int i = 0; i < 10; ++i) pump();
+        check (p.getChopState()->selectedChopId == 73,
+               "a previous pad trigger cannot redirect the editing selection");
+        p.setSelectedChopGainDecibels (-9.0f);
+        check (std::abs (p.getChopState()->chops[1].gainDecibels + 9.0f) < 0.001f
+               && std::abs (p.getChopState()->chops[0].gainDecibels) < 0.001f,
+               "subsequent edits affect the opened favorite's original chop");
+        p.setFavoritesViewEnabled (true);
+        check (waitFor ([&] { return view->isVisible(); }), "favorites can be reopened after editing");
+        p.selectChopById (100);
+        check (p.getChopState()->selectedChopId == 73 && editFavorite->isEnabled(),
+               "Favorites keeps Edit Chop attached to its valid fallback selection");
+        p.selectChopById (10);
+        check (waitFor ([&] { return editFavorite->isEnabled(); }), "Edit Chop follows selection changes");
+        p.publishChopState (std::make_shared<P::ChopState>());
+        p.editChangeBroadcaster.sendChangeMessage();
+        check (waitFor ([&] { return ! editFavorite->isEnabled(); }), "Edit Chop is disabled for empty favorites");
+        editFavorite->onClick();
+        check (p.isFavoritesViewEnabled(), "a stale Edit Chop action safely ignores a removed selection");
+    }
+
     static void runFavorites()
     {
         P p;
@@ -1059,7 +1306,24 @@ struct CueSamplerStateTests
         const auto warpedColour = sampleColour (48000);
         check (warpedColour.getRed() > warpedColour.getGreen() * 1.5,
                "warped waveform colours follow the source-to-playback time map");
-        p.publishChopState (std::make_shared<P::ChopState>());
+        auto movedWarp = std::make_shared<P::ChopState> (*warpedLayout);
+        movedWarp->chops[0].warpMarkers[0].localTimeSeconds = 0.5;
+        p.publishChopState (movedWarp);
+        const auto movedColour = sampleColour (48000);
+        check (movedColour.getGreen() > movedColour.getRed() * 1.5,
+               "moving a warp anchor invalidates cached waveform pixels immediately");
+        auto cueEdit = std::make_shared<P::ChopState> (*movedWarp);
+        cueEdit->chops[0].setCueNormalized (0.1);
+        p.publishChopState (cueEdit);
+        check (sampleColour (48000) == movedColour, "cue edits preserve the cached source waveform");
+        auto removedWarp = std::make_shared<P::ChopState> (*warpedLayout);
+        removedWarp->chops[0].warpMarkers.clear();
+        p.publishChopState (removedWarp);
+        const auto unwarpedColour = sampleColour (48000);
+        check (unwarpedColour.getGreen() > unwarpedColour.getRed() * 1.5,
+               "removing warp anchors reveals the original waveform without stale cache pixels");
+        p.publishChopState (warpedLayout);
+        check (sampleColour (48000) == warpedColour, "restoring warp anchors restores their waveform");
         auto replacement = std::make_shared<P::LoadedSampleData> (*source);
         replacement->buffer.clear();
         std::atomic_store (&p.loadedSample, replacement);
@@ -1094,11 +1358,11 @@ struct CueSamplerStateTests
         const auto generated = original.getChopState();
         check (generated->chops.size() == 4
                && std::all_of (generated->chops.begin(), generated->chops.end(),
-                               [] (const auto& chop) { return chop.cueOffsetSamples > 0; }),
-               "new chops still auto-cue past silent lead-ins");
+                               [] (const auto& chop) { return chop.cueOffsetSamples == 0; }),
+               "new chops start at zero even with different silent lead-ins");
         if (generated->chops.size() != 4) return;
 
-        const std::array<float, 4> cueValues { 0.0f, 0.0f, 0.25f, 1.0f };
+        const std::array<float, 4> cueValues { 0.0f, 0.125f, 0.333f, 1.0f };
         for (size_t i = 0; i < cueValues.size(); ++i)
         {
             original.selectChopById (generated->chops[i].id);
@@ -1146,7 +1410,6 @@ struct CueSamplerStateTests
             original.selectChopById (chop.id);
             original.setSelectedChopCueNormalized (0.0f);
         }
-        const auto zeroCues = original.getChopState();
         const auto allCuesAtStart = [&]
         {
             const auto state = original.getChopState();
@@ -1179,31 +1442,75 @@ struct CueSamplerStateTests
                && original.getGridStartOffset() == 0.0f,
                "undo restores cue and grid state after shift-resize");
 
-        original.publishChopState (std::make_shared<P::ChopState> (*zeroCues));
-        original.selectChopById (zeroCues->chops[0].id);
-        original.setSelectedChopCueNormalized (0.25f);
-        const auto edited = original.getChopState();
-        const int cueSource = edited->chops[0].startSample + edited->chops[0].cueOffsetSamples;
-        original.setGridStartOffset (0.01f);
-        const auto shifted = original.getChopState();
-        check (shifted->chops[0].startSample + shifted->chops[0].cueOffsetSamples == cueSource,
-               "nonzero cue stays on its authored audio position when the grid moves");
+        original.publishChopState (std::make_shared<P::ChopState> (*expected));
+        const auto knobsMatch = [&] (const std::shared_ptr<const P::ChopState>& state)
+        {
+            if (state == nullptr || state->chops.empty()) return false;
+            for (size_t i = 0; i < state->chops.size(); ++i)
+            {
+                const double wanted = i < cueValues.size() ? (double) cueValues[i] : 0.0;
+                if (std::abs (state->chops[i].getCueNormalized() - wanted) > 1.0e-12) return false;
+                const int offset = (int) std::round (wanted * juce::jmax (0, state->chops[i].endSample - state->chops[i].startSample - 1));
+                if (state->chops[i].cueOffsetSamples != offset) return false;
+            }
+            return true;
+        };
+        bool stable = true;
+        for (int i = 0; i < 20; ++i)
+        {
+            original.setGridBpmTrim (i % 2 == 0 ? 1.3f : -2.1f);
+            stable = stable && knobsMatch (original.getChopState());
+            // Keep four slots alive so this checks edits, rather than deleting/recreating the last chop.
+            original.setGridStartOffset (i % 2 == 0 ? 0.013f : 0.02f);
+            stable = stable && knobsMatch (original.getChopState());
+        }
+        check (stable, "repeated tempo/grid edits preserve exact cue knob percentages without rounding drift");
+        original.setGridBpmTrim (0); original.setGridStartOffset (0);
+        original.setDoubleTempoEnabled (true);
+        check (knobsMatch (original.getChopState()), "2x preserves existing knob values and starts new slots at zero");
+        original.setDoubleTempoEnabled (false);
+        original.setChopBarsCount (2);
+        check (knobsMatch (original.getChopState()), "bar changes preserve surviving numbered chop knob settings");
         original.undoLastEdit();
-        check (original.getChopState()->chops[0].cueOffsetSamples == edited->chops[0].cueOffsetSamples,
-               "undo restores the edited cue exactly");
+        check (knobsMatch (original.getChopState()), "undo restores the cue percentages of removed slots");
 
-        auto beforeStart = std::make_shared<P::ChopState> (*zeroCues);
-        beforeStart->chops[0].cueOffsetSamples = 40;
-        original.publishChopState (beforeStart);
-        original.setGridStartOffset (0.01f); // Start moves to sample 80; onset is still ahead.
-        check (allCuesAtStart(), "cue before the new start resets to zero instead of finding another onset");
-        original.setGridStartOffset (0.0f);
-        auto afterEnd = std::make_shared<P::ChopState> (*zeroCues);
-        afterEnd->chops[0].cueOffsetSamples = 12000;
-        original.publishChopState (afterEnd);
-        original.setDoubleTempoEnabled (true); // First chop now ends at sample 8000.
-        check (original.getChopState()->chops[0].cueOffsetSamples == 0,
-               "cue beyond the new end resets to zero instead of finding another onset");
+        const auto before = original.getChopState();
+        const auto id = before->chops[2].id;
+        original.resizeChopBoundaryAndTempo (id, 32000, 47000);
+        check (knobsMatch (original.getChopState()), "shift-resize preserves cue percentages while moving both grid and tempo");
+        original.undoLastEdit();
+        original.setChopBounds (id, 32000, 32002);
+        check (knobsMatch (original.getChopState()), "shrinking a chop to two samples preserves its exact knob setting");
+        juce::MemoryBlock tinySaved; original.getStateInformation (tinySaved);
+        reopened.setStateInformation (tinySaved.getData(), (int) tinySaved.getSize());
+        check (waitFor ([&] { return restored (reopened); }) && knobsMatch (reopened.getChopState()),
+               "saved knob percentage survives recall even when the sample offset cannot represent it exactly");
+        original.setChopBounds (id, 32000, 48000);
+        check (knobsMatch (original.getChopState()), "expanding the chop restores its cue offset without percentage drift");
+
+        // Legacy sessions have offsets but no normalized knob property. Preserve
+        // those offsets in both layers, then freeze the inferred knob percentages.
+        original.publishChopState (std::make_shared<P::ChopState> (*expected));
+        juce::MemoryBlock modern; original.getStateInformation (modern);
+        juce::MemoryInputStream input (modern.getData(), modern.getSize(), false); input.skipNextBytes (4);
+        auto legacy = juce::ValueTree::readFromStream (input);
+        for (const auto* name : { "ChopState", "StashedChopState" })
+            for (auto chop : legacy.getChildWithName (name)) chop.removeProperty ("cuePositionNormalized", nullptr);
+        juce::MemoryBlock oldData;
+        { juce::MemoryOutputStream output (oldData, false); output.write ("CSB2", 4); legacy.writeToStream (output); }
+        reopened.setStateInformation (oldData.getData(), (int) oldData.getSize());
+        check (waitFor ([&] { return restored (reopened); }) && cuesMatch (reopened.getChopState())
+               && cuesMatch (std::atomic_load (&reopened.stashedChopState)),
+               "legacy active and inactive layers preserve every saved cue offset");
+        const auto legacyCues = reopened.getChopState();
+        reopened.setGridBpmTrim (1.7f);
+        bool legacyStable = true;
+        for (size_t i = 0; i < legacyCues->chops.size(); ++i)
+            legacyStable = legacyStable && std::abs (reopened.getChopState()->chops[i].getCueNormalized()
+                                                    - legacyCues->chops[i].getCueNormalized()) < 1.0e-12;
+        check (legacyStable, "legacy cue values remain stable when tempo changes after recall");
+        check (original.chopAtTransients (P::TransientSensitivity::Fine) > 0 && allCuesAtStart(),
+               "transient-generated chops also start at zero cue");
     }
 
     static void run (bool testSeparation)
@@ -1414,6 +1721,8 @@ int main (int argc, char** argv)
    #endif
     const auto filter = argc > 2 ? juce::String (argv[2]) : juce::String();
     const bool full = filter.isEmpty() || filter == "--separate";
+    if (filter == "--ui-benchmark") CueSamplerStateTests::runUiBenchmark();
+    if (full || filter == "--performance-ui") CueSamplerStateTests::runPerformanceUi (scratch);
     if (full || filter == "--cue-recall") CueSamplerStateTests::runCueRecall();
     if (full || filter == "--manual-chops") CueSamplerStateTests::runManualChops (scratch);
     if (full || filter == "--waveform-colour") CueSamplerStateTests::runWaveformColour (scratch);

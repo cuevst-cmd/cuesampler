@@ -80,7 +80,6 @@ private:
 
     juce::TooltipWindow tooltipWindow { this, 500 };
     juce::DropShadow defaultShadow { juce::Colours::black.withAlpha (0.6f), 12, { 0, 5 } };
-    juce::DropShadowEffect panelShadowEffect;
 
     // Measures the real display refresh rate (60/120) so animations run at the
     // display's native frame rate. See cue::observeVBlankInterval.

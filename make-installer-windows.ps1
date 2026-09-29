@@ -105,13 +105,11 @@ if ($CommercialRelease) {
     }
 }
 
-if ([string]::IsNullOrWhiteSpace($Version)) {
-    $projectLine = Select-String -Path "CMakeLists.txt" -Pattern 'project\(CueSampler VERSION ([0-9]+\.[0-9]+\.[0-9]+)\)' | Select-Object -First 1
-    if ($null -eq $projectLine) {
-        Write-Error "Could not read the CueSampler version from CMakeLists.txt."
-    }
-    $Version = $projectLine.Matches[0].Groups[1].Value
-}
+$projectLine = Select-String -Path "CMakeLists.txt" -Pattern 'project\(CueSampler VERSION ([0-9]+\.[0-9]+\.[0-9]+)\)' | Select-Object -First 1
+if ($null -eq $projectLine) { Write-Error "Could not read CueSampler version from CMakeLists.txt." }
+$projectVersion = $projectLine.Matches[0].Groups[1].Value
+if ([string]::IsNullOrWhiteSpace($Version)) { $Version = $projectVersion }
+if ($Version -ne $projectVersion) { Write-Error "Installer version must match CMakeLists.txt ($projectVersion)." }
 
 if ($Version -notmatch '^\d+\.\d+\.\d+$') {
     Write-Error "Installer version must contain exactly three numeric components (for example, 1.0.7)."
@@ -124,7 +122,7 @@ Write-Host "==> Preparing Windows Installer (Version: $Version, BuildDir: $Build
 # --- 1. Generate LICENSE.txt from EULA.md ---
 if (Test-Path "EULA.md") {
     Write-Host "==> Generating LICENSE.txt from EULA.md..."
-    $eula = Get-Content -Path "EULA.md" -Raw
+    $eula = Get-Content -Path "EULA.md" -Raw -Encoding UTF8
     # Strip basic markdown headers and bolding
     $license = $eula -replace '(?m)^#\s+', '' -replace '(?m)^##\s+', '' -replace '\*\*', ''
     # Keep the generated tracked file byte-stable on macOS, Windows, and CI.
@@ -162,6 +160,13 @@ foreach ($relativePath in $requiredRuntimeFiles) {
     }
 }
 
+# Match the compiled PE version, not just the requested package filename.
+$pluginBinary = Join-Path $vst3Path "Contents\x86_64-win\CUE SAMPLER.vst3"
+$compiledVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($pluginBinary).ProductVersion
+if ($compiledVersion -notmatch ('^' + [regex]::Escape($Version) + '(?:\.0)?$')) {
+    Write-Error "Compiled plugin version ($compiledVersion) differs from installer ($Version). Rebuild first."
+}
+
 $stemModelPath = Join-Path $vst3Path "Contents\x86_64-win\htdemucs\htdemucs.onnx"
 if (-not (Test-Path $stemModelPath -PathType Leaf)) {
     if ($CommercialRelease) {
@@ -188,6 +193,10 @@ New-Item -ItemType Directory -Path $releaseNoticesDir -Force | Out-Null
 
 $noticeFiles = @(
     @{ Source = "THIRD_PARTY_NOTICES.txt"; Destination = "THIRD_PARTY_NOTICES.txt" },
+    @{ Source = "EULA.md"; Destination = "EULA.md" },
+    @{ Source = "PRIVACY_POLICY.md"; Destination = "PRIVACY_POLICY.md" },
+    @{ Source = "licenses\PFFFT-LICENSE.txt"; Destination = "PFFFT-LICENSE.txt" },
+    @{ Source = (Join-Path $BuildDir "_deps\bungee-src\submodules\cxxopts\LICENSE"); Destination = "Cxxopts-LICENSE.txt" },
     @{ Source = "licenses\Beat-This-MIT.txt"; Destination = "Beat-This-MIT.txt" },
     @{ Source = "licenses\Demucs-MIT.txt"; Destination = "Demucs-MIT.txt" },
     @{ Source = "assets\Syne-OFL.txt"; Destination = "Syne-OFL-1.1.txt" },
@@ -199,11 +208,19 @@ $noticeFiles = @(
     @{ Source = (Join-Path $BuildDir "_deps\directml-src\ThirdPartyNotices.txt"); Destination = "DirectML-ThirdPartyNotices.txt" }
 )
 
+foreach ($suffix in @("MINPACK", "APACHE", "BSD", "README", "MPL2")) {
+    $noticeFiles += @{ Source = (Join-Path $BuildDir "_deps\bungee-src\submodules\eigen\COPYING.$suffix"); Destination = "Eigen-COPYING.$suffix" }
+}
+foreach ($relative in Get-Content "tools\juce_license_files.txt") {
+    $noticeFiles += @{ Source = (Join-Path $BuildDir "_deps\juce-src\$relative"); Destination = "JUCE-Dependencies/$relative" }
+}
 foreach ($notice in $noticeFiles) {
     if (-not (Test-Path $notice.Source -PathType Leaf)) {
         Write-Error "Required release notice is missing: $($notice.Source)"
     }
-    Copy-Item -Path $notice.Source -Destination (Join-Path $releaseNoticesDir $notice.Destination) -Force
+    $noticeDestination = Join-Path $releaseNoticesDir $notice.Destination
+    New-Item -ItemType Directory -Path (Split-Path -Parent $noticeDestination) -Force | Out-Null
+    Copy-Item -Path $notice.Source -Destination $noticeDestination -Force
 }
 
 $bungeeSourceDir = Join-Path $BuildDir "_deps\bungee-src"

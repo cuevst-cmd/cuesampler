@@ -1,0 +1,12 @@
+modules/juce_audio_plugin_client/AU/AudioUnitSDK/LICENSE.txt
+modules/juce_audio_formats/codecs/flac/Flac Licence.txt
+modules/juce_audio_formats/codecs/oggvorbis/Ogg Vorbis Licence.txt
+modules/juce_graphics/image_formats/jpglib/README
+modules/juce_opengl/opengl/juce_gl.h
+modules/juce_audio_processors_headless/format_types/LV2_SDK/lv2/COPYING
+modules/juce_audio_processors_headless/format_types/pslextensions/ipslcontextinfo.h
+modules/juce_audio_processors_headless/format_types/VST3_SDK/LICENSE.txt
+modules/juce_graphics/image_formats/pnglib/LICENSE
+modules/juce_core/zip/zlib/README
+modules/juce_graphics/fonts/harfbuzz/COPYING
+modules/juce_graphics/unicode/sheenbidi/LICENSE

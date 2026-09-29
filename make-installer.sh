@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build a signed + notarized .pkg installer for CUE SAMPLER.
-# Installs the (already-notarized) VST3 — and the AU if present — into the
+# Installs the (already-notarized) VST3 and AU into the
 # system audio plug-in folders, so any DAW finds them.
 #
 # Prerequisites:
@@ -11,8 +11,13 @@
 # Usage:  ./make-installer.sh [version]
 #         PKG_TAG=osx11 ./make-installer.sh 1.0.6
 set -euo pipefail
+cd "$(dirname "$0")"
 
-VERSION="${1:-1.0.0}"
+PROJECT_VERSION="$(sed -nE 's/^[[:space:]]*project\(CueSampler VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt)"
+VERSION="${1:-$PROJECT_VERSION}"
+[ -n "$PROJECT_VERSION" ] && [ "$VERSION" = "$PROJECT_VERSION" ] || {
+  echo "ERROR: installer version must match CMakeLists.txt ($PROJECT_VERSION)"; exit 1;
+}
 PKG_TAG="${PKG_TAG:-}"
 if [[ -n "$PKG_TAG" && ! "$PKG_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "ERROR: PKG_TAG may contain only letters, numbers, dots, underscores, and hyphens"
@@ -21,12 +26,18 @@ fi
 PKG_SUFFIX="${PKG_TAG:+-${PKG_TAG}}"
 INSTALLER_ID="Developer ID Installer: JERRY OTTAVIO VOLPE (KUU9K5SWA8)"
 PROFILE="cue-notary"
+CUE_NOTARIZE="${CUE_NOTARIZE:-1}"
 PKG_ID="com.cuesoftware.cuesampler.installer"
 
 VST3="build/CueSampler_artefacts/Release/VST3/CUE SAMPLER.vst3"
 AU="build/CueSampler_artefacts/Release/AU/CUE SAMPLER.component"
 
+# Verify legal resources and binary metadata without modifying signed bundles.
+python3 tools/prepare_release_legal.py --verify-bundle "$VST3" --verify-bundle "$AU"
+codesign --verify --deep --strict "$VST3"
+codesign --verify --deep --strict "$AU"
 STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
 OUT="dist"
 UNSIGNED="$STAGE/unsigned.pkg"
 # URL-safe filename (no spaces) so GitHub Release asset links don't need %20
@@ -48,6 +59,22 @@ else
   echo "AU not included (missing)."
 fi
 
+# External/non-APFS workspaces can represent macOS metadata as AppleDouble
+# sidecars, while pkgbuild serializes copied provenance attributes the same way.
+# Neither belongs in the installed plug-ins. Removing extended attributes does
+# not alter signed bundle contents; verify both signatures and tickets again so
+# packaging stops immediately if that ever changes.
+find "$STAGE/root" \( -name '._*' -o -name '.DS_Store' \) -delete
+xattr -cr "$STAGE/root"
+STAGED_VST3="$STAGE/root/Library/Audio/Plug-Ins/VST3/CUE SAMPLER.vst3"
+STAGED_AU="$STAGE/root/Library/Audio/Plug-Ins/Components/CUE SAMPLER.component"
+codesign --verify --deep --strict "$STAGED_VST3"
+xcrun stapler validate "$STAGED_VST3"
+if [ -e "$STAGED_AU" ]; then
+  codesign --verify --deep --strict "$STAGED_AU"
+  xcrun stapler validate "$STAGED_AU"
+fi
+
 # --- Build the component package -------------------------------------------
 echo "==> Building component package..."
 COMPONENT="$STAGE/component.pkg"
@@ -61,6 +88,8 @@ pkgbuild --root "$STAGE/root" \
 echo "==> Building product archive with license..."
 LICENSE="LICENSE.txt"
 [ -e "$LICENSE" ] || { echo "MISSING: $LICENSE (run: sed ... EULA.md > LICENSE.txt)"; exit 1; }
+mkdir -p "$STAGE/resources"
+cp "$LICENSE" "$STAGE/resources/LICENSE.txt"
 DISTXML="$STAGE/distribution.xml"
 cat > "$DISTXML" <<EOF
 <?xml version="1.0" encoding="utf-8"?>
@@ -84,7 +113,7 @@ EOF
 
 productbuild --distribution "$DISTXML" \
   --package-path "$STAGE" \
-  --resources "$(pwd)" \
+  --resources "$STAGE/resources" \
   "$UNSIGNED"
 
 # --- Sign the installer (Developer ID Installer cert) ----------------------
@@ -93,13 +122,14 @@ productsign --sign "$INSTALLER_ID" "$UNSIGNED" "$SIGNED"
 pkgutil --check-signature "$SIGNED"
 
 # --- Notarize + staple the .pkg --------------------------------------------
-echo "==> Notarizing installer (waits for result)..."
-if xcrun notarytool submit "$SIGNED" --keychain-profile "$PROFILE" --wait; then
-  echo "==> Stapling ticket to installer..."
+if [ "$CUE_NOTARIZE" = "1" ]; then
+  echo "==> Notarizing installer (waits for result)..."
+  xcrun notarytool submit "$SIGNED" --keychain-profile "$PROFILE" --wait
   xcrun stapler staple "$SIGNED"
   xcrun stapler validate "$SIGNED"
+  spctl -a -vvv -t install "$SIGNED"
 else
-  echo "WARNING: Notarization submission failed (e.g. pending Apple Developer agreement). The installer is fully code-signed with your Developer ID certificate."
+  echo "==> CUE_NOTARIZE=0 — skipping Apple submission, stapling, and Gatekeeper assessment"
 fi
 
 # --- Emit a SHA-256 sidecar for release/manual integrity verification ---------
@@ -116,4 +146,3 @@ echo "Publish to GitHub Releases (tag drives the version users compare against):
 echo "  gh release create v${VERSION} \\"
 echo "    \"$SIGNED\" \"$SHA_FILE\" \\"
 echo "    --title \"CUE SAMPLER ${VERSION}\" --notes \"...\""
-spctl -a -vvv -t install "$SIGNED" 2>&1 || true

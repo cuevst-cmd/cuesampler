@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.22)
 # `project()` command. `project()` sets up some helpful variables that describe source/binary
 # directories, and the current project version. This is a standard CMake command.
 
-project(CueSampler VERSION 1.0.8)
+project(CueSampler VERSION 1.0.9)
 include(FetchContent)
 find_package(Git REQUIRED)
 
@@ -284,6 +284,15 @@ set(CUE_COPY_IF_EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_if_exists.cmake")
 set(CUE_REMOVE_STALE_ONNX "${CMAKE_CURRENT_SOURCE_DIR}/cmake/remove_stale_onnx_dylibs.cmake")
 
 if(APPLE)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(CUE_LEGAL_DIR "${CMAKE_CURRENT_BINARY_DIR}/release-notices-mac")
+    add_custom_target(CueSampler_Legal
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare_release_legal.py"
+            --build-dir "${CMAKE_CURRENT_BINARY_DIR}" --output "${CUE_LEGAL_DIR}"
+            --juce-source "${juce_SOURCE_DIR}" --bungee-source "${bungee_SOURCE_DIR}"
+            --ort-source "${ONNXRUNTIME_ROOT}"
+        COMMENT "Preparing third-party notices and modified Bungee source"
+        VERBATIM)
     # VST3 (.vst3), AU (.component) and Standalone (.app) all share the bundle
     # layout: TARGET_FILE is Contents/MacOS/<bin>, so Resources is ../Resources
     # and the bundle root is ../.. relative to TARGET_FILE_DIR.
@@ -291,6 +300,15 @@ if(APPLE)
         if(NOT TARGET ${_tgt})
             continue()
         endif()
+
+        add_dependencies(${_tgt} CueSampler_Legal)
+        # Policy changes must relink so POST_BUILD re-seals the updated resources.
+        set_property(TARGET ${_tgt} APPEND PROPERTY LINK_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/EULA.md"
+            "${CMAKE_CURRENT_SOURCE_DIR}/PRIVACY_POLICY.md"
+            "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.txt"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare_release_legal.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/juce_license_files.txt")
 
         # Stem-model copy, built up here so it can be injected into the one
         # POST_BUILD command BEFORE codesign (copy_if_exists skips it if absent).
@@ -327,6 +345,9 @@ if(APPLE)
             # htdemucs model into Resources/htdemucs/ — MUST precede codesign
             # (see ORDERING note above).
             ${_stem_copies}
+
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CUE_LEGAL_DIR}" "$<TARGET_FILE_DIR:${_tgt}>/../Resources/Licenses"
 
             # Patch the binary so it finds libonnxruntime via @loader_path
             COMMAND install_name_tool
@@ -441,6 +462,7 @@ if(CUE_BUILD_STATE_TEST)
     add_test(NAME cue_recall COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --cue-recall)
     add_test(NAME manual_chops COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --manual-chops)
     add_test(NAME waveform_colour COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --waveform-colour)
+    add_test(NAME performance_ui COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --performance-ui)
 endif()
 
 # ── Optional offline StemSeparator test ───────────────────────────────────────

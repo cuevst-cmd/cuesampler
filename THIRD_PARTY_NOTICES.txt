@@ -9,7 +9,8 @@ JUCE 8.0.12
 Source: https://github.com/juce-framework/JUCE/tree/8.0.12
 Licence: Commercial JUCE 8 licence, or AGPLv3 when its requirements are met.
 CUE SAMPLER's commercial binary distribution requires the product owner to
-hold and maintain the appropriate JUCE commercial licence.
+meet the applicable JUCE 8 plan requirements, including free Starter when
+eligible, and maintain the required licence seats and distribution rights.
 
 Bungee, commit 7354c0c62652dd85af90fddfeec307881f3b4252
 Source: https://github.com/bungee-audio-stretch/bungee
@@ -17,13 +18,15 @@ Licence: Mozilla Public License 2.0.
 CUE SAMPLER modifies bungee/Stream.h. The complete corresponding modified
 source, including its versioned submodules, is provided in
 Bungee-7354c0c-modified-source.zip under the MPL 2.0. CUE SAMPLER itself is a
-Larger Work and is not licensed under the MPL.
+Larger Work and is not licensed under the MPL. Submodules retain their own
+licenses; source-file notices identify any different terms.
 
-ONNX Runtime 1.20.1
+ONNX Runtime: macOS 1.18.1; Windows 1.20.1
+Source: https://github.com/microsoft/onnxruntime/tree/v1.18.1
 Source: https://github.com/microsoft/onnxruntime/tree/v1.20.1
 Licence: MIT. See ONNX-Runtime-MIT.txt and its third-party notices.
 
-Microsoft DirectML 1.15.2
+Microsoft DirectML 1.15.2 (Windows only)
 Source: https://www.nuget.org/packages/Microsoft.AI.DirectML/1.15.2
 Licence: Microsoft Software License Terms. See DirectML-LICENSE.txt and its
 third-party notices.
@@ -41,3 +44,13 @@ Licence: MIT. See Demucs-MIT.txt.
 Syne typeface
 Copyright 2017 The Syne Project Authors.
 Licence: SIL Open Font License 1.1. See Syne-OFL-1.1.txt.
+
+Bungee dependencies
+Eigen: see Eigen-COPYING.* and the included source archive for per-file terms.
+pffft / FFTPACK: see PFFFT-LICENSE.txt.
+cxxopts: see Cxxopts-LICENSE.txt (included in the Bungee source distribution).
+
+JUCE bundled dependencies
+See JUCE-Dependencies/ for the applicable upstream notices for the shipped
+audio formats, graphics, fonts, compression, OpenGL, and plugin SDKs.
+Some notices are contained in the accompanying source/header files.

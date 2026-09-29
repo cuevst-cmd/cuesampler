@@ -124,11 +124,6 @@ constexpr int defaultSliceStartFadeSamples = 64;
 constexpr int midiSliceStartFadeSamples = 4;
 constexpr int sliceEndFadeSamples = 16;
 constexpr int midiVoiceReleaseSamples = 32;
-constexpr double autoCueSearchSeconds = 0.20;
-constexpr double autoCueWindowSeconds = 0.002;
-constexpr double autoCuePreRollSeconds = 0.0005;
-constexpr float autoCueRelativePeakThreshold = 0.025f;
-constexpr float autoCueMinimumPeakThreshold = 8.0e-5f;
 constexpr char cueSamplerStateMagic[] = "CSB2";
 
 // Builds that predate removal of the optional data-sharing system may have
@@ -711,54 +706,6 @@ int findLeadingContentStartSample (const AudioPluginAudioProcessor::LoadedSample
         {
             return juce::jmax (startSample, windowStart - preRollSamples);
         }
-    }
-
-    return startSample;
-}
-
-int findAutoCueStartSample (const AudioPluginAudioProcessor::LoadedSampleData& sampleData,
-                            int startSample,
-                            int endSample) noexcept
-{
-    const auto numChannels = sampleData.buffer.getNumChannels();
-    if (numChannels <= 0 || endSample - startSample <= 1 || sampleData.sampleRate <= 0.0)
-        return startSample;
-
-    const auto maxSearchSamples = juce::jmax (1, (int) std::round (sampleData.sampleRate * autoCueSearchSeconds));
-    const auto searchEnd = juce::jmin (endSample, startSample + maxSearchSamples);
-    if (searchEnd <= startSample + 1)
-        return startSample;
-
-    float searchPeak = 0.0f;
-    for (int channel = 0; channel < numChannels; ++channel)
-    {
-        const auto* channelData = sampleData.buffer.getReadPointer (channel);
-        for (int sampleIndex = startSample; sampleIndex < searchEnd; ++sampleIndex)
-            searchPeak = juce::jmax (searchPeak, std::abs (channelData[sampleIndex]));
-    }
-
-    if (searchPeak <= 1.0e-6f)
-        return startSample;
-
-    const auto threshold = juce::jmax (autoCueMinimumPeakThreshold,
-                                       searchPeak * autoCueRelativePeakThreshold);
-    const auto windowSize = juce::jmax (8, (int) std::round (sampleData.sampleRate * autoCueWindowSeconds));
-    const auto preRollSamples = juce::jmax (0, (int) std::round (sampleData.sampleRate * autoCuePreRollSeconds));
-
-    for (int windowStart = startSample; windowStart < searchEnd; windowStart += windowSize)
-    {
-        const auto windowEnd = juce::jmin (windowStart + windowSize, searchEnd);
-        float windowPeak = 0.0f;
-
-        for (int channel = 0; channel < numChannels; ++channel)
-        {
-            const auto* channelData = sampleData.buffer.getReadPointer (channel);
-            for (int sampleIndex = windowStart; sampleIndex < windowEnd; ++sampleIndex)
-                windowPeak = juce::jmax (windowPeak, std::abs (channelData[sampleIndex]));
-        }
-
-        if (windowPeak >= threshold)
-            return juce::jlimit (startSample, endSample - 1, windowStart - preRollSamples);
     }
 
     return startSample;
@@ -4009,6 +3956,7 @@ void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData
             chopTree.setProperty ("startSample", chop.startSample, nullptr);
             chopTree.setProperty ("endSample", chop.endSample, nullptr);
             chopTree.setProperty ("cueOffsetSamples", chop.cueOffsetSamples, nullptr);
+            chopTree.setProperty ("cuePositionNormalized", chop.getCueNormalized(), nullptr);
             chopTree.setProperty ("gainDecibels", chop.gainDecibels, nullptr);
             chopTree.setProperty ("pitchSemitones", chop.pitchSemitones, nullptr);
             chopTree.setProperty ("favorite", chop.favorite, nullptr);
@@ -4176,6 +4124,7 @@ AudioPluginAudioProcessor::parseDeferredRestoreState (const juce::ValueTree& sta
             chop.startSample = (int) chopTree.getProperty ("startSample", 0);
             chop.endSample = (int) chopTree.getProperty ("endSample", 0);
             chop.cueOffsetSamples = (int) chopTree.getProperty ("cueOffsetSamples", 0);
+            chop.cuePositionNormalized = (double) chopTree.getProperty ("cuePositionNormalized", -1.0);
             chop.gainDecibels = juce::jlimit (-24.0f, 12.0f,
                                               (float) (double) chopTree.getProperty ("gainDecibels", 0.0));
             chop.pitchSemitones = juce::jlimit (-12.0f, 12.0f,
@@ -4417,10 +4366,7 @@ void AudioPluginAudioProcessor::completeDeferredSampleRestore (const DeferredRes
         {
             chop.startSample = juce::jlimit (0, totalSamples - 1, chop.startSample);
             chop.endSample = juce::jlimit (chop.startSample + 1, totalSamples, chop.endSample);
-            const auto maxCueOffset = juce::jmax (0, chop.endSample - chop.startSample - 1);
-            // Zero is an intentional cue at the chop start, not an unset value.
-            // Recall must preserve saved cues rather than run onset detection again.
-            chop.cueOffsetSamples = juce::jlimit (0, maxCueOffset, chop.cueOffsetSamples);
+            chop.setCueNormalized (chop.getCueNormalized());
 
             // Drop warp markers that fall outside the (possibly clamped) chop range.
             chop.warpMarkers.erase (std::remove_if (chop.warpMarkers.begin(),
@@ -5682,18 +5628,10 @@ void AudioPluginAudioProcessor::setChopBounds (int chopId, int newStartSample, i
 
     pushEditUndoSnapshot ("chopBounds:" + juce::String (chopId));
 
+    const double cue = chopIt->getCueNormalized();
     chopIt->startSample = clampedStart;
     chopIt->endSample = clampedEnd;
-
-    // The cue is an offset INTO the chop, so it travels with the start marker:
-    // dragging the start earlier or later moves the cue by the same amount and
-    // keeps it in the same relative place. Previously this recomputed the
-    // offset from the cue's absolute source position, which pinned the cue to
-    // the audio and left it stranded while the marker moved out from under it.
-    // Only clamping is applied here, for the case where shrinking the chop
-    // would otherwise leave the cue past the new end.
-    const int newLength = juce::jmax (1, clampedEnd - clampedStart - 1);
-    chopIt->cueOffsetSamples = juce::jlimit (0, newLength, chopIt->cueOffsetSamples);
+    chopIt->setCueNormalized (cue);
 
     chopIt->warpMarkers.erase (std::remove_if (chopIt->warpMarkers.begin(), chopIt->warpMarkers.end(),
                                                [clampedStart, clampedEnd] (const ChopWarpMarker& marker)
@@ -6139,7 +6077,8 @@ void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData&
     newChopState->nextChopId = juce::jmax (existingState != nullptr ? existingState->nextChopId : 1,
                                           stashed != nullptr ? stashed->nextChopId : 1);
 
-    // Per-chop edits follow the AUDIO, not the list position.
+    // Audio-specific edits follow the AUDIO, not the list position.
+    // Cue knob percentages are the exception: they stay with numbered slots.
     //
     // This used to carry edits across by array index, which is only correct
     // when the boundaries do not move. They almost always do. The grid anchor
@@ -6147,7 +6086,7 @@ void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData&
     // chop length scales — so the boundaries at 1 bar are a superset of those
     // at 2, which are a superset of 4, and so on. Going 1 -> 2 bars, new chop k
     // spans old chops 2k and 2k+1, but index matching handed it old chop k:
-    // chop 3's envelope, cue point and warp markers landed on bar 3 when they
+    // chop 3's envelope and warp markers landed on bar 3 when they
     // had been authored against bar 6, and the error grew with k. The same
     // drift hit every other caller that slides the grid — the tempo trim, the
     // start offset and shift-resize all rebuild through here.
@@ -6224,15 +6163,6 @@ void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData&
             {
                 const auto& old = *match;
 
-                // Zero means play from the chop start, including after a grid
-                // edit. Only nonzero cues anchor to a moment in the audio. If
-                // that moment leaves the rebuilt chop, fall back to its start;
-                // rerunning auto-cue here would silently choose a new cue.
-                const int rebasedCue = (old.startSample + old.cueOffsetSamples) - def.startSample;
-                if (old.cueOffsetSamples > 0
-                    && rebasedCue >= 0 && rebasedCue < def.endSample - def.startSample)
-                    def.cueOffsetSamples = rebasedCue;
-
                 def.gainDecibels     = old.gainDecibels;
                 def.pitchSemitones   = old.pitchSemitones;
                 def.favorite         = old.favorite;
@@ -6276,14 +6206,11 @@ void AudioPluginAudioProcessor::buildChopsFromAnalysis (const TempoAnalysisData&
                     }
                 }
             }
-            else
-            {
-                // Onset detection is only for new chops, never a replacement
-                // for an existing chop's cue during tempo/grid edits.
-                const auto autoCueStart = findAutoCueStartSample (*currentSample, startSample, endSample);
-                def.cueOffsetSamples = juce::jlimit (0, endSample - startSample - 1,
-                                                    autoCueStart - startSample);
-            }
+            // Cue knobs belong to the numbered chop slots. Preserve their
+            // percentages even when grid edits change which source audio a
+            // slot covers. Newly added slots start at zero; never auto-cue.
+            const auto slot = newChopState->chops.size();
+            def.setCueNormalized (slot < oldChops.size() ? oldChops[slot].getCueNormalized() : 0.0);
 
             newChopState->chops.push_back (def);
         }
@@ -7246,12 +7173,8 @@ int AudioPluginAudioProcessor::chopAtTransients (TransientSensitivity sensitivit
                                 : totalSamples;
         if (endSample <= startSample)
             continue;
-        const auto autoCueStart  = findAutoCueStartSample (*currentSample, startSample, endSample);
-        const auto autoCueOffset = juce::jlimit (0,
-                                                 juce::jmax (0, endSample - startSample - 1),
-                                                 autoCueStart - startSample);
         newChopState->chops.push_back ({ newChopState->nextChopId++, startSample, endSample,
-                                         autoCueOffset, 0.0f, 0.0f, false, false, {} });
+                                         0, 0.0f, 0.0f, false, false, {} });
     }
 
     if (newChopState->chops.empty())
@@ -7363,9 +7286,7 @@ void AudioPluginAudioProcessor::setSelectedChopCueNormalized (float normalizedVa
         if (chop.id != nextState->selectedChopId)
             continue;
 
-        const auto availableLength = juce::jmax (1, chop.endSample - chop.startSample - 1);
-        chop.cueOffsetSamples = juce::jlimit (0, availableLength,
-                                              (int) std::round (juce::jlimit (0.0f, 1.0f, normalizedValue) * (float) availableLength));
+        chop.setCueNormalized (normalizedValue);
         break;
     }
 

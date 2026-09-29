@@ -2528,6 +2528,44 @@ public:
             g.drawVerticalLine ((int) area.getX() + x, mid - juce::jlimit (0.0f, 1.0f, high) * height,
                                  mid - juce::jlimit (-1.0f, 0.0f, low) * height + 1.0f);
         }
+
+        // Pads are monophonic: selection alone must not put a playhead on a
+        // different (possibly overlapping) chop while the triggered pad plays.
+        if (! processor.isPlaying() || processor.getLastTriggeredChopId() != chop.id)
+            return;
+        const double position = processor.getPlaybackSamplePosition();
+        if (position < begin || position >= end) return;
+
+        const double span = juce::jmax (1, end - begin - 1);
+        double sourcePosition = position;
+        if (! chop.warpMarkers.empty() && sample->sampleRate > 0.0)
+        {
+            cuesampler::WarpMap map;
+            map.build (begin, end, chop.warpMarkers, sample->sampleRate);
+            double localFrames = position - begin;
+            if (chop.reversed)
+            {
+                const double cueFrames = map.localTimeAtSourceSample (begin + chop.cueOffsetSamples)
+                                       * sample->sampleRate;
+                localFrames = span - (localFrames - cueFrames);
+            }
+            sourcePosition = map.sourceSampleAtLocalTime (localFrames / sample->sampleRate);
+        }
+        else if (chop.reversed)
+            sourcePosition = end - 1.0 - (position - begin - chop.cueOffsetSamples);
+
+        // The tile waveform is already mirrored for reverse playback.
+        const double fraction = juce::jlimit (0.0, 1.0,
+            (chop.reversed ? end - 1.0 - sourcePosition : sourcePosition - begin) / span);
+        const float x = area.getX() + (float) fraction * juce::jmax (0.0f, area.getWidth() - 1.0f);
+        juce::Graphics::ScopedSaveState saved (g);
+        g.reduceClipRegion (area.toNearestInt());
+        const auto colour = currentTheme == Theme::light ? juce::Colour (0xff00a33c)
+                                                        : juce::Colour (0xff00c950);
+        g.setColour (colour.withAlpha (0.16f));
+        g.fillRect (juce::Rectangle<float> (x - 3.0f, area.getY(), 6.0f, area.getHeight()));
+        g.setColour (colour);
+        g.drawLine (x, area.getY(), x, area.getBottom(), 2.0f);
     }
 
     ~WaveformDisplayComponent() override
@@ -3759,19 +3797,7 @@ public:
                     juce::jmax (0, (int) std::ceil (loadSweepX - displayBounds.getX())),
                     (int) std::ceil (displayBounds.getHeight())));
 
-            // Subtle glow behind waveform (skip during zoom/scroll animations for performance)
-            if (! isAnimating)
-            {
-                g.setColour (glassText.withAlpha (0.06f));
-                g.strokePath (waveformPath, juce::PathStrokeType (4.0f));
-            }
-
-            setWaveformInk (g, waveformColourStrip, getDisplayBounds().getX(), getDisplayBounds(), 0.55f);
-            g.fillPath (waveformPath);
-
-            // Bright outline
-            setWaveformInk (g, waveformColourStrip, getDisplayBounds().getX(), getDisplayBounds(), 0.85f);
-            g.strokePath (waveformPath, juce::PathStrokeType (1.0f));
+            paintWaveformTrace (g, displayBounds);
 
             // Centre line
             auto centreY = displayBounds.getCentreY();
@@ -3961,6 +3987,41 @@ public:
         }
     }
 
+    void revealChopForEditing (int chopId)
+    {
+        const auto sample = processor.getLoadedSample();
+        const auto state = processor.getChopState();
+        if (sample == nullptr || state == nullptr || sample->buffer.getNumSamples() <= 0) return;
+        const auto chop = std::find_if (state->chops.begin(), state->chops.end(),
+                                       [chopId] (const auto& c) { return c.id == chopId; });
+        if (chop == state->chops.end()) return;
+
+        processor.selectChopById (chopId);
+        setManualAddTool (false);
+        // Fit the entire chop with room for its edge handles, using the inverse
+        // of the logarithmic mapping shared by the waveform and zoom knob.
+        const int total = sample->buffer.getNumSamples();
+        const double span = juce::jlimit (1.0, (double) total,
+            juce::jmax (32.0, (double) (chop->endSample - chop->startSample) * 1.25));
+        const float effective = juce::jlimit (0.0f, 1.0f, (float) (std::log10 ((double) total / span) / 4.0));
+        zoomLevel = targetZoomLevel = effective <= zoomMappedMidpoint
+            ? juce::jmap (effective, 0.0f, zoomMappedMidpoint, 0.0f, zoomResponseMidpoint)
+            : juce::jmap (effective, zoomMappedMidpoint, 1.0f, zoomResponseMidpoint, 1.0f);
+        const int visible = getVisibleRange (total).visibleSamples;
+        const double offset = ((double) chop->startSample + chop->endSample - visible) * 0.5;
+        scrollPosition = targetScrollPosition = total > visible
+            ? juce::jlimit (0.0f, 1.0f, (float) (offset / (double) (total - visible))) : 0.0f;
+        isAnimating = wasAnimating = false;
+        lastObservedChopTriggerRevision = processor.getChopTriggerRevision();
+        setExportTarget (chopId);
+        lastSeenSelectedId = chopId;
+        rebuildWaveformPath();
+        updateHorizontalScrollBar();
+        if (onZoomChanged) onZoomChanged (zoomLevel);
+        if (onScrollChanged) onScrollChanged (scrollPosition);
+        repaint();
+    }
+
     std::function<void(float)> onZoomChanged;
     std::function<void(float)> onScrollChanged;
 
@@ -3997,7 +4058,14 @@ private:
             // scrollBarMoved and fight the SCROLL knob mid-drag.
             updatingHorizontalScrollBar = true;
             const double maxRangeStart = juce::jmax (0.0, 1.0 - visibleProportion);
-            const double currentRangeStart = scrollPosition * maxRangeStart;
+            // The thumb represents the requested position, while the waveform
+            // eases towards it. Never pull the thumb back during a drag.
+            const double currentRangeStart = targetScrollPosition * maxRangeStart;
+            if (horizontalScrollBar.isMouseButtonDown())
+            {
+                updatingHorizontalScrollBar = false;
+                return;
+            }
             horizontalScrollBar.setRangeLimits (0.0, 1.0, juce::dontSendNotification);
             horizontalScrollBar.setCurrentRange (currentRangeStart, visibleProportion, juce::dontSendNotification);
             updatingHorizontalScrollBar = false;
@@ -4468,6 +4536,8 @@ private:
             scrollToChop (triggeredId, true); // Scroll exactly and instantly
         }
 
+        const float previousExportAppear = exportButtonAppear;
+
         // Keep the actions attached to the selected chop. A gesture owns its
         // target until mouse-up even if MIDI changes the current selection.
         {
@@ -4598,8 +4668,18 @@ private:
                 loadAnimPhase = 2.0f;
         }
 
+        const auto nowMs = juce::Time::getMillisecondCounterHiRes();
+        bool refineWarp = false;
+        for (auto& entry : warpedChopRasters)
+            if (entry.second.preview && nowMs >= entry.second.refineAfterMs)
+            {
+                entry.second.preview = false;
+                entry.second.raster.clear();
+                refineWarp = true;
+            }
+
         const auto shouldRepaint = processor.isPlaying() || wasPlayingLastTick
-                                || loadRevealRunning
+                                || loadRevealRunning || refineWarp
                                 || std::abs (currentPlayheadPosition - lastPaintedPlayheadSample) > 0.5
                                 || std::abs (hoverAnimationAlpha - lastPaintedHoverAlpha) > 0.01f
                                 || (isHoveringDisplay && std::abs (hoveredDisplayX - lastPaintedHoverX) > 0.5f)
@@ -4610,7 +4690,7 @@ private:
                                 // when Shift is pressed mid-drag, which can
                                 // happen without any mouse movement.
                                 || (processor.isWarpModeActive() && warpDragChopId >= 0)
-                                || ! getExportButtonBounds().isEmpty() || exportButtonAppear > 0.01f
+                                || std::abs (exportButtonAppear - previousExportAppear) > 0.0001f
                                 || zoomChanged || scrollChanged || vertScaleChanged
                                 || anyChopAnimationActive;
 
@@ -5341,12 +5421,98 @@ private:
     // that maps to that column via the WarpMap and draw min/max from the peak
     // cache. As markers are dragged, the waveform visually compresses and
     // stretches between them — Logic-Flex-Audio style.
+    // Message-thread-only raster layers: animation redraws the playhead and
+    // controls without re-stroking thousands of unchanged waveform segments.
+    struct WaveformRaster
+    {
+        juce::Image image;
+        juce::Rectangle<int> bounds;
+        float scale = 0.0f;
+        Theme theme = currentTheme;
+        juce::Colour panelColour = panelInnerDark, inkColour = glassText;
+
+        void clear() { image = {}; }
+
+        template <typename Paint>
+        void draw (juce::Graphics& g, juce::Rectangle<float> area, Paint&& paint)
+        {
+            const auto pixels = area.getSmallestIntegerContainer();
+            const float deviceScale = juce::jmax (1.0f, g.getInternalContext().getPhysicalPixelScaleFactor());
+            if (image.isNull() || bounds != pixels || std::abs (scale - deviceScale) > 0.001f
+                || theme != currentTheme || panelColour != panelInnerDark || inkColour != glassText)
+            {
+                bounds = pixels;
+                scale = deviceScale;
+                theme = currentTheme;
+                panelColour = panelInnerDark;
+                inkColour = glassText;
+                image = juce::Image (juce::Image::ARGB,
+                    juce::jmax (1, (int) std::ceil ((float) bounds.getWidth() * scale)),
+                    juce::jmax (1, (int) std::ceil ((float) bounds.getHeight() * scale)), true);
+                juce::Graphics cached (image);
+                cached.addTransform (juce::AffineTransform::translation (-(float) bounds.getX(), -(float) bounds.getY())
+                                         .scaled (scale));
+                paint (cached);
+            }
+            g.setOpacity (1.0f);
+            g.drawImageTransformed (image, juce::AffineTransform::scale (1.0f / scale)
+                                       .translated ((float) bounds.getX(), (float) bounds.getY()));
+        }
+    };
+
+    void paintWaveformTrace (juce::Graphics& g, juce::Rectangle<float> bounds)
+    {
+        const auto paintTrace = [this] (juce::Graphics& target)
+        {
+            if (! isAnimating)
+            {
+                target.setColour (glassText.withAlpha (0.06f));
+                target.strokePath (waveformPath, juce::PathStrokeType (4.0f));
+            }
+            setWaveformInk (target, waveformColourStrip, getDisplayBounds().getX(), getDisplayBounds(), 0.55f);
+            target.fillPath (waveformPath);
+            setWaveformInk (target, waveformColourStrip, getDisplayBounds().getX(), getDisplayBounds(), 0.85f);
+            target.strokePath (waveformPath, juce::PathStrokeType (1.0f));
+        };
+        // Scrolling already rebuilds simplified geometry each frame; avoid
+        // allocating a raster that would be discarded on the following tick.
+        if (isAnimating) paintTrace (g);
+        else waveformRaster.draw (g, bounds, paintTrace);
+    }
+
+    struct WarpedChopRaster
+    {
+        WaveformRaster raster;
+        int startSample = -1, endSample = -1;
+        std::vector<AudioPluginAudioProcessor::ChopWarpMarker> markers;
+        bool preview = false;
+        double refineAfterMs = 0.0;
+    };
+
     void paintWarpedChopAudio (juce::Graphics& g, juce::Rectangle<float> displayBounds)
     {
         const auto sampleData = processor.getLoadedSample();
         const auto chopState  = processor.getChopState();
         if (sampleData == nullptr || chopState == nullptr)
             return;
+
+        if (sampleData != warpedRasterSource)
+        {
+            warpedRasterSource = sampleData;
+            warpedChopRasters.clear();
+        }
+        if (chopState != warpedRasterChops)
+        {
+            // Release removed chops; knob/selection edits keep their artwork.
+            for (auto it = warpedChopRasters.begin(); it != warpedChopRasters.end();)
+            {
+                const auto found = std::find_if (chopState->chops.begin(), chopState->chops.end(),
+                    [&] (const auto& chop) { return chop.id == it->first && ! chop.warpMarkers.empty(); });
+                if (found == chopState->chops.end()) it = warpedChopRasters.erase (it);
+                else ++it;
+            }
+            warpedRasterChops = chopState;
+        }
 
         const auto sr = sampleData->sampleRate;
         if (sr <= 0.0)
@@ -5385,122 +5551,159 @@ private:
             if (chopBounds.getWidth() < 2.0f)
                 continue;
 
-            cuesampler::WarpMap warpMap;
-            warpMap.build (chop.startSample, chop.endSample, chop.warpMarkers, sr);
-            const double chopDurationSec = warpMap.totalLocalDurationSeconds();
-            if (chopDurationSec <= 0.0)
-                continue;
-
-            // Mask the linear waveform inside the chop bounds before drawing
-            // the warped one over it.
-            fillRectGradient (g, chopBounds, panelInnerDark.brighter (0.1f), panelInnerDark.darker (0.16f));
-
-            const int leftPx  = (int) std::floor (juce::jmax (chopBounds.getX(), displayBounds.getX()));
-            const int rightPx = (int) std::ceil (juce::jmin (chopBounds.getRight(), displayBounds.getRight()));
-            const float widthPx = chopBounds.getWidth();
-            if (rightPx <= leftPx || widthPx <= 0.0f)
-                continue;
-
-            juce::Image colourStrip;
-            if (hasWaveformColours()) colourStrip = juce::Image (juce::Image::RGB, rightPx - leftPx, 1, false);
-
-            juce::Path topPath;
-            juce::Array<float> bottomYs;
-            bottomYs.ensureStorageAllocated (rightPx - leftPx);
-            bool topStarted = false;
-
-            for (int px = leftPx; px < rightPx; ++px)
+            auto& cached = warpedChopRasters[chop.id];
+            const auto now = juce::Time::getMillisecondCounterHiRes();
+            if (cached.startSample != chop.startSample || cached.endSample != chop.endSample
+                || cached.markers != chop.warpMarkers)
             {
-                const double leftLocal  = (((double) px - chopBounds.getX()) / (double) widthPx) * chopDurationSec;
-                const double rightLocal = (((double) px + 1.0 - chopBounds.getX()) / (double) widthPx) * chopDurationSec;
-                const double srcA = warpMap.sourceSampleAtLocalTime (leftLocal);
-                const double srcB = warpMap.sourceSampleAtLocalTime (rightLocal);
-                const int srcStart = juce::jlimit (0, numSamples - 1, (int) std::floor (juce::jmin (srcA, srcB)));
-                const int srcEnd   = juce::jlimit (srcStart + 1, numSamples, (int) std::ceil (juce::jmax (srcA, srcB)) + 1);
-                if (colourStrip.isValid()) colourStrip.setPixelAt (px - leftPx, 0, waveformColourForSamples (srcStart, srcEnd));
+                // Coalesce rapid marker edits into a min/max preview. Restore
+                // the full-resolution envelope once the gesture settles.
+                cached.preview = cached.startSample >= 0;
+                cached.refineAfterMs = now + 120.0;
+                cached.startSample = chop.startSample;
+                cached.endSample = chop.endSample;
+                cached.markers = chop.warpMarkers;
+                cached.raster.clear();
+            }
+            if (cached.preview && now >= cached.refineAfterMs)
+            {
+                cached.preview = false;
+                cached.raster.clear();
+            }
+            const int pixelStep = (isAnimating || cached.preview) ? 2 : 1;
+            const auto render = [&] (juce::Graphics& target)
+            {
+                cuesampler::WarpMap warpMap;
+                warpMap.build (chop.startSample, chop.endSample, chop.warpMarkers, sr);
+                const double chopDurationSec = warpMap.totalLocalDurationSeconds();
+                if (chopDurationSec <= 0.0)
+                    return;
 
-                float maxVal = 0.0f;
-                float minVal = 0.0f;
+                // Mask the linear waveform inside the chop bounds before drawing
+                // the warped one over it.
+                fillRectGradient (target, chopBounds, panelInnerDark.brighter (0.1f), panelInnerDark.darker (0.16f));
 
-                if (srcEnd - srcStart < cacheBlockSize)
+                const int leftPx  = (int) std::floor (juce::jmax (chopBounds.getX(), displayBounds.getX()));
+                const int rightPx = (int) std::ceil (juce::jmin (chopBounds.getRight(), displayBounds.getRight()));
+                const float widthPx = chopBounds.getWidth();
+                if (rightPx <= leftPx || widthPx <= 0.0f)
+                    return;
+
+                juce::Image colourStrip;
+                if (hasWaveformColours()) colourStrip = juce::Image (juce::Image::RGB, rightPx - leftPx, 1, false);
+
+                juce::Path topPath;
+                juce::Array<float> bottomYs;
+                bottomYs.ensureStorageAllocated (rightPx - leftPx);
+                bool topStarted = false;
+
+                for (int px = leftPx; px < rightPx; px += pixelStep)
                 {
-                    for (int ch = 0; ch < numChannels; ++ch)
+                    const double leftLocal  = (((double) px - chopBounds.getX()) / (double) widthPx) * chopDurationSec;
+                    const double rightLocal = (((double) juce::jmin (rightPx, px + pixelStep) - chopBounds.getX()) / (double) widthPx) * chopDurationSec;
+                    const double srcA = warpMap.sourceSampleAtLocalTime (leftLocal);
+                    const double srcB = warpMap.sourceSampleAtLocalTime (rightLocal);
+                    const int srcStart = juce::jlimit (0, numSamples - 1, (int) std::floor (juce::jmin (srcA, srcB)));
+                    const int srcEnd   = juce::jlimit (srcStart + 1, numSamples, (int) std::ceil (juce::jmax (srcA, srcB)) + 1);
+                    if (colourStrip.isValid())
                     {
-                        auto* data = buffer.getReadPointer (ch);
-                        for (int s = srcStart; s < srcEnd; ++s)
+                        const auto colour = waveformColourForSamples (srcStart, srcEnd);
+                        for (int x = px; x < juce::jmin (rightPx, px + pixelStep); ++x)
+                            colourStrip.setPixelAt (x - leftPx, 0, colour);
+                    }
+
+                    float maxVal = 0.0f;
+                    float minVal = 0.0f;
+
+                    if (srcEnd - srcStart < cacheBlockSize)
+                    {
+                        for (int ch = 0; ch < numChannels; ++ch)
                         {
-                            const auto v = data[s];
-                            if (v > maxVal) maxVal = v;
-                            if (v < minVal) minVal = v;
+                            auto* data = buffer.getReadPointer (ch);
+                            for (int s = srcStart; s < srcEnd; ++s)
+                            {
+                                const auto v = data[s];
+                                if (v > maxVal) maxVal = v;
+                                if (v < minVal) minVal = v;
+                            }
                         }
                     }
-                }
-                else
-                {
-                    const int startBlock = srcStart / cacheBlockSize;
-                    const int endBlock   = (srcEnd  + cacheBlockSize - 1) / cacheBlockSize;
-                    for (int b = startBlock; b < endBlock && b < peakCache.size(); ++b)
+                    else
                     {
-                        const auto range = peakCache.getReference (b);
-                        if (range.getEnd()   > maxVal) maxVal = range.getEnd();
-                        if (range.getStart() < minVal) minVal = range.getStart();
+                        const int startBlock = srcStart / cacheBlockSize;
+                        const int endBlock   = (srcEnd  + cacheBlockSize - 1) / cacheBlockSize;
+                        for (int b = startBlock; b < endBlock && b < peakCache.size(); ++b)
+                        {
+                            const auto range = peakCache.getReference (b);
+                            if (range.getEnd()   > maxVal) maxVal = range.getEnd();
+                            if (range.getStart() < minVal) minVal = range.getStart();
+                        }
+                    }
+
+                    // Clamp to unity (matches the linear waveform path) so hot
+                    // samples can't overflow the window vertically.
+                    maxVal = juce::jlimit (-1.0f, 1.0f, maxVal);
+                    minVal = juce::jlimit (-1.0f, 1.0f, minVal);
+
+                    const auto xPos    = (float) px;
+                    const auto topY    = centreY - maxVal * halfHeight;
+                    const auto bottomY = centreY - minVal * halfHeight;
+
+                    bottomYs.add (bottomY);
+                    if (! topStarted)
+                    {
+                        topPath.startNewSubPath (xPos, topY);
+                        topStarted = true;
+                    }
+                    else
+                    {
+                        topPath.lineTo (xPos, topY);
                     }
                 }
 
-                // Clamp to unity (matches the linear waveform path) so hot
-                // samples can't overflow the window vertically.
-                maxVal = juce::jlimit (-1.0f, 1.0f, maxVal);
-                minVal = juce::jlimit (-1.0f, 1.0f, minVal);
+                juce::Path combined;
+                combined.addPath (topPath);
+                for (int i = bottomYs.size() - 1; i >= 0; --i)
+                    combined.lineTo ((float) (leftPx + i * pixelStep), bottomYs.getReference (i));
+                combined.closeSubPath();
 
-                const auto xPos    = (float) px;
-                const auto topY    = centreY - maxVal * halfHeight;
-                const auto bottomY = centreY - minVal * halfHeight;
+                // Keep the crisp outline, but omit the faint wide glow here:
+                // stroking a dense warped envelope dominates Retina drag frames.
+                setWaveformInk (target, colourStrip, (float) leftPx, displayBounds, 0.55f);
+                target.fillPath (combined);
+                setWaveformInk (target, colourStrip, (float) leftPx, displayBounds, 0.85f);
+                target.strokePath (combined, juce::PathStrokeType (1.0f));
 
-                bottomYs.add (bottomY);
-                if (! topStarted)
+                if (hasWaveformColours() && (processor.getWaveformColourMode() & 2) != 0)
                 {
-                    topPath.startNewSubPath (xPos, topY);
-                    topStarted = true;
+                    const auto& attacks = colourAnalysis->analysis->attacks;
+                    const int firstVisibleSource = (int) warpMap.sourceSampleAtLocalTime (
+                        ((double) leftPx - chopBounds.getX()) / widthPx * chopDurationSec);
+                    const int lastVisibleSource = (int) std::ceil (warpMap.sourceSampleAtLocalTime (
+                        ((double) rightPx - chopBounds.getX()) / widthPx * chopDurationSec));
+                    for (auto it = std::lower_bound (attacks.begin(), attacks.end(), firstVisibleSource);
+                         it != attacks.end() && *it < lastVisibleSource;)
+                    {
+                        const auto localTime = warpMap.localTimeAtSourceSample (*it);
+                        paintAttackTick (target, chopBounds.getX() + (float) (localTime / chopDurationSec) * widthPx, displayBounds);
+                        const int nextSource = juce::jmax (*it + 1,
+                            (int) warpMap.sourceSampleAtLocalTime (localTime + 3.0 / widthPx * chopDurationSec));
+                        it = std::lower_bound (it + 1, attacks.end(), nextSource);
+                    }
                 }
-                else
-                {
-                    topPath.lineTo (xPos, topY);
-                }
-            }
 
-            juce::Path combined;
-            combined.addPath (topPath);
-            for (int i = bottomYs.size() - 1; i >= 0; --i)
-                combined.lineTo ((float) (leftPx + i), bottomYs.getReference (i));
-            combined.closeSubPath();
-
-            g.setColour (glassText.withAlpha (0.06f));
-            g.strokePath (combined, juce::PathStrokeType (4.0f));
-            setWaveformInk (g, colourStrip, (float) leftPx, displayBounds, 0.55f);
-            g.fillPath (combined);
-            setWaveformInk (g, colourStrip, (float) leftPx, displayBounds, 0.85f);
-            g.strokePath (combined, juce::PathStrokeType (1.0f));
-
-            if (hasWaveformColours() && (processor.getWaveformColourMode() & 2) != 0)
+                target.setColour (glassText.withAlpha (0.15f));
+                target.drawHorizontalLine ((int) centreY, chopBounds.getX(), chopBounds.getRight());
+            };
+            if (isAnimating)
             {
-                const auto& attacks = colourAnalysis->analysis->attacks;
-                const int firstVisibleSource = (int) warpMap.sourceSampleAtLocalTime (
-                    ((double) leftPx - chopBounds.getX()) / widthPx * chopDurationSec);
-                const int lastVisibleSource = (int) std::ceil (warpMap.sourceSampleAtLocalTime (
-                    ((double) rightPx - chopBounds.getX()) / widthPx * chopDurationSec));
-                for (auto it = std::lower_bound (attacks.begin(), attacks.end(), firstVisibleSource);
-                     it != attacks.end() && *it < lastVisibleSource;)
-                {
-                    const auto localTime = warpMap.localTimeAtSourceSample (*it);
-                    paintAttackTick (g, chopBounds.getX() + (float) (localTime / chopDurationSec) * widthPx, displayBounds);
-                    const int nextSource = juce::jmax (*it + 1,
-                        (int) warpMap.sourceSampleAtLocalTime (localTime + 3.0 / widthPx * chopDurationSec));
-                    it = std::lower_bound (it + 1, attacks.end(), nextSource);
-                }
+                render (g);
             }
-
-            g.setColour (glassText.withAlpha (0.15f));
-            g.drawHorizontalLine ((int) centreY, chopBounds.getX(), chopBounds.getRight());
+            else
+            {
+                // Include the outline, clipped to the visible display.
+                cached.raster.draw (g, chopBounds.expanded (1.0f, 0.0f).getIntersection (displayBounds), render);
+            }
         }
     }
 
@@ -5879,10 +6082,9 @@ private:
                               ? 0.0f
                               : juce::jlimit (0.0f, 1.0f, (float) (newRangeStart / maxRangeStart));
 
-        scrollPosition = targetScrollPosition = newScroll;
-        rebuildWaveformPath();
-        updateHorizontalScrollBar();
-        repaint();
+        // Coalesce drag events into the same frame-paced animation as wheel
+        // and knob scrolling, including the cheaper path while in motion.
+        setScroll (newScroll);
         if (onScrollChanged)
             onScrollChanged (newScroll);
     }
@@ -5956,6 +6158,10 @@ private:
 
     void rebuildWaveformColourStrip()
     {
+        waveformRaster.clear();
+        warpedChopRasters.clear();
+        warpedRasterChops.reset();
+        warpedRasterSource.reset();
         waveformColourStrip = {};
         if (! hasWaveformColours()) return;
         const auto bounds = getDisplayBounds();
@@ -6159,7 +6365,7 @@ private:
         combined.closeSubPath();
         waveformPath = std::move (combined);
     }
-    
+
     void updatePeakCache()
     {
         requestWaveformColourAnalysis();
@@ -6216,6 +6422,10 @@ private:
     juce::TextButton waveformColourButton;
     int lastWaveformColourMode = -1;
     juce::Path waveformPath;
+    WaveformRaster waveformRaster;
+    std::map<int, WarpedChopRaster> warpedChopRasters;
+    std::shared_ptr<const AudioPluginAudioProcessor::ChopState> warpedRasterChops;
+    std::shared_ptr<const AudioPluginAudioProcessor::LoadedSampleData> warpedRasterSource;
     juce::Array<juce::Range<float>> peakCache;
     std::shared_ptr<const AudioPluginAudioProcessor::LoadedSampleData> peakCacheSource;
     const int cacheBlockSize = 256;
@@ -6338,16 +6548,32 @@ public:
         : processor (p), waveforms (waveform), grid (*this)
     {
         addAndMakeVisible (grid);
+        configureButton (editChopButton, "EDIT CHOP", juce::Colour (0xffff2db1));
+        editChopButton.getProperties().set ("cueStyle", "segment");
+        editChopButton.getProperties().set ("cueAccent", (int) juce::Colour (0xffff2db1).getARGB());
+        editChopButton.setTooltip ("Open the selected favorite at its original location in the waveform for editing.");
+        editChopButton.onClick = [this]
+        {
+            const int id = selectedFavoriteId();
+            if (id < 0 || ! processor.isFavoritesViewEnabled()) return;
+            grid.releaseNote();
+            if (onEditChop) onEditChop (id);
+        };
+        addAndMakeVisible (editChopButton);
         triggerRevision = processor.getChopTriggerRevision();
-        startTimerHz (30);
+        animHz = animationFrameRateHz();
+        startTimerHz (animHz);
     }
     ~FavoritesViewComponent() override { stopTimer(); grid.releaseNote(); }
+
+    std::function<void(int)> onEditChop;
 
     void refresh()
     {
         const auto state = processor.getChopState();
         const auto count = state != nullptr ? state->favoriteChopIndices.size() : 0;
         if (! processor.isFavoritesViewEnabled()) grid.releaseNote();
+        refreshEditButton();
         // Keep a familiar six-column lineup at the default size, then wrap.
         // Dense collections gain columns as needed to retain waveform space.
         grid.columns = juce::jlimit (1, juce::jmax (1, (int) count), grid.getWidth() / 180);
@@ -6362,6 +6588,7 @@ public:
     }
     void resized() override
     {
+        editChopButton.setBounds (getWidth() - 144, 10, 120, 24);
         grid.setBounds (getLocalBounds().reduced (16).withTrimmedTop (30));
         refresh();
     }
@@ -6376,7 +6603,7 @@ public:
         g.setColour (textMuted);
         g.setFont (monoFont (10));
         g.drawText (count > 92 ? "FIRST 92 FAVORITES HAVE MIDI KEYS (C2–G9)" : "FAVORITE ORDER  /  MIDI FROM C2",
-                    250, 10, juce::jmax (0, getWidth() - 278), 24, juce::Justification::centredRight);
+                    250, 10, juce::jmax (0, getWidth() - 410), 24, juce::Justification::centredRight);
         if (count == 0)
         {
             g.setColour (textPrimary);
@@ -6389,6 +6616,16 @@ public:
         }
     }
 private:
+    int selectedFavoriteId() const
+    {
+        const auto state = processor.getChopState();
+        if (state != nullptr)
+            for (const auto& chop : state->chops)
+                if (chop.favorite && chop.id == state->selectedChopId) return chop.id;
+        return -1;
+    }
+    void refreshEditButton() { editChopButton.setEnabled (selectedFavoriteId() >= 0); }
+
     struct Grid final : juce::Component
     {
         explicit Grid (FavoritesViewComponent& v) : owner (v) {}
@@ -6460,25 +6697,23 @@ private:
             const int id = chopAt (e.position);
             if (id < 0) return;
             owner.processor.selectChopById (id);
+            owner.refreshEditButton();
             pressedNote = owner.processor.getMidiNoteForChopId (id);
             if (pressedNote >= 0) owner.processor.keyboardState.noteOn (1, pressedNote, 1.0f);
         }
         void mouseUp (const juce::MouseEvent&) override { releaseNote(); }
-        void mouseDoubleClick (const juce::MouseEvent& e) override
-        {
-            if (! e.mods.isLeftButtonDown()) return;
-            releaseNote();
-            const int id = chopAt (e.position);
-            if (id < 0) return;
-            owner.processor.selectChopById (id);
-            owner.processor.toggleSelectedChopFavorite();
-            owner.refresh();
-        }
+        // Double-clicks audition through mouseDown/mouseUp like any other pad
+        // press. Favorite membership is edited only in the waveform view.
         FavoritesViewComponent& owner;
     };
     void timerCallback() override
     {
         if (! isShowing()) return;
+        if (const int hz = animationFrameRateHz(); hz != animHz)
+        {
+            animHz = hz;
+            startTimerHz (animHz);
+        }
         const auto revision = processor.getChopTriggerRevision();
         if (revision != triggerRevision)
         {
@@ -6491,7 +6726,9 @@ private:
     AudioPluginAudioProcessor& processor;
     WaveformDisplayComponent& waveforms;
     Grid grid;
+    juce::TextButton editChopButton;
     uint64_t triggerRevision = 0;
+    int animHz = 60;
     bool wasPlaying = false;
 };
 
@@ -7068,8 +7305,7 @@ private:
             return;
         }
 
-        const auto chopLength = juce::jmax (1, selectedChop->endSample - selectedChop->startSample - 1);
-        const auto cuePercent = (double) selectedChop->cueOffsetSamples / (double) chopLength * 100.0;
+        const auto cuePercent = selectedChop->getCueNormalized() * 100.0;
         cueKnob.getSlider().setValue (cuePercent, juce::dontSendNotification);
         gainKnob.getSlider().setValue ((double) selectedChop->gainDecibels, juce::dontSendNotification);
         pitchKnob.getSlider().setValue ((double) selectedChop->pitchSemitones, juce::dontSendNotification);
@@ -8123,6 +8359,12 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
 
     favoritesViewComponent = std::make_unique<cue::FavoritesViewComponent> (processorRef, *waveformDisplayComponent);
     contentComponent.addChildComponent (*favoritesViewComponent);
+    favoritesViewComponent->onEditChop = [this] (int chopId)
+    {
+        processorRef.setFavoritesViewEnabled (false);
+        waveformDisplayComponent->revealChopForEditing (chopId);
+        refreshFavoritesView();
+    };
     cue::configureButton (favoritesButton, "FAVORITES", juce::Colour (0xffff2db1));
     favoritesButton.getProperties().set ("cueStyle", "segment");
     favoritesButton.getProperties().set ("cueAccent", (int) juce::Colour (0xffff2db1).getARGB());
@@ -8142,10 +8384,6 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     cueOrbComponent->setBackgroundColour (cue::shellDark);
     contentComponent.addAndMakeVisible (*cueOrbComponent);
 
-    panelShadowEffect.setShadowProperties (defaultShadow);
-    waveformDisplayComponent->setComponentEffect (&panelShadowEffect);
-    transportSectionComponent->setComponentEffect (&panelShadowEffect);
-    stemRackComponent->setComponentEffect (&panelShadowEffect);
 
     helpOverlayComponent = std::make_unique<cue::HelpOverlayComponent>();
     contentComponent.addChildComponent (*helpOverlayComponent); // invisible by default
@@ -8290,6 +8528,7 @@ AudioPluginAudioProcessorEditor::~AudioPluginAudioProcessorEditor()
 void AudioPluginAudioProcessorEditor::refreshFavoritesView()
 {
     const bool enabled = processorRef.isFavoritesViewEnabled();
+    const bool viewChanged = waveformDisplayComponent->isVisible() == enabled;
     favoritesButton.setToggleState (enabled, juce::dontSendNotification);
     waveformDisplayComponent->setVisible (! enabled);
     waveformFooterComponent->getZoomSlider().setEnabled (! enabled);
@@ -8297,9 +8536,13 @@ void AudioPluginAudioProcessorEditor::refreshFavoritesView()
     if (favoritesViewComponent != nullptr)
     {
         favoritesViewComponent->setVisible (enabled);
-        favoritesViewComponent->refresh();
+        if (enabled) favoritesViewComponent->refresh();
     }
-    repaint();
+    if (viewChanged) repaint();
+    else
+        // Mode changes and host recall also update the guide above the panel.
+        repaint (juce::Rectangle<float> (0.0f, 84.0f, (float) getUiFluidWidth(), 20.0f)
+                     .transformedBy (juce::AffineTransform::scale (getUiScale())).getSmallestIntegerContainer());
 }
 
 void AudioPluginAudioProcessorEditor::timerCallback()
@@ -8451,6 +8694,13 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
     // whole window (fillAll above); no faceplate plate, no side rails — the
     // core and the FX rack share one surface and one scale.
 
+    // These panels have fixed opaque silhouettes. Drawing their shadows here
+    // avoids a full-panel alpha extraction and blur on every child repaint.
+    if (waveformDisplayComponent->isVisible())
+        defaultShadow.drawForRectangle (g, waveformDisplayComponent->getBounds().reduced (1));
+    defaultShadow.drawForRectangle (g, transportSectionComponent->getBounds().reduced (1));
+    defaultShadow.drawForRectangle (g, stemRackComponent->getBounds().reduced (1));
+
     // Chassis plate for the on-screen MIDI keyboard along the bottom strip.
     {
         auto keyboardPanel = juce::Rectangle<float> (10.0f, 584.0f, fluidW - 20.0f, 68.0f);
@@ -8468,7 +8718,7 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
     // markers, and grid lines can never obscure it.
     cue::drawHelperText (g,
                          processorRef.isFavoritesViewEnabled()
-                             ? "Click: play/select   Double-click: remove favorite   Order: left to right, top to bottom"
+                             ? "Click: play/select   EDIT CHOP: open in waveform   Order: left to right, top to bottom"
                              : processorRef.isManualChopModeActive()
                              ? "ADD CHOP: click start / end   EDIT: select + audition   Drag S / E: trim   Escape: cancel"
                              : "Click chop: preview   DRAG AUDIO: export to DAW   Drag edge: resize   Shift-drag: tempo",

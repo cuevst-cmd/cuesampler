@@ -27,6 +27,8 @@ BeatThisAnalyzer::BeatThisAnalyzer (const juce::String& onnxModelPath)
     try
     {
         ortEnv     = std::make_unique<Ort::Env> (ORT_LOGGING_LEVEL_WARNING, "BeatThis");
+        // Configure diagnostics before any model/session work, off the audio thread.
+        ortEnv->DisableTelemetryEvents();
         ortOptions = std::make_unique<Ort::SessionOptions>();
         ortOptions->SetIntraOpNumThreads (1);
         ortOptions->SetGraphOptimizationLevel (GraphOptimizationLevel::ORT_ENABLE_ALL);

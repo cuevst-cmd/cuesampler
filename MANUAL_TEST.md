@@ -45,9 +45,14 @@ prefixed `StemSeparator:`.
       directions and back. Select each chop: its cue stays at its new start and reads 0%.
 - [ ] Repeat with **2x**, bars-per-chop changes, and Shift-dragging a chop edge.
       Zero cues stay at the chop starts, including chops with silent lead-ins.
-- [ ] Set a nonzero cue, then nudge the grid: the cue stays on the same source audio
-      while that position remains inside the rebuilt chop. If it falls outside, the cue
-      resets to 0%. Undo restores the previous grid and cue; save/reopen preserves them.
+- [ ] Set several different nonzero CUE percentages. Tempo, grid, 2x, bar changes,
+      and either kind of boundary resize keep each surviving numbered chop's
+      percentage unchanged. Audio starts at that percentage of the new bounds.
+- [ ] Load audio with silent lead-ins and create transient chops: all new cues
+      start at 0%. Only moving the CUE knob changes its setting.
+- [ ] Save/reopen including very short chops and the inactive manual/automatic
+      layer: exact knob values persist. Older sessions retain their saved cue
+      offsets; any previously auto-generated offsets remain until manually reset.
 
 ## Manual chopping
 - [ ] Press **CHOP MANUALLY** after automatic chops exist. The waveform immediately becomes
@@ -378,9 +383,14 @@ Undo, fine trim, manual chops, saved-state recall and older-state defaults.
 - [ ] Click/hold a tile in GATE mode, then release it. Try ONE SHOT and hardware
       MIDI too. Cue, gain, pitch, reverse, warp and stem settings still belong
       to the original chops. This view does not concatenate or rewrite audio.
-- [ ] Double-click a tile to unfavorite it. Remaining assignments close the gap.
-      Undo restores its position. Re-favorite a removed chop from the full view:
-      it goes to the end. Remapping while holding a key must not leave a stuck note.
+- [ ] Double-click tiles repeatedly: they audition without changing favorite
+      membership, order or MIDI assignments. Toggle Favorites off to add/remove
+      favorites by double-clicking in the regular waveform view. Re-favoriting
+      appends to the lineup; Undo restores the removed favorite's position.
+- [ ] Play every tile using mouse and MIDI. A green playhead moves through the
+      active tile, resets on loops/retriggers, and disappears when playback stops.
+      Check cue offsets, reverse, warp, ONE SHOT and host sync. Selecting another
+      tile or having overlapping source chops must not move/duplicate the playhead.
 - [ ] Toggle Favorites off. Original explicit MIDI assignments, unassigned chops,
       octave offset, full waveform zoom/scroll and source boundaries return.
       In Favorites, octave and waveform-editing controls are disabled; favorite
@@ -393,7 +403,7 @@ Undo, fine trim, manual chops, saved-state recall and older-state defaults.
       chronology use sample order initially; new favorite actions record order.
 - [ ] With 8, 18 and 24 favorites, verify every tile fits on screen in rows.
       Resize the window: labels and waveforms stay inside their tiles. Play and
-      remove tiles in each row; gaps and empty cells must not trigger a chop.
+      audition tiles in each row; gaps and empty cells must not trigger a chop.
       The first 92 favorites map from MIDI 36 (C2) through 127 (G9); additional
       tiles explicitly display NO MIDI. Favorites are taken from the active chop
       layout; switch the manual/automatic layout in the full view.
@@ -401,6 +411,15 @@ Undo, fine trim, manual chops, saved-state recall and older-state defaults.
 `test_project_restore` checks chronology, the real Favorites button, C2 MIDI
 triggering, original-pin suppression/restoration, original audio/settings,
 held-voice reset on remap, removal/re-add, Undo, portable recall and old states.
+
+## Waveform scrollbar
+
+- [ ] Zoom in and drag the horizontal scrollbar slowly, quickly and back and forth.
+      The waveform eases smoothly as with wheel scrolling; the thumb stays under
+      the pointer without being pulled backward by the animation.
+- [ ] Release at either end and midway. The waveform settles at the requested
+      position and the SCROLL knob agrees. Check track clicks, wheel scrolling,
+      SCROLL knob movement, zoom changes and resizing the window too.
 
 ## Explicit chop export handle
 - [ ] Selecting a chop shows separate **ADSR** and **DRAG AUDIO** controls. They
@@ -427,3 +446,32 @@ held-voice reset on remap, removal/re-add, Undo, portable recall and old states.
 - [ ] After dragging a knob, Option-click and move the mouse before release:
       the reset value stays put. Normal dragging still works on the next gesture.
 - [ ] Knob tooltips name the platform's reset modifier. Double-click also resets.
+
+## Chop editing frame budget
+
+- [ ] With a long stereo sample and 32+ chops, audition while dragging CUE,
+      gain, pitch and ADSR; playhead and hover animation should stay smooth.
+- [ ] Warp several chops, then drag one marker. Only that chop's waveform
+      changes; removing markers and undoing edits must not leave stale artwork.
+- [ ] Repeat on a Retina display, resize the editor, scroll/zoom, change theme,
+      and cycle waveform colour modes. Check waveform sharpness and alignment.
+- [ ] Check panel shadows and favorites switching; the favorites playhead must
+      still animate and double-clicking a favorite must not remove it.
+- CPU paint benchmark (opt-in, no timing assertions in CI): run
+  `build/test_project_restore_artefacts/Release/test_project_restore build --ui-benchmark`.
+  Uses deterministic 60-second stereo audio and 32 chops at 1x/2x resolution.
+  Scenarios: 0 = cue edits, 1 = cue edits on warped chops, 2 = all warp maps
+  changing (stress), 3 = one warp map changing. Reports warm mean/p95/max paint
+  milliseconds. The 60 FPS budget is 16.67 ms for the entire UI frame; this
+  benchmark measures waveform component CPU painting, not host presentation FPS.
+
+
+## Edit a favorite in the waveform
+
+- [ ] In Favorites, select a chop and click EDIT CHOP in the header. The main
+      waveform opens with that original chop selected and both edges in view.
+- [ ] Repeat with favorites added out of source order, a chop near the sample
+      end, a very short chop, and a manual chop. CUE/gain/ADSR edits should affect
+      the correct original chop, and Favorites should retain its order.
+- [ ] With no favorites (or no selected favorite), EDIT CHOP is disabled.
+      Double-clicking a favorite still auditions without removing it.

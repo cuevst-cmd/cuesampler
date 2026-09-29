@@ -197,6 +197,8 @@ StemSeparator::StemSeparator (const ModelPaths& paths)
     try
     {
         ortEnv     = std::make_unique<Ort::Env> (ORT_LOGGING_LEVEL_WARNING, "StemSeparator");
+        // Configure diagnostics before any model/session work, off the audio thread.
+        ortEnv->DisableTelemetryEvents();
         ortOptions = std::make_unique<Ort::SessionOptions>();
 
         // Offline pass on a single below-realtime thread. On Apple Silicon this

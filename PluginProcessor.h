@@ -12,6 +12,7 @@
 
 #include <array>
 #include <bitset>
+#include <cmath>
 #include <atomic>
 #include <memory>
 #include <functional>
@@ -101,6 +102,21 @@ public:
         float sustainLevel = 1.0f;
         float releaseMilliseconds = 5.0f;
         int64_t favoriteOrder = 0; // creation order, independent of source position
+
+        // The knob value is authoritative; the sample offset is derived on the
+        // editing thread. Negative means an older in-memory/sample-offset cue.
+        double cuePositionNormalized = -1.0;
+        double getCueNormalized() const noexcept
+        {
+            return std::isfinite (cuePositionNormalized) && cuePositionNormalized >= 0.0
+                ? juce::jlimit (0.0, 1.0, cuePositionNormalized)
+                : juce::jlimit (0.0, 1.0, (double) cueOffsetSamples / juce::jmax (1, endSample - startSample - 1));
+        }
+        void setCueNormalized (double value) noexcept
+        {
+            cuePositionNormalized = std::isfinite (value) ? juce::jlimit (0.0, 1.0, value) : 0.0;
+            cueOffsetSamples = (int) std::round (cuePositionNormalized * juce::jmax (0, endSample - startSample - 1));
+        }
     };
 
     // The single authority on which MIDI note plays which chop.
