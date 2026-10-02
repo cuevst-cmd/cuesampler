@@ -22,21 +22,30 @@ Unicode true
   !define MyBuildDir "build"
 !endif
 
-Name "${APP_NAME} ${MyAppVersion}"
-OutFile "dist\CUESAMPLER-Setup-${MyAppVersion}.exe"
+!ifndef MySetupFile
+  !define MySetupFile "dist\CUESAMPLER-Setup-${MyAppVersion}.exe"
+!endif
+!ifdef MyAppBeta
+  !define APP_CHANNEL_SUFFIX " Beta"
+!else
+  !define APP_CHANNEL_SUFFIX ""
+!endif
+
+Name "${APP_NAME} ${MyAppVersion}${APP_CHANNEL_SUFFIX}"
+OutFile "${MySetupFile}"
 InstallDir "$PROGRAMFILES64\${APP_PUBLISHER}\${APP_NAME}"
 InstallDirRegKey HKLM "${UNINSTALL_KEY}" "InstallLocation"
 RequestExecutionLevel admin
 ManifestSupportedOS Win10
 SetCompressor /SOLID lzma
 SetCompressorDictSize 64
-BrandingText "${APP_NAME} Setup"
+BrandingText "${APP_NAME}${APP_CHANNEL_SUFFIX} Setup"
 
 VIProductVersion "${MyAppVersion}.0"
-VIAddVersionKey /LANG=1033 "ProductName" "${APP_NAME}"
+VIAddVersionKey /LANG=1033 "ProductName" "${APP_NAME}${APP_CHANNEL_SUFFIX}"
 VIAddVersionKey /LANG=1033 "ProductVersion" "${MyAppVersion}"
 VIAddVersionKey /LANG=1033 "CompanyName" "${APP_PUBLISHER}"
-VIAddVersionKey /LANG=1033 "FileDescription" "${APP_NAME} Setup"
+VIAddVersionKey /LANG=1033 "FileDescription" "${APP_NAME}${APP_CHANNEL_SUFFIX} Setup"
 VIAddVersionKey /LANG=1033 "FileVersion" "${MyAppVersion}"
 VIAddVersionKey /LANG=1033 "LegalCopyright" "${APP_COPYRIGHT}"
 
@@ -123,7 +132,7 @@ Section "CUE SAMPLER VST3" SEC_VST3
   File "THIRD_PARTY_NOTICES.txt"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
-  WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayName" "${APP_NAME}"
+  WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayName" "${APP_NAME}${APP_CHANNEL_SUFFIX}"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayVersion" "${MyAppVersion}"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "Publisher" "${APP_PUBLISHER}"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "URLInfoAbout" "${APP_URL}"

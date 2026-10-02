@@ -3,6 +3,8 @@
 #
 # Development build:
 #   .\make-installer-windows.ps1 [-Version "1.0.7"] [-BuildDir "build"]
+# Beta build (labels the installer UI and output filename):
+#   .\make-installer-windows.ps1 -BuildDir "build-win-1.0.9" -Beta
 # Commercial release (requires confirmed JUCE plan eligibility and a trusted certificate):
 #   .\make-installer-windows.ps1 -CommercialRelease `
 #       -JuceLicenseEligibilityConfirmed `
@@ -13,6 +15,7 @@
 param (
     [string]$Version = "",
     [string]$BuildDir = "build",
+    [switch]$Beta,
     [switch]$CommercialRelease,
     [Alias("JuceCommercialLicenseConfirmed")]
     [switch]$JuceLicenseEligibilityConfirmed,
@@ -316,11 +319,16 @@ if (-not (Test-Path "dist")) {
 
 # --- 7. Compile the Installer ---
 Write-Host "==> Compiling installer..."
+$artifactVersion = $Version
+if ($Beta) { $artifactVersion += "-BETA" }
+$compiledSetupFile = "dist\CUESAMPLER-Setup-$artifactVersion.exe"
 $compilerArgs = @(
     "/WX",
     "/DMyAppVersion=$Version",
+    "/DMySetupFile=$compiledSetupFile",
     "/DMyBuildDir=$BuildDir"
 )
+if ($Beta) { $compilerArgs += "/DMyAppBeta=1" }
 
 if ($CommercialRelease) {
     # The final Setup.exe is signed after compilation below. The embedded
@@ -367,11 +375,10 @@ if ($compilerExitCode -ne 0) {
     Write-Error "NSIS failed with exit code $compilerExitCode."
 }
 
-$compiledSetupFile = "dist\CUESAMPLER-Setup-$Version.exe"
 if ($CommercialRelease) {
     $setupFile = $compiledSetupFile
 } else {
-    $setupFile = "dist\CUESAMPLER-Setup-$Version-UNSIGNED.exe"
+    $setupFile = "dist\CUESAMPLER-Setup-$artifactVersion-UNSIGNED.exe"
     if (-not (Test-Path $compiledSetupFile -PathType Leaf)) {
         Write-Error "Compiled installer executable was not found at: $compiledSetupFile"
     }

@@ -101,17 +101,19 @@ Use SDK tools such as `dumpbin /headers` on the inner plugin binary to confirm x
 ## 4. Package an unsigned development candidate
 
 ```powershell
-.\make-installer-windows.ps1 -BuildDir build-win-1.0.9 -Version 1.0.9
+.\make-installer-windows.ps1 -BuildDir build-win-1.0.9 -Version 1.0.9 -Beta
 ```
 
 Expected outputs:
 
 ```text
-dist\CUESAMPLER-Setup-1.0.9-UNSIGNED.exe
-dist\CUESAMPLER-Setup-1.0.9-UNSIGNED.exe.sha256
+dist\CUESAMPLER-Setup-1.0.9-BETA-UNSIGNED.exe
+dist\CUESAMPLER-Setup-1.0.9-BETA-UNSIGNED.exe.sha256
 ```
 
 The wrapper checks project/binary versions, stages runtime prerequisites and legal resources, verifies the Microsoft VC++ x64 redistributable's publisher signature, invokes NSIS with warnings treated as errors, and generates the checksum. Use this wrapper instead of calling `makensis` directly.
+
+`-Beta` adds the beta designation to the setup window, executable metadata, Installed Apps entry, and artifact filename while retaining numeric product version 1.0.9. It does not change signing requirements or the plugin's install path/identity.
 
 Inspect `build-win-1.0.9\release-notices`, including the policies, dependency notices, and `Bungee-7354c0c-modified-source.zip`. Check that the ZIP includes the actual patched Bungee source and needed submodules, without Git metadata. Inspect the rendered installer license for correct text and UTF-8 punctuation.
 
@@ -138,6 +140,7 @@ After validation, use the real certificate thumbprint:
 
 ```powershell
 .\make-installer-windows.ps1 -BuildDir build-win-1.0.9 -Version 1.0.9 `
+  -Beta `
   -CommercialRelease `
   -JuceLicenseEligibilityConfirmed `
   -SigningCertificateThumbprint '<REAL_CERTIFICATE_SHA1_THUMBPRINT>'
@@ -148,8 +151,8 @@ The script signs the plugin, signs the embedded uninstaller during NSIS compilat
 Expected signed outputs:
 
 ```text
-dist\CUESAMPLER-Setup-1.0.9.exe
-dist\CUESAMPLER-Setup-1.0.9.exe.sha256
+dist\CUESAMPLER-Setup-1.0.9-BETA.exe
+dist\CUESAMPLER-Setup-1.0.9-BETA.exe.sha256
 ```
 
 Install this exact signed candidate and verify the installed plugin and `Uninstall.exe` signatures with `Get-AuthenticodeSignature` and SDK `signtool verify /pa /all /tw`. Recheck the installed payload and DAW loading after final packaging. Compare `Get-FileHash -Algorithm SHA256` against the final sidecar; signing changes the installer bytes, so an earlier hash is invalid.

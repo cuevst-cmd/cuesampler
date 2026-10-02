@@ -9,6 +9,7 @@ Thumbs.db
 
 # C++ / CMake Build directories
 build/
+build-win-*/
 cmake-build-*/
 out/
 bin/
