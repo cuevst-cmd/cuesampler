@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.22)
 # `project()` command. `project()` sets up some helpful variables that describe source/binary
 # directories, and the current project version. This is a standard CMake command.
 
-project(CueSampler VERSION 1.0.9)
+project(CueSampler VERSION 1.1.0)
 include(FetchContent)
 find_package(Git REQUIRED)
 
@@ -167,6 +167,16 @@ juce_add_plugin(CueSampler
                                                 # GarageBand 10.3 requires the first letter to be upper-case, and the remaining letters to be lower-case
     FORMATS AU VST3 Standalone                  # The formats to build. Other valid formats are: AAX Unity VST AU AUv3
     PRODUCT_NAME "CUE SAMPLER")                 # The name of the final executable, which can differ from the target name
+
+# JUCE 8.0.12's Windows resource command omits its version-info input dependency.
+# Regenerate the PE version resource when reconfiguring an existing build for a
+# new release, so the binary version matches PROJECT_VERSION and the installer.
+if(WIN32)
+    get_target_property(_cue_generated_code CueSampler JUCE_GENERATED_SOURCES_DIRECTORY)
+    get_target_property(_cue_info_file CueSampler JUCE_INFO_FILE)
+    add_custom_command(OUTPUT "${_cue_generated_code}/CueSampler_resources.rc"
+        APPEND DEPENDS "${_cue_info_file}")
+endif()
 
 # `juce_generate_juce_header` will create a JuceHeader.h for a given target, which will be generated
 # into your build tree. This should be included with `#include <JuceHeader.h>`. The include path for
