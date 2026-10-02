@@ -3,6 +3,7 @@
 
 // ONNX Runtime C++ API (same bundled runtime as BeatThisAnalyzer).
 #include <onnxruntime_cxx_api.h>
+#include <onnxruntime_session_options_config_keys.h>
 
 #if defined(__APPLE__)
  #include <coreml_provider_factory.h>
@@ -48,7 +49,14 @@ namespace
             return juce::jlimit (1, 32, perfCores);
        #endif
 
+       #if defined(_WIN32)
+        // Leave CPU headroom for the message thread, host and audio playback.
+        // ORT owns its own workers; moving the caller off the UI thread alone
+        // does not prevent inference from saturating a Windows machine.
+        return (int) juce::jlimit (1u, 4u, std::thread::hardware_concurrency() / 2);
+       #else
         return (int) juce::jlimit (1u, 16u, std::thread::hardware_concurrency());
+       #endif
     }
 
 
@@ -201,12 +209,18 @@ StemSeparator::StemSeparator (const ModelPaths& paths)
         ortEnv->DisableTelemetryEvents();
         ortOptions = std::make_unique<Ort::SessionOptions>();
 
-        // Offline pass on a single below-realtime thread. On Apple Silicon this
-        // defaults to the performance-core count (see chooseIntraOpThreads); other
-        // platforms use all logical cores capped at 16. Tune via CUE_STEM_THREADS.
+        // On Apple Silicon use performance cores; on Windows reserve CPU
+        // headroom for the UI/host (see chooseIntraOpThreads). CUE_STEM_THREADS
+        // remains an explicit override for benchmarking.
         const int nThreads = chooseIntraOpThreads();
         ortOptions->SetIntraOpNumThreads (nThreads);
         ortOptions->SetGraphOptimizationLevel (GraphOptimizationLevel::ORT_ENABLE_ALL);
+       #if defined(_WIN32)
+        // Idle ORT workers otherwise spin between operators at normal priority,
+        // competing with UI rendering even though the caller is a background job.
+        ortOptions->AddConfigEntry (kOrtSessionOptionsConfigAllowIntraOpSpinning, "0");
+        ortOptions->AddConfigEntry (kOrtSessionOptionsConfigAllowInterOpSpinning, "0");
+       #endif
         juce::Logger::writeToLog ("StemSeparator: intra-op threads = " + juce::String (nThreads));
 
 #if defined(__APPLE__)
@@ -241,15 +255,19 @@ StemSeparator::StemSeparator (const ModelPaths& paths)
 #endif
 
 #if defined(_WIN32)
-        // DirectML execution provider — runs the htdemucs graph on any DX12 GPU
-        // (NVIDIA/AMD/Intel), ~10x faster than the CPU path (which, in a VM, may
-        // see only a handful of cores). ON by default; set CUE_DISABLE_DIRECTML=1
-        // to force CPU (headless/CI, or to A/B). The DML EP has two hard
+        // DirectML shares the display GPU with the editor and Windows compositor.
+        // HTDemucs can monopolise it throughout processing or trigger TDR; a
+        // successful load-time probe does not guarantee responsive rendering.
+        // Use CPU by default. CUE_ENABLE_DIRECTML=1 explicitly opts into GPU
+        // inference; the existing CUE_DISABLE_DIRECTML override takes precedence.
+        // The DML EP has two hard
         // requirements: memory pattern OFF and SEQUENTIAL execution mode (it does
         // not support ORT's parallel mem-pattern planner). loadModel still retries
         // on CPU if the DML session fails to build, and runModel guards against
         // non-finite GPU output (an earlier CoreML attempt on this model NaN'd).
-        if (std::getenv ("CUE_DISABLE_DIRECTML") == nullptr)
+        const auto* enableDirectML = std::getenv ("CUE_ENABLE_DIRECTML");
+        if (enableDirectML != nullptr && std::string (enableDirectML) == "1"
+            && std::getenv ("CUE_DISABLE_DIRECTML") == nullptr)
         {
             try
             {
@@ -289,7 +307,7 @@ StemSeparator::StemSeparator (const ModelPaths& paths)
         }
         else
         {
-            juce::Logger::writeToLog ("StemSeparator: DirectML disabled (CUE_DISABLE_DIRECTML), using CPU");
+            juce::Logger::writeToLog ("StemSeparator: using CPU (DirectML opt-in via CUE_ENABLE_DIRECTML=1; CUE_DISABLE_DIRECTML overrides)");
         }
 #endif
 

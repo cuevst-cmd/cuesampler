@@ -1060,10 +1060,15 @@ private:
     juce::ThreadPool analysisThreadPool { 1 };
     juce::ThreadPool warpRenderThreadPool { 1 };
     juce::ThreadPool keyDetectionThreadPool { 1 };
-    // Offline HTDemucs-FT separation + mute remixes. Single thread (one pass at a
-    // time), default priority — below the host's realtime audio thread so it can
-    // never glitch playback. Runs both StemSeparationJob and RemixJob.
+    // Offline HTDemucs separation + mute remixes. One pass at a time, with a
+    // low-priority caller so model loading/encoding also yield to the UI/host.
+    // ORT's separate inference workers are bounded in StemSeparator.
+   #if JUCE_WINDOWS
+    juce::ThreadPool stemThreadPool { 1, juce::Thread::osDefaultStackSize,
+                                      juce::Thread::Priority::low };
+   #else
     juce::ThreadPool stemThreadPool { 1 };
+   #endif
     // Optional persistence must not hold up separation readiness or mute remixes.
     juce::ThreadPool stemCacheWriteThreadPool { 1 };
     // Higher priority so the background bake finishes fast — and is biased onto a

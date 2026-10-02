@@ -1673,17 +1673,48 @@ struct CueSamplerStateTests
 
         if (testSeparation)
         {
+            // Keep the real editor's timers running during model loading and
+            // inference, and measure message dispatch throughout the pass.
+            std::unique_ptr<juce::AudioProcessorEditor> separatingEditor (original.createEditor());
+            struct Heartbeat final : juce::Timer
+            {
+                Heartbeat() { startTimer (20); }
+                ~Heartbeat() override { stopTimer(); }
+                void timerCallback() override
+                {
+                    recordGap();
+                    ++callbacks;
+                }
+                void recordGap()
+                {
+                    const auto now = juce::Time::getMillisecondCounterHiRes();
+                    worstGap = juce::jmax (worstGap, now - lastTick);
+                    lastTick = now;
+                }
+                double lastTick = juce::Time::getMillisecondCounterHiRes();
+                double worstGap = 0.0;
+                int callbacks = 0;
+            } heartbeat;
             // Deliberately stall optional persistence: readiness, mute remix and
             // an immediate portable save/restore must still complete.
             auto cacheGate = std::make_shared<juce::WaitableEvent>();
-            original.stemCacheWriteThreadPool.addJob ([cacheGate] { cacheGate->wait (90000); });
+            original.stemCacheWriteThreadPool.addJob ([cacheGate] { cacheGate->wait (-1); });
             const auto readyStart = juce::Time::getMillisecondCounterHiRes();
             original.requestStemSeparation();
-            const auto deadline = juce::Time::getMillisecondCounterHiRes() + 60000.0;
-            while (original.stemSeparationInProgress.load() && juce::Time::getMillisecondCounterHiRes() < deadline) pump();
+            const auto deadline = juce::Time::getMillisecondCounterHiRes() + 180000.0;
+            // Publication clears the busy flag before committing the active mix.
+            // Wait for the complete job before snapshotting audio for comparison.
+            while (original.stemThreadPool.getNumJobs() != 0
+                   && juce::Time::getMillisecondCounterHiRes() < deadline) pump();
+            heartbeat.stopTimer();
+            heartbeat.recordGap();
+            std::cout << "STEM UI callbacks=" << heartbeat.callbacks
+                      << " max dispatch gap ms=" << heartbeat.worstGap << std::endl;
+            check (heartbeat.callbacks > 0 && heartbeat.worstGap < 1000.0,
+                   "editor message dispatch remains responsive during real separation");
             const auto actualStems = std::atomic_load (&original.stemSet);
             std::cout << "STEM READY ms=" << juce::Time::getMillisecondCounterHiRes() - readyStart << std::endl;
-            check (! original.stemSeparationInProgress.load() && actualStems != nullptr
+            check (! original.stemSeparationInProgress.load() && original.areStemsReady() && actualStems != nullptr
                    && actualStems != originalStems && actualStems->serializedStemData.getBinaryData() != nullptr,
                    "real separation publishes portable stem data before cache write");
             if (actualStems != nullptr)

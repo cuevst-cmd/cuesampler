@@ -317,6 +317,19 @@ their embedded stems until explicitly separated again.
 
 ## Stem quality and readiness (10% overlap / sinc resampling)
 
+- [ ] On Windows with `CUE_ENABLE_DIRECTML`, `CUE_DISABLE_DIRECTML` and
+      `CUE_STEM_THREADS` unset, separate a full song while playing audio. Drag
+      controls, move/resize the editor and check progress animation throughout
+      first-use model loading and subsequent separations. The default uses CPU,
+      half the logical cores capped at four, sleeping ORT workers and a
+      low-priority separation caller. Compare playback stability at small host
+      buffer sizes; the pass can take longer than GPU inference.
+- [ ] For GPU comparison only, set `CUE_ENABLE_DIRECTML=1` before starting the
+      host. Check UI responsiveness on the actual GPU/driver: DirectML shares
+      display resources and can stall rendering. `CUE_DISABLE_DIRECTML` still
+      forces CPU even when the enable flag is set. Unset the enable flag to
+      restore the default. macOS provider/thread defaults are unchanged.
+
 New separations use 10% overlap and a band-limited, zero-phase sample-rate
 converter. Overlap adds roughly 11% more inference windows on long files versus
 zero overlap; short-file counts depend on length. Processing stops as soon as the
@@ -342,7 +355,9 @@ nonredundant window coverage. `test_project_restore` checks resampler passband,
 alias rejection, timing, short buffers and exact equal-rate copies. Run
 `test_project_restore <scratch-parent> --separate` with the model installed to
 exercise real inference, blocked cache writing, independent mute remixing and
-bit-exact portable save/restore before the cache exists.
+bit-exact portable save/restore before the cache exists. That opt-in run also
+keeps an editor open and checks message dispatch during model loading/inference,
+reporting its worst dispatch gap (under one second required).
 
 ## Sample tempo 2x correction
 
