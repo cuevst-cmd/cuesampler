@@ -1,0 +1,172 @@
+#!/bin/sh
+# Package postinstall: deploy only CUE's controller for the active console user.
+# Uses macOS system tools; never edits FL preferences or controller routing.
+
+set -eu
+
+log()
+{
+    /bin/echo "CUE SAMPLER FL Link: $*"
+}
+
+fail()
+{
+    log "$*"
+    exit 1
+}
+
+vst_source="/Library/Audio/Plug-Ins/VST3/CUE SAMPLER.vst3/Contents/Resources/FLStudio/CUE SAMPLER Link/device_CueSamplerLink.py"
+au_source="/Library/Audio/Plug-Ins/Components/CUE SAMPLER.component/Contents/Resources/FLStudio/CUE SAMPLER Link/device_CueSamplerLink.py"
+
+validate_home()
+{
+    case "$user_home" in
+        /*) ;;
+        *) fail "Controller not installed: could not resolve the active user's home directory." ;;
+    esac
+    if [ "$user_home" = "/" ] || [ ! -d "$user_home" ] || [ -L "$user_home" ]; then
+        fail "Controller not installed: the active user's home is not an available regular directory."
+    fi
+}
+
+validate_source()
+{
+    case "$source_script" in
+        "$vst_source"|"$au_source") ;;
+        *) fail "Controller not installed: source is not an installed system CUE bundle resource." ;;
+    esac
+    if [ ! -f "$source_script" ] || [ -L "$source_script" ]; then
+        fail "Controller not installed: installed plug-in bundles contain no regular CUE controller resource."
+    fi
+    if ! /usr/bin/grep -Fqx '# name=CUE SAMPLER Link' "$source_script" \
+        || ! /usr/bin/grep -Fqx '# supportedDevices=CUE SAMPLER Link' "$source_script"; then
+        fail "Controller not installed: bundled controller metadata does not match CUE SAMPLER Link."
+    fi
+}
+
+if [ "${1:-}" = "--install-for-user" ]; then
+    # All mutable user paths are handled after dropping root privileges. This
+    # also makes path races unable to overwrite files beyond this user's rights.
+    [ "$#" -eq 3 ] || fail "Controller worker received invalid arguments."
+    [ "$(/usr/bin/id -u)" -ne 0 ] || fail "Controller worker must not run as root."
+    source_script="$2"
+    user_home="$3"
+    console_user="$(/usr/bin/id -un)"
+    resolved_home="$(/usr/bin/dscl . -read "/Users/$console_user" NFSHomeDirectory 2>/dev/null \
+        | /usr/bin/sed -n 's/^NFSHomeDirectory: //p')"
+    [ "$user_home" = "$resolved_home" ] || fail "Controller worker home does not match its user account."
+    validate_home
+    validate_source
+else
+    [ "$(/usr/bin/id -u)" -eq 0 ] || fail "Package bootstrap must run as installer root."
+    # Another target volume has no known active user on that OS.
+    target_volume="${3:-/}"
+    if [ "$target_volume" != "/" ]; then
+        log "Controller skipped: target volume is not the running system. Plug-ins remain installed."
+        exit 0
+    fi
+
+    console_user="$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || true)"
+    case "$console_user" in
+        ''|root|loginwindow|_mbsetupuser|nobody)
+            log "Controller skipped: no active GUI user. Plug-ins remain installed; automatic FL controller connection is unavailable for this installation."
+            exit 0
+            ;;
+    esac
+    user_home="$(/usr/bin/dscl . -read "/Users/$console_user" NFSHomeDirectory 2>/dev/null \
+        | /usr/bin/sed -n 's/^NFSHomeDirectory: //p')"
+    validate_home
+    source_script=""
+    for candidate in "$vst_source" "$au_source"; do
+        if [ -f "$candidate" ] && [ ! -L "$candidate" ]; then
+            source_script="$candidate"
+            break
+        fi
+    done
+    validate_source
+    # No user directory has been created or modified by the privileged process.
+    # Installer's script directory may be private to root. Open this read-only
+    # script before dropping privileges; the worker needs no access to that path.
+    exec /usr/bin/sudo -u "$console_user" /bin/sh -s -- --install-for-user "$source_script" "$user_home" < "$0"
+fi
+
+hardware_root="$user_home/Documents/Image-Line/FL Studio/Settings/Hardware"
+controller_dir="$hardware_root/CUE SAMPLER Link"
+destination="$controller_dir/device_CueSamplerLink.py"
+backup_root="$user_home/Library/Application Support/CUE SAMPLER/Controller Backups"
+
+# Create only missing directories as the user, preserving existing directories.
+for directory in \
+    "$user_home/Documents" \
+    "$user_home/Documents/Image-Line" \
+    "$user_home/Documents/Image-Line/FL Studio" \
+    "$user_home/Documents/Image-Line/FL Studio/Settings" \
+    "$hardware_root" \
+    "$controller_dir"
+do
+    if [ -L "$directory" ]; then
+        fail "Controller not installed: refusing a symlink in the default FL Hardware path: $directory"
+    elif [ -e "$directory" ]; then
+        [ -d "$directory" ] || fail "Controller not installed: a default FL directory path is occupied by a file: $directory"
+    else
+        /bin/mkdir "$directory"
+        /bin/chmod 0755 "$directory"
+    fi
+done
+
+if [ -L "$destination" ]; then
+    fail "Controller not installed: refusing to replace a symlink at the CUE script path."
+fi
+if [ -e "$destination" ] && [ ! -f "$destination" ]; then
+    fail "Controller not installed: the CUE script path is not a regular file."
+fi
+if [ -f "$destination" ] && /usr/bin/cmp -s "$source_script" "$destination"; then
+    log "Controller already current for $console_user; no FL settings changed."
+    exit 0
+fi
+
+if [ -f "$destination" ]; then
+    for directory in \
+        "$user_home/Library" \
+        "$user_home/Library/Application Support" \
+        "$user_home/Library/Application Support/CUE SAMPLER" \
+        "$backup_root"
+    do
+        if [ -L "$directory" ]; then
+            fail "Controller not installed: refusing a symlink in the controller backup path: $directory"
+        elif [ -e "$directory" ]; then
+            [ -d "$directory" ] || fail "Controller not installed: a backup directory path is occupied by a file: $directory"
+        else
+            /bin/mkdir "$directory"
+            /bin/chmod 0755 "$directory"
+        fi
+    done
+    backup_stamp="$(/bin/date -u '+%Y%m%dT%H%M%SZ')"
+    backup_dir="$(/usr/bin/mktemp -d "$backup_root/${backup_stamp}_XXXXXX")"
+    /bin/chmod 0755 "$backup_dir"
+    /bin/cp -p "$destination" "$backup_dir/device_CueSamplerLink.py"
+    /usr/bin/cmp -s "$destination" "$backup_dir/device_CueSamplerLink.py" \
+        || fail "Controller not installed: prior CUE script backup verification failed."
+    log "Previous CUE script backed up to $backup_dir"
+fi
+
+staged_script=""
+cleanup()
+{
+    if [ -n "$staged_script" ]; then
+        /bin/rm -f "$staged_script"
+    fi
+}
+trap cleanup 0
+trap 'cleanup; exit 1' 1 2 3 15
+staged_script="$(/usr/bin/mktemp "$controller_dir/.cue-link.XXXXXX")"
+/bin/cp "$source_script" "$staged_script"
+/bin/chmod 0644 "$staged_script"
+/usr/bin/cmp -s "$source_script" "$staged_script" \
+    || fail "Controller not installed: staged script verification failed."
+/bin/mv -f "$staged_script" "$destination"
+staged_script=""
+/usr/bin/cmp -s "$source_script" "$destination" \
+    || fail "Controller installation verification failed."
+log "Controller installed for $console_user. FL preferences were not changed; automatic input activation and recording remain host-dependent."
+exit 0

@@ -205,6 +205,7 @@ $noticeFiles = @(
     @{ Source = "assets\Syne-OFL.txt"; Destination = "Syne-OFL-1.1.txt" },
     @{ Source = (Join-Path $BuildDir "_deps\juce-src\LICENSE.md"); Destination = "JUCE-LICENSE.md" },
     @{ Source = (Join-Path $BuildDir "_deps\bungee-src\LICENSE"); Destination = "Bungee-MPL-2.0.txt" },
+    @{ Source = (Join-Path $BuildDir "_deps\lame-src\COPYING"); Destination = "LAME-LGPL-2.0.txt" },
     @{ Source = (Join-Path $BuildDir "_deps\onnxruntime-src\LICENSE"); Destination = "ONNX-Runtime-MIT.txt" },
     @{ Source = (Join-Path $BuildDir "_deps\onnxruntime-src\ThirdPartyNotices.txt"); Destination = "ONNX-Runtime-ThirdPartyNotices.txt" },
     @{ Source = (Join-Path $BuildDir "_deps\directml-src\LICENSE.txt"); Destination = "DirectML-LICENSE.txt" },
@@ -235,7 +236,17 @@ if (Test-Path $bungeeSourceArchive) {
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $bungeeSourceArchive -PathType Leaf)) {
     Write-Error "Failed to create the Bungee MPL source archive."
 }
-Write-Host "    Third-party notices and Bungee source staged: $releaseNoticesDir"
+
+$lameSourceDir = Join-Path $BuildDir "_deps\lame-src"
+$lameSourceArchive = Join-Path $releaseNoticesDir "LAME-3.100-source.zip"
+if (Test-Path $lameSourceArchive) {
+    Remove-Item -LiteralPath $lameSourceArchive -Force
+}
+& tar.exe -a -c -f $lameSourceArchive --exclude=.git -C $lameSourceDir .
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $lameSourceArchive -PathType Leaf)) {
+    Write-Error "Failed to create the LAME LGPL source archive."
+}
+Write-Host "    Third-party notices and Bungee/LAME source staged: $releaseNoticesDir"
 
 # Sign the product binary before NSIS packages the VST3 bundle. Microsoft and
 # third-party runtime DLLs retain their publishers' existing signatures.

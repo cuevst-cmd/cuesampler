@@ -16,7 +16,7 @@ namespace Ort { struct Env; struct Session; struct SessionOptions; struct RunOpt
  * BeatThisAnalyzer
  * ----------------
  * Runs the beat_this (ISMIR 2024) neural beat tracker on a loaded audio buffer
- * and returns beat / downbeat positions with high accuracy (~92-95% F-measure).
+ * and returns beat / downbeat positions.
  *
  * The analysis is designed to run entirely on a background thread.
  * All public methods are thread-safe when called from a single analysis thread.
@@ -69,6 +69,8 @@ public:
     void terminate() const;
 
 private:
+    friend struct BeatThisAnalyzerTests;
+
     //==========================================================================
     // Constants matching beat_this's training configuration
     static constexpr double  kTargetSampleRate = 22050.0;
@@ -77,10 +79,9 @@ private:
     static constexpr int     kMelBins          = 128;
     static constexpr double  kFps              = 50.0;   // kTargetSampleRate / kHopSize
     static constexpr double  kFreqMin          = 30.0;
-    static constexpr double  kFreqMax          = 10000.0;
+    static constexpr double  kFreqMax          = 11000.0;
     static constexpr float   kLogScale         = 1000.0f; // ln(1 + 1000*x)
     static constexpr float   kBeatThreshold    = 0.5f;   // sigmoid threshold
-    static constexpr float   kMinBeatGapSecs   = 0.25f;  // 240 BPM max
 
     //==========================================================================
     // Mel filter bank: sparse triangular filters, one per band
@@ -113,18 +114,12 @@ private:
                                              int startFrame,
                                              int endFrame) const;
 
-    // beat_this positional encoding is fixed to 8192 frames (~163 s at 50 fps)
-    static constexpr int kMaxChunkFrames   = 8192;
-    static constexpr int kChunkOverlap     = 512;  // frames of overlap between chunks
-
     static std::vector<int> peakPick (const std::vector<float>& activations,
-                                      float threshold,
-                                      int minGapFrames);
+                                      float threshold, int radiusFrames);
 
-    static double estimateGlobalTempoACF (const std::vector<float>& activations);
-    
-    static std::vector<int> dpBeatTrack (const std::vector<float>& activations, 
-                                         double targetIntervalFrames);
+    static Result decodeBeatProbabilities (const std::vector<float>& beat,
+                                            const std::vector<float>& downbeat,
+                                            double analysisStartSecs);
 
     static float sigmoid (float x) noexcept;
 

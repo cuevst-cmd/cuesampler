@@ -14,6 +14,7 @@ class WarpHelpOverlayComponent;
 class HeaderComponent;
 class VisualizerOrb;
 class WaveformDisplayComponent;
+class SampleImportOverlayComponent;
 class TransportSectionComponent;
 class FavoritesViewComponent;
 class WaveformFooterComponent;
@@ -55,7 +56,9 @@ private:
     void toggleTheme();
     void applyThemeToUi();
     void refreshFavoritesView();
-
+    void syncMidiKeyboard();
+    int lastKeyboardBase = 0;
+    uint32_t lastObservedHostMidiKeyEvent = 0;
     AudioPluginAudioProcessor& processorRef;
     std::unique_ptr<juce::PropertiesFile> uiSettingsFile;
 
@@ -64,6 +67,7 @@ private:
     std::unique_ptr<cue::CueSamplerLookAndFeel> lookAndFeel;
     std::unique_ptr<cue::HeaderComponent> headerComponent;
     std::unique_ptr<cue::WaveformDisplayComponent> waveformDisplayComponent;
+    std::unique_ptr<cue::SampleImportOverlayComponent> sampleImportOverlayComponent;
     std::unique_ptr<cue::TransportSectionComponent> transportSectionComponent;
     std::unique_ptr<cue::FavoritesViewComponent> favoritesViewComponent;
     juce::TextButton favoritesButton;

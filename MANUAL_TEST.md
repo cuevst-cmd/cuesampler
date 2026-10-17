@@ -35,7 +35,7 @@ prefixed `StemSeparator:`.
       sustain remain independent per chop; in GATE mode Release begins on note-off.
 - [ ] In ONE SHOT mode, confirm Release fades into the chop boundary without shortening or
       looping the chop. Exercise normal, pitched, warped, reversed, HALF-TIME, and SYNC playback.
-- [ ] Use **EXPORT CHOP** inside the callout and confirm the saved WAV has the selected chop's
+- [ ] Use **EXPORT CHOP** inside the callout and confirm the saved MP3 has the selected chop's
       ADSR baked in. Save/reopen the project and confirm all four values restore per chop.
 - [ ] Enter manual-chop mode, complete and select a chop, then open the same ADSR/export callout.
       Changing the selection while a callout is open must not redirect its knobs to another chop.
@@ -98,12 +98,12 @@ prefixed `StemSeparator:`.
       overlaps the +/- zoom buttons and never leaves the display.
 - [ ] Outside manual mode no × appears, and the ADSR/EXPORT pill sits exactly where it did
       before (position must be unchanged).
-- [ ] Complete a manual chop by double-clicking the end (no pad held). It is assigned **C3**.
-      The next such chop takes C#3, then D3. Delete the C#3 chop and create another — it
-      reuses C#3 rather than continuing upward.
+- [ ] After importing a new sample, complete a manual chop by double-clicking the end
+      (no pad held). It is assigned **C2**. The next such chop takes C#2, then D2.
+      Delete the C#2 chop and create another — it reuses C#2 rather than continuing upward.
 - [ ] Chops captured by holding a pad keep that exact pad; the auto-assigned ones skip over
       any note already taken.
-- [ ] Load an older project saved before this change. Its chops still map from C2 as before.
+- [ ] Load an older project. Its chops retain their saved root and note assignments.
 
 ## WARP discoverability
 - [ ] Press **WARP**. No full-screen guide appears. A purple hint bar sits at the top of the
@@ -277,15 +277,15 @@ ctest --test-dir build --output-on-failure
 
 ## Audio extraction regression
 
-Exports use 32-bit floating-point WAV at the host sample rate and snapshot the
-chop, cue, pitch, warp, tempo/HALF-TIME, gain, envelope, reverse and stem mutes at
+Exports use 320 kbps MP3 and snapshot the chop, cue, pitch, warp,
+tempo/HALF-TIME, gain, envelope, reverse and stem mutes at
 the export gesture. Rendering and Save As copies run off the UI/audio threads.
 The envelope follows full-velocity one-shot playback; a held MIDI gate/note-off
 performance is not recorded into the file. Prepared audio preserves headroom
 instead of independently normalising each chop.
 
 - [ ] Drag the DRAG AUDIO handle with pitch, warp, SYNC and HALF-TIME individually,
-      then combined. Place each WAV on the grid and compare its onset, duration,
+      then combined. Place each MP3 on the grid and compare its onset, duration,
       pitch and final transient to the loop; repeat at 44.1/48/96 kHz and with a
       source at a different rate. Check chops at the start/end of the source.
 - [ ] Export just after moving a warp marker, changing a cue or toggling a stem
@@ -298,7 +298,7 @@ instead of independently normalising each chop.
       display Preparing export. Keep dragging to start the native file drag once
       ready. Release early, then drag the handle again: the prepared result is reused
       if settings are unchanged. Change settings before retrying: it must re-render.
-- [ ] Use ADSR > Save WAV, cancel it, and test a destination that cannot be written.
+- [ ] Use ADSR > Save MP3, cancel it, and test a destination that cannot be written.
       Failed saves report an error and preserve the rendered file and any existing
       destination file. Close the editor while rendering; no crash or late dialog.
 - [ ] Drag to a DAW that references files in place. Wait more than 60 seconds,
@@ -308,7 +308,7 @@ instead of independently normalising each chop.
       deleted; don't manually remove files still referenced by projects. Use the
       DAW's collect/copy-media feature before moving a project to another computer.
 
-The `test_project_restore` suite also reads actual exported WAVs and checks
+The `test_project_restore` suite also reads actual exported MP3s and checks
 processing-delay compensation, loop lengths, pitch, late-loop audio, sample-rate
 conversion, float peaks, cue/reverse, stem intent, long-release short chops,
 background snapshots/cache lifetime, and stem-resampling alignment. Fresh stem
@@ -355,7 +355,7 @@ nonredundant window coverage. `test_project_restore` checks resampler passband,
 alias rejection, timing, short buffers and exact equal-rate copies. Run
 `test_project_restore <scratch-parent> --separate` with the model installed to
 exercise real inference, blocked cache writing, independent mute remixing and
-bit-exact portable save/restore before the cache exists. That opt-in run also
+compact portable save/restore before the cache exists. That opt-in run also
 keeps an editor open and checks message dispatch during model loading/inference,
 reporting its worst dispatch gap (under one second required).
 
@@ -391,6 +391,14 @@ Undo, fine trim, manual chops, saved-state recall and older-state defaults.
 
 ## Favorites performance view
 
+- [ ] While transport playback or a held MIDI chop is sounding, toggle Favorites
+      on and off: audio continues. Release the original MIDI key after switching:
+      GATE releases normally; ONE SHOT plays through. Check every favorite using
+      tiles and MIDI after the view has been open for several seconds.
+- [ ] In FL Studio, audition tiles with the host transport stopped. Mouse
+      audition uses the same preview path as the waveform, including NO MIDI
+      tiles beyond the first 92 favorites. Hiding Favorites releases a held
+      mouse GATE; hardware MIDI follows the displayed C2-upward assignments.
 - [ ] Favorite chops out of sample order (for example 3, 1, 6, 4). Click
       **FAVORITES** above the waveform: only those chops appear, side by side,
       labeled C2, C#2, D2, D#2 in the order they were favorited. Pink keyboard
@@ -429,6 +437,23 @@ held-voice reset on remap, removal/re-add, Undo, portable recall and old states.
 
 ## Waveform scrollbar
 
+- [ ] In FL Studio on macOS 15.2, use two-finger vertical trackpad scrolling
+      and pinch in/out over the waveform. Zoom follows the pointer; quick,
+      small movements accumulate instead of stalling. Two-finger horizontal
+      scrolling pans and stays in sync with the SCROLL knob.
+- [ ] Verify ZOOM - / + and FIT are absent. The ZOOM knob adjusts horizontal
+      zoom; double-clicking it shows the full sample. The original +/- buttons
+      still adjust waveform height independently.
+- [ ] On a laptop, test slow/fast pinch in/out, two-finger vertical zoom and
+      horizontal pan, including momentum and diagonal movement. The dominant
+      scroll direction controls zoom or pan without minor-axis drift. Test
+      Ctrl+vertical scroll, including pinch translated to Ctrl-wheel by the OS.
+      Repeat in standalone and the supported macOS/Windows plugin hosts; native
+      pinch delivery depends on the OS, driver and host.
+- [ ] Check minimum/default/maximum editor sizes, both themes, manual chop and
+      warp modes. Colour controls, hints and chop export actions remain clear.
+      Save/reopen and verify zoom and scroll values return.
+
 - [ ] Zoom in and drag the horizontal scrollbar slowly, quickly and back and forth.
       The waveform eases smoothly as with wheel scrolling; the thumb stays under
       the pointer without being pulled backward by the animation.
@@ -449,7 +474,7 @@ held-voice reset on remap, removal/re-add, Undo, portable recall and old states.
       toggling a favorite. Repeating the click reuses the prepared file.
 - [ ] Change pitch/warp/stems after preparing: the next export uses fresh settings.
       Select another chop while rendering: its next request supersedes the old UI result.
-- [ ] ADSR opens its envelope menu; **SAVE WAV...** opens the file-save workflow.
+- [ ] ADSR opens its envelope menu; **SAVE MP3...** opens the file-save workflow.
 - [ ] Test actual drops in a DAW on macOS and Windows, including a cold render,
       early release/retry, rejected drop and repeat drag of unchanged audio.
 
@@ -490,3 +515,86 @@ held-voice reset on remap, removal/re-add, Undo, portable recall and old states.
       the correct original chop, and Favorites should retain its order.
 - [ ] With no favorites (or no selected favorite), EDIT CHOP is disabled.
       Double-clicking a favorite still auditions without removing it.
+
+## OCT -/+ and MIDI mapping (C2 start, higher screen keys)
+
+- [ ] Restart FL after installation. Select its standard Piano typing layout.
+      No virtual MIDI input or controller adapter is needed.
+- [ ] Import a sample with at least 104 chops. The screen opens at C2: chop 1
+      is C2, chop 13 is C3, chop 49 is C6, chop 61 is C7, and chop 104 is G10.
+      With FL typing at C2, Z plays/lights chop 1 in both views.
+- [ ] Play a typing note first to reveal its real octave. Release it; OCT −/+
+      controls FL C2–C6, preserving real pitches in the DAW and CUE. Check FL's
+      actual menu/notes as well as the CUE caption.
+- [ ] At OCT C6, press +: CUE shows C7 and SCREEN KEYS. Click C7 to play chop
+      61. Continue to C10 and click G10 for chop 104. FL's typing octave does
+      not change during these higher view steps. Clips/typing do not pull the
+      higher screen view away. Return to C6: FL receives its native C6 shortcut.
+- [ ] Hold a typing key while returning C7→C6: native dispatch is blocked and
+      the view stays C7. Release, retry, and check matching note-off behavior.
+      Test inactive FL, text editing and dialogs. Screen-only navigation must
+      never send unsupported shortcuts or transpose a held host note.
+- [ ] Record a clip using FL typing; OCT never reinterprets its MIDI.
+      Mouse screen keys audition in CUE without injecting a DAW recording input.
+      Save/reopen: root, mapping and screen view return; recall sends no shortcut.
+- [ ] A 220-chop C2 sample exposes 1–104/channel 1, 105–208/channel 2, and
+      209–220/channel 3. Later ranges restart at C2. All corresponding screen
+      keys and DAW channel/note pairs trigger the same chop.
+- [ ] Older C0 and C4 projects retain their existing mappings/range sizes.
+      Importing a new sample starts C2; failed imports preserve the old map.
+      Manual captures retain explicit pins; new unpinned manual chops start C2.
+- [ ] Favorites pack from the current saved root. Test both themes and minimum
+      editor size: SCREEN KEYS and blocked-request status fit the mapping strip.
+      The CHOPS slider is absent for all chop counts; later chops retain their DAW channel/note assignments.
+
+`test_project_restore --octave-banking` covers native-to-screen transitions,
+blocked returns to C6, C10 limits, the new C2/104-note ranges and recall, legacy
+C0/C4 mappings, all 128 legacy screen/host notes, Favorites and release pairing.
+The native C6→C5 change was confirmed live by the user; the new C6→C7 screen
+transition and C2 import UI remain host smoke checks after installation.
+
+## Background sample import
+
+- [ ] Load a long WAV/MP3 using both the file chooser and drag-and-drop. Controls
+      remain responsive while the sample is prepared; existing audio keeps playing
+      until the replacement is ready.
+- [ ] Import two files quickly. The last selection wins. Restore a project while
+      an import is pending: the restored sample must remain selected.
+- [ ] During import, the waveform shows an animated loading panel with the
+      incoming filename and progress. Use CHOOSE ANOTHER SAMPLE or drop a new
+      file onto that panel: the filename updates and the latest file replaces
+      the old audio. REPLACE SAMPLE remains available after loading finishes.
+- [ ] Drop a corrupt or unsupported audio file. A clear error appears, the
+      loading panel clears, and the previous sample remains available.
+- [ ] Close/reopen the editor during import, and remove the plugin during import.
+      No crash or callback into a deleted editor.
+- [ ] Save immediately after the new waveform appears, then reopen with the
+      original audio file unavailable. Embedded audio restores correctly.
+- [ ] Import a long file and begin playing as soon as the waveform appears.
+      Project-audio compression continues in the background. Save immediately,
+      then again after a few seconds: both saves recall without the original
+      file; the later save uses compact embedded audio.
+
+`test_project_restore --sample-import` covers background dispatch, latest-file
+selection, failed loads, embedded audio readiness and project-restore cancellation.
+It also exercises loading-panel file drops and block-by-block encoding cancellation,
+and writes `build/sample-import-loading.png` for layout inspection.
+It verifies immediate recall with compression blocked and the source file deleted,
+then verifies compact recall and shared persistence through stem remixes.
+`test_project_restore build --import-benchmark` compares median preparation time
+for a 30-second stereo WAV over three runs against the previous import path.
+
+
+## Grid and keyboard visibility
+
+- [ ] In automatic and manual chop modes, orange bar guides use round dots with
+      clear gaps. Zoom/scroll and adjust TEMPO: dots stay aligned to the bar grid,
+      and no continuous beat line shows through the gaps.
+- [ ] Check both themes at normal and minimum editor sizes. Selected white and
+      black keys have a strong accent fill and outline; playing keys have a bright
+      orange fill (pink for favorites), a pale rim, and a dark bottom indicator.
+- [ ] Release a played key: its playing fill clears and selection/favorite styling
+      returns. Host MIDI and mouse input highlight the same mapped note.
+- [ ] Load more than 128 chops, toggle Favorites and reopen the editor. The CHOPS
+      slider stays absent, OCT stays bounded to C0–C10, and existing DAW MIDI
+      channel/note assignments still trigger the same chops.

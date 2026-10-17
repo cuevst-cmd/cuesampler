@@ -47,6 +47,55 @@ FetchContent_Declare(JUCE
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(JUCE)
 
+# LAME — bundled as a shared library so MP3 encoding works without a separately
+# installed command-line tool. Keeping it dynamically linked preserves the LGPL
+# library boundary; each plugin bundle stages the library and its license/source.
+FetchContent_Declare(lame
+    URL https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz
+    URL_HASH SHA256=ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(lame)
+
+add_library(cue_mp3lame SHARED
+    "${lame_SOURCE_DIR}/libmp3lame/VbrTag.c"
+    "${lame_SOURCE_DIR}/libmp3lame/bitstream.c"
+    "${lame_SOURCE_DIR}/libmp3lame/encoder.c"
+    "${lame_SOURCE_DIR}/libmp3lame/fft.c"
+    "${lame_SOURCE_DIR}/libmp3lame/gain_analysis.c"
+    "${lame_SOURCE_DIR}/libmp3lame/id3tag.c"
+    "${lame_SOURCE_DIR}/libmp3lame/lame.c"
+    "${lame_SOURCE_DIR}/libmp3lame/newmdct.c"
+    "${lame_SOURCE_DIR}/libmp3lame/presets.c"
+    "${lame_SOURCE_DIR}/libmp3lame/psymodel.c"
+    "${lame_SOURCE_DIR}/libmp3lame/quantize.c"
+    "${lame_SOURCE_DIR}/libmp3lame/quantize_pvt.c"
+    "${lame_SOURCE_DIR}/libmp3lame/reservoir.c"
+    "${lame_SOURCE_DIR}/libmp3lame/set_get.c"
+    "${lame_SOURCE_DIR}/libmp3lame/tables.c"
+    "${lame_SOURCE_DIR}/libmp3lame/takehiro.c"
+    "${lame_SOURCE_DIR}/libmp3lame/util.c"
+    "${lame_SOURCE_DIR}/libmp3lame/vbrquantize.c"
+    "${lame_SOURCE_DIR}/libmp3lame/version.c"
+    "${lame_SOURCE_DIR}/libmp3lame/mpglib_interface.c")
+target_include_directories(cue_mp3lame
+    PUBLIC "${lame_SOURCE_DIR}/include"
+    PRIVATE "${lame_SOURCE_DIR}/libmp3lame")
+target_compile_definitions(cue_mp3lame PRIVATE
+    STDC_HEADERS=1 HAVE_STDINT_H=1 HAVE_INTTYPES_H=1 HAVE_ERRNO_H=1
+    HAVE_FCNTL_H=1 HAVE_STRCHR=1 HAVE_MEMCPY=1 USE_FAST_LOG=1
+    LAME_LIBRARY_BUILD=1
+    ieee754_float32_t=float ieee754_float64_t=double ieee854_float80_t=long\ double)
+set_target_properties(cue_mp3lame PROPERTIES
+    OUTPUT_NAME mp3lame
+    WINDOWS_EXPORT_ALL_SYMBOLS TRUE
+    POSITION_INDEPENDENT_CODE TRUE)
+if(MSVC)
+    target_compile_definitions(cue_mp3lame PRIVATE _CRT_SECURE_NO_WARNINGS=1)
+    target_compile_options(cue_mp3lame PRIVATE /w)
+else()
+    target_compile_options(cue_mp3lame PRIVATE -w)
+endif()
+
 # Bungee (time-stretch) — pinned to the exact commit previously used locally.
 # Bungee vendors Eigen as a git submodule under submodules/eigen, which
 # FetchContent initialises by default. No GIT_SHALLOW here: shallow clones
@@ -158,7 +207,7 @@ juce_add_plugin(CueSampler
     NEEDS_MIDI_INPUT TRUE
     # NEEDS_MIDI_OUTPUT TRUE/FALSE              # Does the plugin need midi output?
     # IS_MIDI_EFFECT TRUE/FALSE                 # Is this plugin a MIDI effect?
-    # EDITOR_WANTS_KEYBOARD_FOCUS TRUE/FALSE    # Does the editor need keyboard focus?
+    EDITOR_WANTS_KEYBOARD_FOCUS FALSE         # Leave typing-keyboard playback with the host
     COPY_PLUGIN_AFTER_BUILD FALSE               # Enabled manually after runtime/model staging below
     COMPANY_NAME "CUE SOFTWARE"
     BUNDLE_ID "com.cuesoftware.cuesampler"
@@ -196,13 +245,20 @@ target_sources(CueSampler
         UpdateChecker.cpp
         KeyDetector.cpp
         PluginEditor.cpp
+        FlOctaveShortcut.cpp
         PluginProcessor.cpp
         BeatThisAnalyzer.cpp
         StemSeparator.cpp
         StemCache.cpp
+        Mp3AudioCodec.cpp
         VisualizerOrb.cpp
         WarpMap.cpp
         ChopAudioCache.cpp)
+
+if(APPLE)
+    enable_language(OBJCXX)
+    set_source_files_properties(FlOctaveShortcut.cpp PROPERTIES LANGUAGE OBJCXX)
+endif()
 
 # `target_compile_definitions` adds some preprocessor definitions to our target. In a Projucer
 # project, these might be passed in the 'Preprocessor Definitions' field. JUCE modules also make use
@@ -216,6 +272,7 @@ target_compile_definitions(CueSampler
         # JUCE_WEB_BROWSER and JUCE_USE_CURL would be on by default, but you might not need them.
         JUCE_WEB_BROWSER=0
         JUCE_USE_CURL=0     # If you remove this, add `NEEDS_CURL TRUE` to the `juce_add_plugin` call
+        JUCE_USE_MP3AUDIOFORMAT=1
         JUCE_VST3_CAN_REPLACE_VST2=0
         # Running version for the in-app update checker (compared against the
         # newest GitHub Release). Single source of truth: project(... VERSION).
@@ -250,6 +307,7 @@ target_link_libraries(CueSampler
         juce::juce_dsp
         juce::juce_opengl
         bungee_library
+        cue_mp3lame
         "${ORT_LINK_LIB}"
     PUBLIC
         juce::juce_recommended_config_flags
@@ -300,7 +358,7 @@ if(APPLE)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare_release_legal.py"
             --build-dir "${CMAKE_CURRENT_BINARY_DIR}" --output "${CUE_LEGAL_DIR}"
             --juce-source "${juce_SOURCE_DIR}" --bungee-source "${bungee_SOURCE_DIR}"
-            --ort-source "${ONNXRUNTIME_ROOT}"
+            --ort-source "${ONNXRUNTIME_ROOT}" --lame-source "${lame_SOURCE_DIR}"
         COMMENT "Preparing third-party notices and modified Bungee source"
         VERBATIM)
     # VST3 (.vst3), AU (.component) and Standalone (.app) all share the bundle
@@ -332,6 +390,11 @@ if(APPLE)
             COMMAND ${CMAKE_COMMAND} -E make_directory
                 "$<TARGET_FILE_DIR:${_tgt}>/../Resources"
 
+            # FL LINK is paused. Remove its resources from incremental bundles
+            # so this build cannot install or advertise a controller adapter.
+            COMMAND ${CMAKE_COMMAND} -E rm -rf
+                "$<TARGET_FILE_DIR:${_tgt}>/../Resources/FLStudio"
+
             # Incremental builds may still contain the previously pinned dylib.
             # Remove any version other than the one this build will stage.
             COMMAND ${CMAKE_COMMAND}
@@ -343,6 +406,11 @@ if(APPLE)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${ONNX_DYLIB}"
                 "$<TARGET_FILE_DIR:${_tgt}>/${ORT_DYLIB_NAME}"
+
+            # LAME MP3 encoder next to the binary (resolved via @loader_path).
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:cue_mp3lame>"
+                "$<TARGET_FILE_DIR:${_tgt}>/$<TARGET_FILE_NAME:cue_mp3lame>"
 
             # beat_this model into Resources/ (small, committed → direct copy)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -364,12 +432,18 @@ if(APPLE)
                 -change "@rpath/${ORT_DYLIB_NAME}"
                         "@loader_path/${ORT_DYLIB_NAME}"
                 "$<TARGET_FILE:${_tgt}>"
+            COMMAND install_name_tool
+                -change "@rpath/$<TARGET_FILE_NAME:cue_mp3lame>"
+                        "@loader_path/$<TARGET_FILE_NAME:cue_mp3lame>"
+                "$<TARGET_FILE:${_tgt}>"
 
             # Re-sign LAST: nested dylib first, then the whole bundle so the seal
             # (CodeResources) covers every file copied above. install_name_tool
             # invalidated the binary's signature; the bundle sign re-signs it too.
             COMMAND codesign --force --sign -
                 "$<TARGET_FILE_DIR:${_tgt}>/${ORT_DYLIB_NAME}"
+            COMMAND codesign --force --sign -
+                "$<TARGET_FILE_DIR:${_tgt}>/$<TARGET_FILE_NAME:cue_mp3lame>"
             COMMAND codesign --force --sign -
                 "$<TARGET_FILE_DIR:${_tgt}>/../.."
 
@@ -412,6 +486,9 @@ elseif(WIN32)
                     "${DIRECTML_DLL}"
                     "$<TARGET_FILE_DIR:CueSampler_${_fmt}>/DirectML.dll"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:cue_mp3lame>"
+                    "$<TARGET_FILE_DIR:CueSampler_${_fmt}>/$<TARGET_FILE_NAME:cue_mp3lame>"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "${CMAKE_CURRENT_SOURCE_DIR}/assets/beat_this.onnx"
                     "$<TARGET_FILE_DIR:CueSampler_${_fmt}>/beat_this.onnx"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -437,10 +514,12 @@ if(CUE_BUILD_STEM_CACHE_TEST)
     set_target_properties(test_stem_cache PROPERTIES EXCLUDE_FROM_ALL TRUE)
     target_sources(test_stem_cache PRIVATE
         tools/test_stem_cache.cpp
-        StemCache.cpp)
+        StemCache.cpp
+        Mp3AudioCodec.cpp)
     target_compile_definitions(test_stem_cache PRIVATE
         JUCE_WEB_BROWSER=0
         JUCE_USE_CURL=0
+        JUCE_USE_MP3AUDIOFORMAT=1
         JUCE_STANDALONE_APPLICATION=1)
     target_include_directories(test_stem_cache PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(test_stem_cache PRIVATE
@@ -448,6 +527,7 @@ if(CUE_BUILD_STEM_CACHE_TEST)
         juce::juce_audio_basics
         juce::juce_cryptography
         juce::juce_core
+        cue_mp3lame
         juce::juce_recommended_config_flags)
     add_test(NAME stem_cache COMMAND test_stem_cache "${CMAKE_CURRENT_BINARY_DIR}")
 endif()
@@ -455,6 +535,16 @@ endif()
 option(CUE_BUILD_STATE_TEST "Build DAW state and chop regression tests" OFF)
 if(CUE_BUILD_STATE_TEST)
     enable_testing()
+    add_executable(test_fl_link_protocol EXCLUDE_FROM_ALL tools/test_fl_link_protocol.cpp)
+    target_include_directories(test_fl_link_protocol PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME fl_link_protocol COMMAND test_fl_link_protocol)
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME fl_link_controller
+            COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_fl_link_controller.py")
+        add_test(NAME fl_link_installer
+            COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_install_fl_link_controller.py")
+    endif()
     juce_add_console_app(test_project_restore PRODUCT_NAME "test_project_restore")
     set_target_properties(test_project_restore PROPERTIES EXCLUDE_FROM_ALL TRUE)
     target_sources(test_project_restore PRIVATE tools/test_project_restore.cpp)
@@ -473,6 +563,11 @@ if(CUE_BUILD_STATE_TEST)
     add_test(NAME manual_chops COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --manual-chops)
     add_test(NAME waveform_colour COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --waveform-colour)
     add_test(NAME performance_ui COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --performance-ui)
+    add_test(NAME sample_import COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --sample-import)
+    add_test(NAME octave_banking COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --octave-banking)
+    add_test(NAME waveform_zoom COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --waveform-zoom)
+    add_test(NAME favorites_audio COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --favorites-audio)
+    add_test(NAME mp3_exports COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --mp3-exports)
 endif()
 
 # ── Optional offline StemSeparator test ───────────────────────────────────────
@@ -522,6 +617,46 @@ if(CUE_BUILD_STEM_TEST)
                 "$<TARGET_FILE_DIR:test_stem_separator>/DirectML.dll"
             COMMENT "Windows: staging ONNX Runtime + DirectML beside test_stem_separator")
     endif()
+endif()
+
+# ── Optional offline tempo-analysis regressions ──────────────────────────────
+# Does not load a model or install a plugin for the default frontend/decoder
+# tests. Use --analyze with an audio file to inspect real ONNX inference.
+option(CUE_BUILD_TEMPO_TEST "Build offline beat frontend and tempo decoder regressions" OFF)
+if(CUE_BUILD_TEMPO_TEST)
+    enable_testing()
+    juce_add_console_app(test_tempo_analysis PRODUCT_NAME "test_tempo_analysis")
+    set_target_properties(test_tempo_analysis PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    target_sources(test_tempo_analysis PRIVATE
+        tools/test_tempo_analysis.cpp
+        BeatThisAnalyzer.cpp)
+    target_compile_definitions(test_tempo_analysis PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CURL=0
+        JUCE_STANDALONE_APPLICATION=1)
+    target_include_directories(test_tempo_analysis PRIVATE
+        "${ORT_INCLUDE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(test_tempo_analysis PRIVATE
+        juce::juce_audio_formats
+        juce::juce_dsp
+        juce::juce_audio_basics
+        juce::juce_core
+        juce::juce_recommended_config_flags
+        "${ORT_LINK_LIB}")
+    if(APPLE)
+        set_target_properties(test_tempo_analysis PROPERTIES
+            BUILD_RPATH "${ONNXRUNTIME_ROOT}/lib")
+    elseif(WIN32)
+        add_custom_command(TARGET test_tempo_analysis POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${ORT_RUNTIME_DLL}"
+                "$<TARGET_FILE_DIR:test_tempo_analysis>/onnxruntime.dll"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${DIRECTML_DLL}"
+                "$<TARGET_FILE_DIR:test_tempo_analysis>/DirectML.dll")
+    endif()
+    add_test(NAME tempo_analysis COMMAND test_tempo_analysis)
 endif()
 
 if(WIN32 AND MSVC)

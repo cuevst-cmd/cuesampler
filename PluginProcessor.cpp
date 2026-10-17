@@ -1,6 +1,8 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "StemCache.h"
+#include "Mp3AudioCodec.h"
+#include "TempoAnalysisPolicy.h"
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -99,9 +101,8 @@ constexpr float minimumLeadingPeakThreshold = 1.0e-4f;
 constexpr float minimumLeadingMeanThreshold = 3.0e-5f;
 constexpr float relativeLeadingPeakThresholdScale = 0.015f;
 constexpr float relativeLeadingMeanThresholdScale = 0.005f;
-constexpr float strongClassicTempoConfidence = 0.5f;
 constexpr float strongNeuralTempoConfidence = 0.55f;
-constexpr double neuralAgreementTolerance = 0.04;
+constexpr double neuralAgreementTolerance = 0.02;
 constexpr double neuralSelectionScoreMargin = 0.08;
 constexpr int representativeConsensusWindowCount = 4;
 constexpr int localTempoCandidatesPerWindow = 4;
@@ -109,16 +110,11 @@ constexpr double representativeWindowOverlapRatio = 0.5;
 constexpr double tempoConsensusTolerance = 0.06;
 constexpr double harmonicMappedSupportPenalty = 0.88;
 constexpr double halfDoubleScoreMargin = 0.025;
-constexpr double minimumTempoBpm = 55.0;
-constexpr double maximumTempoBpm = 210.0;
+constexpr double minimumTempoBpm = 40.0;
+constexpr double maximumTempoBpm = 240.0;
 constexpr double preferredTempoLow = 72.0;
 constexpr double preferredTempoHigh = 160.0;
-constexpr int midiRootNote = 36; // C2 — chop 0
-// Manual chops created without holding a pad are given an explicit assignment
-// starting here rather than falling back to the positional map. C3 under this
-// plugin's naming (C4 = 60). Deliberately separate from midiRootNote so that
-// existing projects and auto-chopped samples keep their historic C2 mapping.
-constexpr int manualChopDefaultRootNote = 48; // C3 — first manual chop
+constexpr int midiRootNote = cuesampler::defaultKeyboardStartNote; // FL C2 — first chop for new imports
 constexpr int defaultSliceStartFadeSamples = 64;
 // MIDI chops need a near-instant front edge; keep only a tiny de-click ramp.
 constexpr int midiSliceStartFadeSamples = 4;
@@ -297,7 +293,7 @@ bool isSupportedReaderShape (const juce::AudioFormatReader& reader) noexcept
 }
 
 std::shared_ptr<AudioPluginAudioProcessor::LoadedSampleData>
-readValidatedSampleData (juce::AudioFormatReader& reader)
+readValidatedSampleData (juce::AudioFormatReader& reader, const std::function<bool (float)>& progress = {})
 {
     if (! isSupportedReaderShape (reader))
         return {};
@@ -308,8 +304,16 @@ readValidatedSampleData (juce::AudioFormatReader& reader)
     auto sampleData = std::make_shared<AudioPluginAudioProcessor::LoadedSampleData>();
     sampleData->buffer.setSize (numChannels, numSamples, false, true, true);
 
-    if (! reader.read (&sampleData->buffer, 0, numSamples, 0, true, true))
-        return {};
+    // Bound cancellation latency while decoding long replacement samples.
+    constexpr int readBlockSize = 65536;
+    for (int offset = 0; offset < numSamples; offset += readBlockSize)
+    {
+        if (progress && ! progress ((float) offset / (float) numSamples))
+            return {};
+        if (! reader.read (&sampleData->buffer, offset, juce::jmin (readBlockSize, numSamples - offset),
+                           offset, true, true))
+            return {};
+    }
 
     sampleData->sampleRate = reader.sampleRate;
     sampleData->leadingContentStartSample = 0;
@@ -1498,15 +1502,7 @@ double getSamplingTempoScore (const AudioPluginAudioProcessor::TempoAnalysisData
     if (! isValidTempoAnalysis (analysis))
         return 0.0;
 
-    const auto beatCountScore = juce::jlimit (0.0, 1.0, (double) analysis.beatPositionsSeconds.size() / 24.0);
-    const auto barCountScore = juce::jlimit (0.0, 1.0, (double) analysis.barPositionsSeconds.size() / 8.0);
-    const auto stabilityScore = analysis.likelyDrifting ? 0.2 : 1.0;
-
-    return (double) analysis.confidence * 0.55
-         + getTempoPreferenceWeight (analysis.estimatedBpm) * 0.2
-         + beatCountScore * 0.15
-         + barCountScore * 0.1
-         + stabilityScore * 0.1;
+    return cuesampler::tempoAnalysisEvidenceScore (analysis);
 }
 
 AudioPluginAudioProcessor::TempoAnalysisData makeTempoAnalysisFromBeatThis (
@@ -1533,7 +1529,7 @@ void refineSampleTempoAnalysisWithBeatThis (AudioPluginAudioProcessor::TempoAnal
 {
     baseAnalysis.confidence = juce::jmax (baseAnalysis.confidence,
                                           juce::jlimit (0.0f, 1.0f, neuralAnalysis.confidence * 0.92f));
-    baseAnalysis.likelyDrifting = baseAnalysis.likelyDrifting && neuralAnalysis.likelyDrifting;
+    baseAnalysis.likelyDrifting = baseAnalysis.likelyDrifting || neuralAnalysis.likelyDrifting;
 
     if (! neuralAnalysis.barPositionsSeconds.empty())
         baseAnalysis.barPositionsSeconds = neuralAnalysis.barPositionsSeconds;
@@ -1548,8 +1544,11 @@ void refineSampleTempoAnalysisWithBeatThis (AudioPluginAudioProcessor::TempoAnal
 }
 
 AudioPluginAudioProcessor::TempoAnalysisData analyzeTempoSample (const AudioPluginAudioProcessor::LoadedSampleData& sampleData,
-                                                                const AudioPluginAudioProcessor::TempoEditState* editState)
+                                                                const AudioPluginAudioProcessor::TempoEditState* editState,
+                                                                bool* hasDirectWindowConsensus = nullptr)
 {
+    if (hasDirectWindowConsensus != nullptr)
+        *hasDirectWindowConsensus = false;
     AudioPluginAudioProcessor::TempoAnalysisData result;
     const auto baseWindow = getAnalysisWindow (sampleData, editState);
     double analysisSampleRate = tempoAnalysisTargetRate;
@@ -1616,6 +1615,19 @@ AudioPluginAudioProcessor::TempoAnalysisData analyzeTempoSample (const AudioPlug
     if (! selectedHypothesis.valid)
         return result;
 
+    if (hasDirectWindowConsensus != nullptr)
+    {
+        // Half/double hypothesis selection may have changed the tempo family.
+        // Verify direct window support for the final BPM, not the old consensus.
+        *hasDirectWindowConsensus = std::all_of (representativeWindows.begin(), representativeWindows.end(),
+            [&selectedHypothesis] (const auto& window)
+            {
+                bool direct = false;
+                getWindowTempoSupportScore (window, selectedHypothesis.bpm, &direct);
+                return direct;
+            });
+    }
+
     result.estimatedBpm = selectedHypothesis.bpm;
     result.beatPeriodSeconds = selectedHypothesis.beatPeriodSeconds;
     result.firstBeatSeconds = selectedHypothesis.firstBeatSeconds;
@@ -1653,13 +1665,15 @@ public:
         if (shouldExit() || sampleData == nullptr)
             return jobHasFinished;
 
-        auto result = std::make_shared<TempoAnalysisData> (analyzeTempoSample (*sampleData, editState.get()));
+        bool hasDirectWindowConsensus = false;
+        auto result = std::make_shared<TempoAnalysisData> (analyzeTempoSample (*sampleData, editState.get(),
+                                                                            &hasDirectWindowConsensus));
         const auto classicValid = isValidTempoAnalysis (*result);
 
-        // For sample chopping, the classical detector is faster and usually a better
-        // source of BPM/grid spacing. Only pay the neural cost when the classical
-        // answer is weak or when BeatThis strongly agrees and can refine downbeats.
-        if (classicValid && result->confidence >= strongClassicTempoConfidence && ! result->likelyDrifting)
+        // Retain fast analysis for clear loops. Moderate confidence, conflicting
+        // window interpretations, and expressive timing warrant a neural check.
+        if (classicValid && hasDirectWindowConsensus
+            && cuesampler::canUseClassicalTempoWithoutNeuralCheck (*result))
         {
             owner.publishTempoAnalysis (std::move (result), generation);
             return jobHasFinished;
@@ -1678,22 +1692,36 @@ public:
                                                                    analysisWindow.startSample,
                                                                    analysisWindow.endSample);
 
-            if (btResult.valid)
+            if (shouldExit())
+                return jobHasFinished;
+
+            if (btResult.valid && btResult.confidence >= strongNeuralTempoConfidence)
             {
                 auto neuralAnalysis = makeTempoAnalysisFromBeatThis (btResult, analysisWindow, sampleData->sampleRate);
 
-                if (classicValid
-                    && btResult.confidence >= strongNeuralTempoConfidence
-                    && doTemposAgree (result->estimatedBpm, neuralAnalysis.estimatedBpm, neuralAgreementTolerance))
+                if (classicValid && cuesampler::temposAgreeAtDifferentOctaves (result->estimatedBpm,
+                                                                               neuralAnalysis.estimatedBpm))
                 {
-                    refineSampleTempoAnalysisWithBeatThis (*result, neuralAnalysis);
-                    juce::Logger::writeToLog ("Tempo analysis: classical BPM retained, BeatThis used to refine beat/downbeat placement");
+                    // Confidence measures beat evidence, not the listener's
+                    // half/double interpretation. Keep the existing level when
+                    // independent detectors corroborate the same tempo family.
+                    // Keep its beat markers too; do not invent extra neural beats.
+                    result->confidence = juce::jmax (result->confidence, neuralAnalysis.confidence * 0.92f);
+                    result->likelyDrifting = result->likelyDrifting || neuralAnalysis.likelyDrifting;
+                    if (! neuralAnalysis.barPositionsSeconds.empty())
+                        result->barPositionsSeconds = neuralAnalysis.barPositionsSeconds;
+                    juce::Logger::writeToLog ("Tempo analysis: classical tempo level retained, BeatThis confirms half/double family");
                 }
                 else if (! classicValid
-                         || getSamplingTempoScore (neuralAnalysis) > getSamplingTempoScore (*result) + neuralSelectionScoreMargin)
+                    || getSamplingTempoScore (neuralAnalysis) > getSamplingTempoScore (*result) + neuralSelectionScoreMargin)
                 {
                     *result = std::move (neuralAnalysis);
                     juce::Logger::writeToLog ("Tempo analysis: BeatThis selected over classical detector");
+                }
+                else if (doTemposAgree (result->estimatedBpm, neuralAnalysis.estimatedBpm, neuralAgreementTolerance))
+                {
+                    refineSampleTempoAnalysisWithBeatThis (*result, neuralAnalysis);
+                    juce::Logger::writeToLog ("Tempo analysis: classical BPM retained, BeatThis used to refine beat/downbeat placement");
                 }
                 else
                 {
@@ -2001,20 +2029,102 @@ private:
     uint64_t generation = 0;
 };
 
+class AudioPluginAudioProcessor::SampleStateEncodingJob final : public juce::ThreadPoolJob
+{
+public:
+    SampleStateEncodingJob (AudioPluginAudioProcessor& ownerIn,
+                            std::shared_ptr<const LoadedSampleData> sampleIn, uint64_t generationIn)
+        : juce::ThreadPoolJob ("Compact Sample State"), owner (ownerIn),
+          sample (std::move (sampleIn)), generation (generationIn) {}
+
+    JobStatus runJob() override
+    {
+        const auto isCurrent = [this] (float)
+        {
+            return ! shouldExit()
+                && generation == owner.sampleImportGeneration.load (std::memory_order_acquire);
+        };
+        juce::MemoryBlock encoded;
+        if (! isCurrent (0.0f) || sample->deferredStateData == nullptr
+            || ! owner.serializeSampleToStateData (*sample, encoded, isCurrent))
+            return jobHasFinished; // the original snapshot remains usable on failure
+
+        auto data = std::make_shared<const juce::var> (std::move (encoded));
+        const std::lock_guard<std::recursive_mutex> lock (owner.sampleStateMutex);
+        if (isCurrent (1.0f))
+        {
+            std::atomic_store (&sample->deferredStateData->data, std::move (data));
+            owner.requestHostStateSync();
+        }
+        return jobHasFinished;
+    }
+
+private:
+    AudioPluginAudioProcessor& owner;
+    std::shared_ptr<const LoadedSampleData> sample;
+    uint64_t generation;
+};
+
+class AudioPluginAudioProcessor::SampleImportJob final : public juce::ThreadPoolJob
+{
+public:
+    SampleImportJob (AudioPluginAudioProcessor& ownerIn, juce::File fileIn, uint64_t generationIn,
+                     std::shared_ptr<SampleImportStatus> statusIn,
+                     std::function<void (SampleLoadResult)> completedIn)
+        : juce::ThreadPoolJob ("Sample Import"), owner (ownerIn), file (std::move (fileIn)),
+          generation (generationIn), status (std::move (statusIn)), completed (std::move (completedIn)) {}
+
+    JobStatus runJob() override
+    {
+        if (shouldExit())
+            return jobHasFinished;
+
+        auto result = SampleLoadResult::failed;
+        auto sample = owner.createLoadedSampleDataFromFile (file, &result, [this] (float progress)
+        {
+            if (shouldExit() || generation != owner.sampleImportGeneration.load (std::memory_order_acquire))
+                return false;
+            // Status belongs to this generation and survives editor reopening.
+            if (status != nullptr)
+                status->progress.store (progress, std::memory_order_release);
+            return true;
+        }, true);
+        {
+            const std::lock_guard<std::recursive_mutex> lock (owner.sampleStateMutex);
+            if (shouldExit() || generation != owner.sampleImportGeneration.load (std::memory_order_acquire))
+                return jobHasFinished;
+            if (sample != nullptr)
+            {
+                owner.publishImportedSample (sample);
+                owner.sampleStateEncodingThreadPool.addJob (new SampleStateEncodingJob (owner, sample, generation), true);
+            }
+            std::atomic_store (&owner.sampleImportStatus, std::shared_ptr<SampleImportStatus> {});
+        }
+        // No processor reference escapes the worker lifetime. UI callers use a
+        // SafePointer so closing the editor while importing is also safe.
+        if (completed)
+            juce::MessageManager::callAsync ([callback = std::move (completed), result] { callback (result); });
+        return jobHasFinished;
+    }
+
+private:
+    AudioPluginAudioProcessor& owner;
+    juce::File file;
+    uint64_t generation;
+    std::shared_ptr<SampleImportStatus> status;
+    std::function<void (SampleLoadResult)> completed;
+};
+
 class AudioPluginAudioProcessor::KeyDetectionJob final : public juce::ThreadPoolJob
 {
 public:
     KeyDetectionJob (AudioPluginAudioProcessor& ownerIn,
                      uint64_t generationIn,
-                     juce::File sourceFileIn,
-                     juce::AudioBuffer<float> bufferIn,
-                     double sampleRateIn)
+                     std::shared_ptr<const LoadedSampleData> sampleIn)
         : juce::ThreadPoolJob ("Key Detection"),
           owner (ownerIn),
           generation (generationIn),
-          sourceFile (std::move (sourceFileIn)),
-          buffer (std::move (bufferIn)),
-          sampleRate (sampleRateIn)
+          sample (std::move (sampleIn))
     {
     }
 
@@ -2024,12 +2134,12 @@ public:
             return finish();
 
         // Prefer an embedded key tag in the file metadata when present.
-        auto metadataResult = owner.tryReadKeyFromMetadata (sourceFile);
+        auto metadataResult = owner.tryReadKeyFromMetadata (sample->sourceFile);
         const bool haveMetadataKey = metadataResult.valid;
 
         // Always compute the local FFT guess; it is used when no metadata key
         // exists in the source file.
-        auto localResult = owner.keyDetector.detect (buffer, sampleRate);
+        auto localResult = owner.keyDetector.detect (sample->buffer, sample->sampleRate);
 
         publishResult (haveMetadataKey ? std::move (metadataResult) : std::move (localResult));
         return jobHasFinished;
@@ -2066,9 +2176,7 @@ private:
 
     AudioPluginAudioProcessor& owner;
     uint64_t generation = 0;
-    juce::File sourceFile;
-    juce::AudioBuffer<float> buffer;
-    double sampleRate = 0.0;
+    std::shared_ptr<const LoadedSampleData> sample;
 };
 
 class AudioPluginAudioProcessor::WarpRenderJob final : public juce::ThreadPoolJob
@@ -2317,6 +2425,7 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
                      #endif
                        )
 {
+    keyboardState.addListener (this);
     std::atomic_store (&tempoEditState, std::make_shared<TempoEditState>());
     publishChopState (std::make_shared<ChopState>());
 
@@ -2420,6 +2529,7 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
 
 AudioPluginAudioProcessor::~AudioPluginAudioProcessor()
 {
+    keyboardState.removeListener (this);
     stopTimer();
     if (cachePollerThread != nullptr)
     {
@@ -2430,6 +2540,10 @@ AudioPluginAudioProcessor::~AudioPluginAudioProcessor()
     }
 
     cancelPendingUpdate();
+    sampleImportGeneration.fetch_add (1, std::memory_order_acq_rel);
+    sampleImportThreadPool.removeAllJobs (true, -1);
+    sampleStateEncodingThreadPool.removeAllJobs (true, -1);
+    cancelPendingUpdate(); // an import may have requested host sync while finishing
     keyDetectionGeneration.fetch_add (1, std::memory_order_acq_rel);
     prepareWarmGeneration.fetch_add (1, std::memory_order_acq_rel);
     stemGeneration.fetch_add (1, std::memory_order_acq_rel);
@@ -2581,6 +2695,9 @@ void AudioPluginAudioProcessor::prepareToPlay (double sampleRate, int samplesPer
     setLatencySamples (0);
 
     voice.reset();
+    heldMidiNote.store (-1, std::memory_order_release);
+    for (auto& channels : heldHostMidiChannels) channels.store (0, std::memory_order_relaxed);
+    latestHostMidiKeyEvent.store (0, std::memory_order_release);
 
     // (Re)build the per-voice Bungee engines so they match the new host rate.
     // If a sample is already loaded, ensurePitchEnginesReady will use its
@@ -2595,6 +2712,7 @@ void AudioPluginAudioProcessor::releaseResources()
 {
     cancelManualChopCapture();
     voice.reset();
+    heldMidiNote.store (-1, std::memory_order_release);
 
     std::atomic_store (&pitchEngineSet, std::shared_ptr<const VoicePitchEngineSet> {});
     outputMeterLevel.store (0.0f, std::memory_order_release);
@@ -2688,10 +2806,32 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     auto totalNumOutputChannels = juce::jmin (getTotalNumOutputChannels(), buffer.getNumChannels());
     const auto analysis = std::atomic_load (&tempoAnalysis);
 
-    // Mirror host MIDI into the on-screen keyboard state and inject notes the
-    // user plays by clicking it, so clicked keys trigger chops like real MIDI.
-    keyboardState.processNextMidiBuffer (midiMessages, 0, buffer.getNumSamples(), true);
-    
+    // Mirror host key lights with atomics; keep UI key state independent so a
+    // host note-off cannot swallow the release of a held on-screen key. This
+    // also avoids MidiKeyboardState's lock and indirect-event buffer on audio.
+    for (const auto metadata : midiMessages)
+    {
+        if (metadata.numBytes < 3) continue;
+        const auto* bytes = metadata.data;
+        const int type = bytes[0] & 0xf0;
+        const auto mask = (uint16_t) (1u << (bytes[0] & 0x0f));
+        if (bytes[1] > 127 || bytes[2] > 127) continue;
+        if (type == 0x90 && bytes[2] != 0)
+        {
+            heldHostMidiChannels[(size_t) bytes[1]].fetch_or (mask, std::memory_order_relaxed);
+            // Audio is the sole producer. One lock-free snapshot also keeps
+            // short taps visible to the UI after their note-off has arrived.
+            const auto revision = (latestHostMidiKeyEvent.load (std::memory_order_relaxed) & ~2047u) + 2048u;
+            latestHostMidiKeyEvent.store (revision | ((uint32_t) (bytes[0] & 0x0f) << 7) | bytes[1],
+                                          std::memory_order_release);
+        }
+        else if (type == 0x80 || (type == 0x90 && bytes[2] == 0))
+            heldHostMidiChannels[(size_t) bytes[1]].fetch_and ((uint16_t) ~mask, std::memory_order_relaxed);
+        else if (type == 0xb0 && (bytes[1] == 120 || bytes[1] == 123))
+            for (auto& channels : heldHostMidiChannels)
+                channels.fetch_and ((uint16_t) ~mask, std::memory_order_relaxed);
+    }
+
     // Host sync snapshot
     double blockStartHostPpq = 0.0;
     bool blockHasHostPpq = false;
@@ -2767,6 +2907,10 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     if (pendingCommand != TransportCommand::none)
     {
         auto& v = voice;
+        if (pendingCommand == TransportCommand::stop || pendingCommand == TransportCommand::silence)
+        {
+            heldMidiNote.store (-1, std::memory_order_release);
+        }
 
         if (pendingCommand == TransportCommand::pause)
         {
@@ -3555,6 +3699,31 @@ void AudioPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             v.playbackActive = false;
     };
 
+    const bool overflow = onScreenMidiOverflow.exchange (false, std::memory_order_acq_rel);
+    {
+        const auto events = onScreenMidiFifo.read (onScreenMidiFifo.getNumReady());
+        const auto playEvent = [&] (int index)
+        {
+            if (overflow) return;
+            const auto& event = onScreenMidiEvents[(size_t) index];
+            const auto message = event.velocity > 0.0f
+                ? juce::MidiMessage::noteOn (event.channel, event.note, event.velocity)
+                : juce::MidiMessage::noteOff (event.channel, event.note);
+            handleMidiEvent (message, 0, sampleForBlock, currentChopState, currentHostRate,
+                             blockHasHostPpq, blockHostTransportPlaying, blockStartHostPpq, true);
+        };
+        for (int i = 0; i < events.blockSize1; ++i) playEvent (events.startIndex1 + i);
+        for (int i = 0; i < events.blockSize2; ++i) playEvent (events.startIndex2 + i);
+    }
+    if (overflow && ((voice.playbackTriggeredByMidi && heldMidiIsOnScreen)
+                     || (voice.manualChopCapture && captureMidiIsOnScreen)))
+    {
+        // A dropped UI note-off must not strand a voice or capture.
+        if (voice.manualChopCapture) cancelManualChopCapture();
+        voice.reset();
+        heldMidiNote.store (-1, std::memory_order_release);
+    }
+
     auto midiIterator = midiMessages.begin();
     auto midiEnd = midiMessages.end();
     while (currentOffset < samplesToProcess)
@@ -3652,7 +3821,8 @@ void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg,
                                                 double currentHostRate,
                                                 bool blockHasHostPpq,
                                                 bool blockHostTransportPlaying,
-                                                double blockStartHostPpq)
+                                                double blockStartHostPpq,
+                                                bool onScreen)
 {
     // Manual-chop capture is deliberately handled before normal pad playback.
     // The audio thread only mutates its voice and atomics here: no allocation,
@@ -3677,6 +3847,7 @@ void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg,
             const int heldNote = manualChopCaptureHeldNote.load (std::memory_order_acquire);
             if (heldNote >= 0 && msg.getNoteNumber() == heldNote
                 && msg.getChannel() == voice.manualCaptureChannel
+                && onScreen == captureMidiIsOnScreen
                 && voice.manualCaptureGeneration == manualCaptureGeneration.load (std::memory_order_acquire))
             {
                 const int endLimit = currentSample != nullptr
@@ -3728,6 +3899,7 @@ void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg,
 
             auto& captureVoice = voice;
             captureVoice.reset();
+            heldMidiNote.store (-1, std::memory_order_release);
             captureVoice.playbackActive = true;
             captureVoice.playbackSamplePosition = (double) startSample;
             captureVoice.playbackStopSample = (double) sourceLength;
@@ -3742,6 +3914,7 @@ void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg,
             captureVoice.manualCaptureContext = manualCaptureContext.load (std::memory_order_acquire);
             captureVoice.manualCaptureStart = startSample;
             captureVoice.manualCaptureChannel = msg.getChannel();
+            captureMidiIsOnScreen = onScreen;
             captureVoice.manualCaptureSource = currentSample.get();
             captureVoice.fadeGain = 1.0f;
             captureVoice.fadeTarget = 1.0f;
@@ -3757,7 +3930,8 @@ void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg,
 
     if (msg.isNoteOff())
     {
-        if (msg.getNoteNumber() == heldMidiNote.load())
+        if (msg.getNoteNumber() == heldMidiNote.load()
+            && msg.getChannel() == heldMidiChannel && onScreen == heldMidiIsOnScreen)
         {
             heldMidiNote.store (-1, std::memory_order_release);
             // OneShot voices own their lifetime and play through the chop end.
@@ -3778,16 +3952,15 @@ void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg,
     if (currentChopState == nullptr)
         return;
 
-    const auto noteNumber = msg.getNoteNumber();
+    const int noteNumber = msg.getNoteNumber();
+    const int channel = msg.getChannel();
     if (noteNumber < 0 || noteNumber > 127)
         return;
 
-    // One array read. Both mapping rules — explicit pins and the legacy
-    // positional map — were resolved into this table at publish time, so there
-    // is no scan here any more and no chance of disagreeing with what the UI
-    // shows. See rebuildChopMidiMap.
-    const auto& midiMap = currentChopState->midiMap;
-    const int chopIndex = midiMap.noteToChopIndex[(size_t) noteNumber];
+    // Host and on-screen keys use the same absolute MIDI note/channel.
+    // OCT and CHOPS only select the screen keyboard's view; they must never
+    // reinterpret recorded notes (for example, FL C6 as CUE C0).
+    const int chopIndex = currentChopState->midiMap.channelNoteToChopIndex[(size_t) (channel - 1)][(size_t) noteNumber];
     if (chopIndex < 0 || chopIndex >= (int) currentChopState->chops.size())
         return;
 
@@ -3827,6 +4000,8 @@ void AudioPluginAudioProcessor::handleMidiEvent (const juce::MidiMessage& msg,
     vs.fadeStep = 0.0f;
     vs.startEnvelope (chop, currentHostRate);
     heldMidiNote.store (msg.getNoteNumber(), std::memory_order_release);
+    heldMidiIsOnScreen = onScreen;
+    heldMidiChannel = msg.getChannel();
     lastTriggeredChopId.store (chop.id, std::memory_order_release);
     chopTriggerRevision.fetch_add (1, std::memory_order_acq_rel);
 
@@ -3880,15 +4055,25 @@ void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData
     state.setProperty ("muteBass", muteBass.load (std::memory_order_acquire), nullptr);
     state.setProperty ("muteVocals", muteVocals.load (std::memory_order_acquire), nullptr);
 
-    // Audio has already been encoded on the loading/separation worker. Cache
-    // eviction, a missing model, or a different machine cannot change recall.
+    // Imported audio has an embedded source snapshot immediately; the persistence
+    // worker can later substitute compact audio without delaying import or save.
     if (const auto stems = std::atomic_load (&stemSet); stems != nullptr)
     {
         state.setProperty ("stemCacheKey", stems->cacheKey, nullptr);
         state.setProperty ("embeddedStemData", stems->serializedStemData, nullptr);
     }
     state.setProperty ("chopBarsCount", chopBarsCount.load (std::memory_order_acquire), nullptr);
-    state.setProperty ("midiOctaveOffset", midiOctaveOffset.load (std::memory_order_acquire), nullptr);
+    // Older builds interpreted this as transposition. Save zero for them and
+    // persist the viewport separately so reopening never shifts recorded notes.
+    state.setProperty ("midiOctaveOffset", 0, nullptr);
+    state.setProperty ("keyboardStartNote", getKeyboardStartNote(), nullptr);
+    state.setProperty ("recordedMidiRoot", recordedMidiRoot.load (std::memory_order_acquire), nullptr);
+    state.setProperty ("midiChannelBanks", isMidiBankModeEnabled(), nullptr);
+    state.setProperty ("keyboardMidiBank", getKeyboardMidiBank(), nullptr);
+    // Retire learned transposition, including when reopening in an older build.
+    state.setProperty ("keyboardMidiNavigation", false, nullptr);
+    state.setProperty ("keyboardMidiInputBase", -1, nullptr);
+    state.setProperty ("midiFollowsOctaveBank", false, nullptr); // compatibility with earlier builds
     state.setProperty ("playbackSamplePosition", playbackSamplePosition.load (std::memory_order_acquire), nullptr);
 
     const auto currentSample = std::atomic_load (&loadedSample);
@@ -3899,8 +4084,9 @@ void AudioPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData
         state.setProperty ("samplePath", currentSample->filePath, nullptr);
         state.setProperty ("sampleFileName", currentSample->fileName, nullptr);
 
-        if (currentSample->serializedStateData.getBinaryData() != nullptr)
-            state.setProperty ("embeddedSampleData", currentSample->serializedStateData, nullptr);
+        const auto sampleStateData = currentSample->getSerializedStateData();
+        if (sampleStateData.getBinaryData() != nullptr)
+            state.setProperty ("embeddedSampleData", sampleStateData, nullptr);
     }
 
     if (const auto currentEditState = std::atomic_load (&tempoEditState); currentEditState != nullptr)
@@ -4027,6 +4213,10 @@ void AudioPluginAudioProcessor::setStateInformation (const void* data, int sizeI
 
     const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
     pendingRestoreState = state;
+    sampleImportGeneration.fetch_add (1, std::memory_order_acq_rel);
+    sampleImportThreadPool.removeAllJobs (false, 0);
+    sampleStateEncodingThreadPool.removeAllJobs (false, 0);
+    std::atomic_store (&sampleImportStatus, std::shared_ptr<SampleImportStatus> {});
     cancelManualChopCapture();
     manualCaptureContext.fetch_add (1, std::memory_order_acq_rel);
     resetStemState();
@@ -4235,8 +4425,15 @@ AudioPluginAudioProcessor::parseDeferredRestoreState (const juce::ValueTree& sta
     restoreState.restoredMuteVocals = (bool) state.getProperty ("muteVocals", false);
     restoreState.restoredStemCacheKey = state.getProperty ("stemCacheKey").toString();
     restoreState.restoredBarsPerChop = juce::jlimit (1, 8, (int) state.getProperty ("chopBarsCount", 1));
-    restoreState.restoredMidiOctaveOffset = juce::jlimit (midiOctaveOffsetMin, midiOctaveOffsetMax,
-                                                          (int) state.getProperty ("midiOctaveOffset", 0));
+    const int keyboardStart = juce::jlimit (0, 120, (int) state.getProperty ("keyboardStartNote", 48));
+    restoreState.restoredMidiOctaveOffset = keyboardStart / 12;
+    // Historical projects used note 36 as the root. Retain their recorded map,
+    // including the oldest format where the offset was part of that root.
+    const int legacyOffset = juce::jlimit (-maximumRestoredSequenceItems, 4, (int) state.getProperty ("midiOctaveOffset", 0));
+    restoreState.restoredRecordedMidiRoot = juce::jlimit (0, 127,
+        (int) state.getProperty ("recordedMidiRoot", 36 + legacyOffset * 12));
+    restoreState.restoredMidiBankMode = (bool) state.getProperty ("midiChannelBanks", false);
+    restoreState.restoredKeyboardMidiBank = juce::jlimit (1, 16, (int) state.getProperty ("keyboardMidiBank", 1));
     restoreState.restoredPlaybackPosition = (double) state.getProperty ("playbackSamplePosition", 0.0);
     if (! std::isfinite (restoreState.restoredPlaybackPosition) || restoreState.restoredPlaybackPosition < 0.0)
         restoreState.restoredPlaybackPosition = 0.0;
@@ -4295,6 +4492,9 @@ void AudioPluginAudioProcessor::applyParsedRestoreState (const DeferredRestoreSt
                                                                                                             : 8,
                          std::memory_order_release);
     midiOctaveOffset.store (restoreState.restoredMidiOctaveOffset, std::memory_order_release);
+    recordedMidiRoot.store (restoreState.restoredRecordedMidiRoot, std::memory_order_release);
+    midiBankMode.store (restoreState.restoredMidiBankMode, std::memory_order_release);
+    keyboardMidiBank.store (restoreState.restoredKeyboardMidiBank, std::memory_order_release);
 
     playbackSamplePosition.store (restoreState.restoredPlaybackPosition, std::memory_order_release);
     playbackActive.store (false, std::memory_order_release);
@@ -4498,7 +4698,9 @@ juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 
 std::shared_ptr<AudioPluginAudioProcessor::LoadedSampleData>
 AudioPluginAudioProcessor::createLoadedSampleDataFromFile (const juce::File& file,
-                                                           SampleLoadResult* loadResult)
+                                                           SampleLoadResult* loadResult,
+                                                           const std::function<bool (float)>& progress,
+                                                           bool deferStateEncoding)
 {
     if (loadResult != nullptr)
         *loadResult = SampleLoadResult::failed;
@@ -4517,7 +4719,40 @@ AudioPluginAudioProcessor::createLoadedSampleDataFromFile (const juce::File& fil
         return {};
     }
 
-    auto sampleData = readValidatedSampleData (*reader);
+    juce::var sourceSnapshot;
+    if (deferStateEncoding)
+    {
+        if (! isSupportedReaderShape (*reader))
+            return {};
+        auto input = file.createInputStream();
+        if (input == nullptr || input->getTotalLength() <= 0
+            || (juce::uint64) input->getTotalLength() > maximumEmbeddedSampleBytes)
+            return {};
+        juce::MemoryBlock bytes ((size_t) input->getTotalLength());
+        constexpr size_t blockSize = 65536;
+        for (size_t offset = 0; offset < bytes.getSize(); offset += blockSize)
+        {
+            if (progress && ! progress (-1.0f))
+                return {};
+            const auto count = (int) juce::jmin (blockSize, bytes.getSize() - offset);
+            if (input->read (static_cast<char*> (bytes.getData()) + offset, count) != count)
+                return {};
+        }
+        sourceSnapshot = juce::var (std::move (bytes));
+        // Decode exactly the bytes that an immediate project save will embed,
+        // even if the original file changes or disappears during import.
+        reader.reset (localFormatManager.createReaderFor (
+            std::make_unique<juce::MemoryInputStream> (*sourceSnapshot.getBinaryData(), false)));
+        if (reader == nullptr)
+            return {};
+        if (isReaderTooLong (*reader))
+        {
+            if (loadResult != nullptr) *loadResult = SampleLoadResult::fileTooLong;
+            return {};
+        }
+    }
+
+    auto sampleData = readValidatedSampleData (*reader, progress);
     if (sampleData == nullptr)
         return {};
 
@@ -4526,10 +4761,18 @@ AudioPluginAudioProcessor::createLoadedSampleDataFromFile (const juce::File& fil
     sampleData->fileName = file.getFileNameWithoutExtension();
     sampleData->leadingContentStartSample = findLeadingContentStartSample (*sampleData, 0,
                                                                            sampleData->buffer.getNumSamples());
-    juce::MemoryBlock encoded;
-    if (! serializeSampleToStateData (*sampleData, encoded))
-        return {};
-    sampleData->serializedStateData = juce::var (encoded);
+    if (deferStateEncoding)
+    {
+        sampleData->deferredStateData = std::make_shared<SamplePersistenceData>();
+        sampleData->deferredStateData->data = std::make_shared<const juce::var> (std::move (sourceSnapshot));
+    }
+    else
+    {
+        juce::MemoryBlock encoded;
+        if (! serializeSampleToStateData (*sampleData, encoded, progress))
+            return {};
+        sampleData->serializedStateData = juce::var (std::move (encoded));
+    }
 
     if (loadResult != nullptr)
         *loadResult = SampleLoadResult::loaded;
@@ -4568,7 +4811,8 @@ KeyDetector::Result AudioPluginAudioProcessor::tryReadKeyFromMetadata (const juc
 }
 
 bool AudioPluginAudioProcessor::serializeSampleToStateData (const LoadedSampleData& sampleData,
-                                                            juce::MemoryBlock& stateData) const
+                                                            juce::MemoryBlock& stateData,
+                                                            const std::function<bool (float)>& progress) const
 {
     stateData.reset();
 
@@ -4577,34 +4821,22 @@ bool AudioPluginAudioProcessor::serializeSampleToStateData (const LoadedSampleDa
     if (numChannels <= 0 || numSamples <= 0 || sampleData.sampleRate <= 0.0)
         return false;
 
-    auto serializeWithFormat = [&] (juce::AudioFormat& format, int bitsPerSample) -> bool
-    {
-        juce::MemoryBlock encodedAudio;
-        std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::MemoryOutputStream> (encodedAudio, false);
-        const auto options = juce::AudioFormatWriterOptions()
-                                 .withSampleRate (sampleData.sampleRate)
-                                 .withNumChannels (numChannels)
-                                 .withBitsPerSample (bitsPerSample)
-                                 .withSampleFormat (juce::AudioFormatWriterOptions::SampleFormat::floatingPoint);
+    juce::MemoryBlock encoded;
+    cuesampler::Mp3AudioCodec::EncodedInfo info;
+    if (! cuesampler::Mp3AudioCodec::encode (sampleData.buffer, sampleData.sampleRate, encoded, &info, 320, progress)
+        || info.samples <= 0 || info.samples > std::numeric_limits<int>::max())
+        return false;
 
-        auto writer = format.createWriterFor (stream, options);
-        if (writer == nullptr)
-            return false;
-
-        if (! writer->writeFromAudioSampleBuffer (sampleData.buffer, 0, numSamples))
-            return false;
-
-        writer.reset();
-
-        if (encodedAudio.getSize() == 0)
-            return false;
-
-        stateData = std::move (encodedAudio);
-        return true;
-    };
-
-    juce::WavAudioFormat wavFormat;
-    return serializeWithFormat (wavFormat, 32);
+    juce::MemoryOutputStream output (stateData, false);
+    output.write ("CUMP", 4);
+    output.writeInt (1);
+    output.writeDouble (info.sampleRate);
+    output.writeInt (info.channels);
+    output.writeInt ((int) info.samples);
+    output.writeInt64 ((juce::int64) encoded.getSize());
+    output.write (encoded.getData(), encoded.getSize());
+    output.flush();
+    return ! stateData.isEmpty();
 }
 
 std::shared_ptr<AudioPluginAudioProcessor::LoadedSampleData>
@@ -4613,6 +4845,38 @@ AudioPluginAudioProcessor::createLoadedSampleDataFromStateData (const juce::Memo
 {
     if (stateData.getSize() == 0 || stateData.getSize() > maximumEmbeddedSampleBytes)
         return {};
+
+    if (stateData.getSize() >= 4 && std::memcmp (stateData.getData(), "CUMP", 4) == 0)
+    {
+        juce::MemoryInputStream input (stateData, false);
+        char magic[4] = {};
+        input.read (magic, 4);
+        const auto version = input.readInt();
+        const auto sampleRate = input.readDouble();
+        const auto channels = input.readInt();
+        const auto samples = input.readInt();
+        const auto bytes = input.readInt64();
+        if (version != 1 || ! std::isfinite (sampleRate)
+            || sampleRate < 8000.0 || sampleRate > 384000.0
+            || channels < 1 || channels > 2 || samples <= 0
+            || (double) samples > sampleRate * maximumLoadedSampleMinutes * 60.0
+            || bytes <= 0 || bytes != input.getNumBytesRemaining()
+            || bytes > std::numeric_limits<int>::max())
+            return {};
+
+        juce::MemoryBlock mp3 ((size_t) bytes);
+        if (input.read (mp3.getData(), (int) bytes) != bytes)
+            return {};
+
+        auto sampleData = std::make_shared<LoadedSampleData>();
+        if (! cuesampler::Mp3AudioCodec::decode (mp3, sampleRate, channels, samples, sampleData->buffer))
+            return {};
+        sampleData->sampleRate = sampleRate;
+        sampleData->fileName = fileName.isNotEmpty() ? fileName : "Embedded Sample";
+        sampleData->leadingContentStartSample = findLeadingContentStartSample (*sampleData, 0, samples);
+        sampleData->serializedStateData = juce::var (stateData);
+        return sampleData;
+    }
 
     juce::AudioFormatManager localFormatManager;
     localFormatManager.registerBasicFormats();
@@ -4636,12 +4900,42 @@ AudioPluginAudioProcessor::createLoadedSampleDataFromStateData (const juce::Memo
 AudioPluginAudioProcessor::SampleLoadResult
 AudioPluginAudioProcessor::loadAudioFile (const juce::File& file)
 {
+    uint64_t generation;
+    {
+        const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
+        generation = sampleImportGeneration.fetch_add (1, std::memory_order_acq_rel) + 1;
+        sampleImportThreadPool.removeAllJobs (false, 0);
+        sampleStateEncodingThreadPool.removeAllJobs (false, 0);
+        std::atomic_store (&sampleImportStatus, std::shared_ptr<SampleImportStatus> {});
+    }
     auto loadResult = SampleLoadResult::failed;
     auto sampleData = createLoadedSampleDataFromFile (file, &loadResult);
     if (sampleData == nullptr)
         return loadResult;
 
     const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
+    if (generation != sampleImportGeneration.load (std::memory_order_acquire))
+        return SampleLoadResult::failed;
+    publishImportedSample (sampleData);
+    return SampleLoadResult::loaded;
+}
+
+void AudioPluginAudioProcessor::loadAudioFileAsync (
+    const juce::File& file, std::function<void (SampleLoadResult)> completed)
+{
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
+    const auto generation = sampleImportGeneration.fetch_add (1, std::memory_order_acq_rel) + 1;
+    sampleImportThreadPool.removeAllJobs (false, 0);
+    sampleStateEncodingThreadPool.removeAllJobs (false, 0);
+    auto status = std::make_shared<SampleImportStatus>();
+    status->fileName = file.getFileName();
+    std::atomic_store (&sampleImportStatus, status);
+    sampleImportThreadPool.addJob (new SampleImportJob (*this, file, generation, std::move (status), std::move (completed)), true);
+}
+
+void AudioPluginAudioProcessor::publishImportedSample (const std::shared_ptr<LoadedSampleData>& sampleData)
+{
+    // Caller holds sampleStateMutex; audio rendering never takes this mutex.
     resetStemState();
     favoritesViewEnabled.store (false, std::memory_order_release);
     cancelManualChopCapture();
@@ -4667,6 +4961,10 @@ AudioPluginAudioProcessor::loadAudioFile (const juce::File& file)
         std::atomic_store (&loadedSample, sampleData);
         std::atomic_store (&tempoAnalysis, std::shared_ptr<TempoAnalysisData> {});
         std::atomic_store (&tempoEditState, std::make_shared<TempoEditState> ());
+        recordedMidiRoot.store (midiRootNote, std::memory_order_release);
+        midiOctaveOffset.store (midiRootNote / 12, std::memory_order_release);
+        midiBankMode.store (true, std::memory_order_release);
+        keyboardMidiBank.store (1, std::memory_order_release);
         publishChopState (std::make_shared<ChopState> ());
         clearEditUndoHistory(); // a fresh sample starts with no edit history
         doubleTempoEnabled.store (false, std::memory_order_release);
@@ -4694,15 +4992,9 @@ AudioPluginAudioProcessor::loadAudioFile (const juce::File& file)
         keyDetectionThreadPool.removeAllJobs (false, 0);
         keyDetectionInProgress.store (true, std::memory_order_release);
 
-        auto keyBuffer = sampleData->buffer;
-        const auto keySampleRate = sampleData->sampleRate;
-        const auto sourceFile = sampleData->sourceFile;
-
         keyDetectionThreadPool.addJob (new KeyDetectionJob (*this,
                                                             keyGeneration,
-                                                            sourceFile,
-                                                            std::move (keyBuffer),
-                                                            keySampleRate),
+                                                            sampleData),
                                        true);
 
         touchTempoUiRevision();
@@ -4710,7 +5002,6 @@ AudioPluginAudioProcessor::loadAudioFile (const juce::File& file)
         requestHostStateSync();
     }
 
-    return SampleLoadResult::loaded;
 }
 
 std::shared_ptr<const AudioPluginAudioProcessor::LoadedSampleData> AudioPluginAudioProcessor::getLoadedSample() const
@@ -4908,38 +5199,16 @@ juce::File AudioPluginAudioProcessor::renderChopExport (const ChopExportRequest&
                                              + "_chop" + juce::String (chop.id)
                                              + "_pitch_" + juce::String (request.pitch, 2)
                                              + "_export_" + juce::Uuid().toString()
-                                             + ".wav");
+                                             + ".mp3");
     tempFile.deleteFile();
 
-    auto rawStream = std::make_unique<juce::FileOutputStream> (tempFile);
-    if (! rawStream->openedOk())
-        return {};
-
-    std::unique_ptr<juce::OutputStream> outputStream = std::move (rawStream);
-
-    juce::WavAudioFormat wav;
-    const auto options = juce::AudioFormatWriterOptions()
-                             .withSampleRate (currentHostRate)
-                             .withNumChannels (numChannels)
-                             .withBitsPerSample (32)
-                             .withSampleFormat (juce::AudioFormatWriterOptions::SampleFormat::floatingPoint);
-
-    auto writer = wav.createWriterFor (outputStream, options);
-    if (writer == nullptr)
+    juce::MemoryBlock encoded;
+    if (! cuesampler::Mp3AudioCodec::encode (outputBuffer, currentHostRate, encoded)
+        || ! tempFile.replaceWithData (encoded.getData(), encoded.getSize()))
     {
-        outputStream.reset();
         tempFile.deleteFile();
         return {};
     }
-
-    if (! writer->writeFromAudioSampleBuffer (outputBuffer, 0, framesToWrite))
-    {
-        writer.reset();
-        tempFile.deleteFile();
-        return {};
-    }
-
-    writer.reset();
     return tempFile;
 }
 
@@ -5201,21 +5470,32 @@ AudioPluginAudioProcessor::getChopPlaybackMode() const noexcept
                : ChopPlaybackMode::Gate;
 }
 
+void AudioPluginAudioProcessor::enqueueOnScreenMidi (int channel, int note, float velocity)
+{
+    const auto slot = onScreenMidiFifo.write (1);
+    if (slot.blockSize1 > 0)
+        onScreenMidiEvents[(size_t) slot.startIndex1] = { channel, note, velocity };
+    else
+        onScreenMidiOverflow.store (true, std::memory_order_release);
+}
+
+void AudioPluginAudioProcessor::handleNoteOn (juce::MidiKeyboardState*, int channel, int note, float velocity)
+{
+    enqueueOnScreenMidi (channel, note, velocity);
+}
+
+void AudioPluginAudioProcessor::handleNoteOff (juce::MidiKeyboardState*, int channel, int note, float)
+{
+    enqueueOnScreenMidi (channel, note, 0.0f);
+}
+
 void AudioPluginAudioProcessor::setMidiOctaveOffset (int octaves)
 {
-    if (isFavoritesViewEnabled()) return; // Favorites uses C2; preserve the normal root.
-    const int clamped = juce::jlimit (midiOctaveOffsetMin, midiOctaveOffsetMax, octaves);
+    const std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
+    const int clamped = juce::jlimit (getMidiOctaveOffsetMin(), midiOctaveOffsetMax, octaves);
     if (clamped == midiOctaveOffset.exchange (clamped, std::memory_order_acq_rel))
         return; // no change → don't churn the UI / host state
-
-    // The positional half of the note map is resolved against the root, and the
-    // root just moved — so the map is now stale even though the chop list did
-    // not change. Republish to rebuild it. Easy to overlook: this is the one
-    // path that invalidates the mapping without touching a single chop.
-    if (const auto current = std::atomic_load (&chopState))
-        publishChopState (std::make_shared<ChopState> (*current));
-
-    // Refresh the editor (chop note names, lit keys) and persist the offset.
+    // Only the keyboard viewport changes; the MIDI lookup stays absolute.
     notifyEditStateChanged();
 }
 
@@ -5224,15 +5504,70 @@ int AudioPluginAudioProcessor::getMidiOctaveOffset() const noexcept
     return midiOctaveOffset.load (std::memory_order_acquire);
 }
 
-int AudioPluginAudioProcessor::getMidiRootNote() const noexcept
+int AudioPluginAudioProcessor::getMidiOctaveOffsetMin() const noexcept
 {
-    return isFavoritesViewEnabled() ? midiRootNote
-                                   : midiRootNote + midiOctaveOffset.load (std::memory_order_acquire) * 12;
+    return midiOctaveOffsetMin;
 }
 
-// Resolves both mapping rules into one table. Order matters and mirrors what
-// the audio thread used to do inline, so behaviour is unchanged for every chop
-// set that was not already ambiguous:
+int AudioPluginAudioProcessor::getMidiRootNote() const noexcept
+{
+    return recordedMidiRoot.load (std::memory_order_acquire);
+}
+
+void AudioPluginAudioProcessor::setMidiBankModeEnabled (bool enabled)
+{
+    std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
+    if (midiBankMode.exchange (enabled, std::memory_order_acq_rel) == enabled) return;
+    keyboardMidiBank.store (1, std::memory_order_release);
+    pendingTransportCommand.store ((int) TransportCommand::silence, std::memory_order_release);
+    if (const auto state = getChopState()) publishChopState (std::make_shared<ChopState> (*state));
+    notifyEditStateChanged();
+}
+
+void AudioPluginAudioProcessor::setKeyboardMidiBank (int channel)
+{
+    std::lock_guard<std::recursive_mutex> lock (sampleStateMutex);
+    channel = juce::jlimit (1, getMidiBankCount(), channel);
+    if (keyboardMidiBank.exchange (channel, std::memory_order_acq_rel) != channel)
+        notifyEditStateChanged();
+}
+
+int AudioPluginAudioProcessor::getMidiBankCount() const noexcept
+{
+    if (! isMidiBankModeEnabled()) return 1;
+    int last = 1;
+    if (const auto state = getChopState())
+        for (const int channel : state->midiMap.channelForChopIndex) last = juce::jmax (last, channel);
+    return last;
+}
+
+int AudioPluginAudioProcessor::getAvailableMidiBankCount() const noexcept
+{
+    // Old projects alias every incoming MIDI channel to the same notes. Do not
+    // offer an implicit slider conversion that would change recorded clips.
+    if (! isMidiBankModeEnabled()) return 1;
+    const auto state = getChopState();
+    if (state == nullptr) return 1;
+    const int stride = 128 - juce::jlimit (0, 127, getMidiRootNote());
+    int lastPosition = -1;
+    if (state->midiMap.favoritesOnly)
+        lastPosition = (int) state->favoriteChopIndices.size() - 1;
+    else
+        for (size_t i = 0; i < state->chops.size(); ++i)
+            if (state->chops[i].assignedMidiNote == -1) lastPosition = (int) i;
+    return juce::jlimit (1, 16, lastPosition < 0 ? 1 : lastPosition / stride + 1);
+}
+
+int AudioPluginAudioProcessor::getMidiChannelForChopId (int chopId) const noexcept
+{
+    if (const auto state = getChopState())
+        for (size_t index = 0; index < state->chops.size(); ++index)
+            if (state->chops[index].id == chopId)
+                return index < state->midiMap.channelForChopIndex.size() ? state->midiMap.channelForChopIndex[index] : 0;
+    return 0;
+}
+
+// Resolve absolute pins and positional chops without any viewport transposition:
 //
 //   1. An explicit pin (assignedMidiNote 0..127) claims its note. On a
 //      collision the lowest chop index wins — that is what the old first-match
@@ -5241,14 +5576,41 @@ int AudioPluginAudioProcessor::getMidiRootNote() const noexcept
 //      note is still free. A pin always outranks it.
 //   3. -2 is deliberately unassigned and never claims anything.
 //
-// Anything that fails to claim a note is left at -1: UNREACHABLE. That case
-// always existed, it just had no name and no way to be displayed.
-void AudioPluginAudioProcessor::rebuildChopMidiMap (ChopState& state, int rootNote, bool favoritesOnly)
+// Banks repeat root..127 on channels 1..16. New imports use 104 notes from
+// C2; saved roots retain their previous stride. Legacy maps alias all
+// channels to bank 1. Deliberately unassigned and overflow chops stay -1.
+void AudioPluginAudioProcessor::rebuildChopMidiMap (ChopState& state, int rootNote, bool favoritesOnly, bool channelBanks)
 {
     auto& map = state.midiMap;
     map.rootNote = rootNote;
+    map.favoritesOnly = favoritesOnly;
     map.noteToChopIndex.fill (-1);
+    for (auto& channel : map.channelNoteToChopIndex) channel.fill (-1);
     map.noteForChopIndex.assign (state.chops.size(), -1);
+    map.channelForChopIndex.assign (state.chops.size(), 0);
+    map.channelBanks = channelBanks;
+    const int stride = 128 - juce::jlimit (0, 127, rootNote);
+    const auto assign = [&] (int index, int channel, int note)
+    {
+        if (channel < 0 || channel >= 16 || note < 0 || note > 127) return;
+        auto& target = map.channelNoteToChopIndex[(size_t) channel][(size_t) note];
+        if (target >= 0) return;
+        target = index;
+        map.noteForChopIndex[(size_t) index] = note;
+        map.channelForChopIndex[(size_t) index] = channel + 1;
+    };
+    const auto assignPosition = [&] (int index, int position)
+    {
+        assign (index, channelBanks ? position / stride : 0,
+                rootNote + (channelBanks ? position % stride : position));
+    };
+    const auto finalize = [&]
+    {
+        map.noteToChopIndex = map.channelNoteToChopIndex[0];
+        if (! channelBanks)
+            for (int channel = 1; channel < 16; ++channel)
+                map.channelNoteToChopIndex[(size_t) channel] = map.noteToChopIndex;
+    };
 
     const int numChops = (int) state.chops.size();
     state.favoriteChopIndices.clear();
@@ -5273,40 +5635,29 @@ void AudioPluginAudioProcessor::rebuildChopMidiMap (ChopState& state, int rootNo
         if (! selectedFavorite)
             state.selectedChopId = state.favoriteChopIndices.empty() ? -1
                                  : state.chops[(size_t) state.favoriteChopIndices.front()].id;
-        for (size_t slot = 0; slot < state.favoriteChopIndices.size() && rootNote + (int) slot <= 127; ++slot)
+        for (size_t slot = 0; slot < state.favoriteChopIndices.size(); ++slot)
         {
             const int index = state.favoriteChopIndices[slot];
-            const int note = rootNote + (int) slot;
-            if (note < 0) continue;
-            map.noteToChopIndex[(size_t) note] = index;
-            map.noteForChopIndex[(size_t) index] = note;
+            assignPosition (index, (int) slot);
         }
+        finalize();
         return;
     }
 
     for (int i = 0; i < numChops; ++i)
     {
-        const int note = state.chops[(size_t) i].assignedMidiNote;
-        if (note < 0 || note > 127)
-            continue;
-        if (map.noteToChopIndex[(size_t) note] >= 0)
-            continue; // an earlier pin owns this note; this chop is unreachable
-        map.noteToChopIndex[(size_t) note] = i;
-        map.noteForChopIndex[(size_t) i]   = note;
+        const int assigned = state.chops[(size_t) i].assignedMidiNote;
+        if (assigned < 0) continue;
+        assign (i, 0, assigned); // Existing explicit pins retain channel 1.
     }
 
     for (int i = 0; i < numChops; ++i)
     {
         if (state.chops[(size_t) i].assignedMidiNote != -1)
             continue;
-        const int note = rootNote + i;
-        if (note < 0 || note > 127)
-            continue;
-        if (map.noteToChopIndex[(size_t) note] >= 0)
-            continue; // a pin already claimed it; this chop is unreachable
-        map.noteToChopIndex[(size_t) note] = i;
-        map.noteForChopIndex[(size_t) i]   = note;
+        assignPosition (i, i);
     }
+    finalize();
 }
 
 void AudioPluginAudioProcessor::publishChopState (std::shared_ptr<ChopState> next)
@@ -5320,16 +5671,21 @@ void AudioPluginAudioProcessor::publishChopState (std::shared_ptr<ChopState> nex
         if (next->published)
             next = std::make_shared<ChopState> (*next);
 
-        rebuildChopMidiMap (*next, getMidiRootNote(), isFavoritesViewEnabled());
-        // A favorite removed/reordered while a key is held must not leave an
-        // old gate voice sounding under the newly assigned note.
+        // Screen keys, waveform labels and DAW MIDI share one absolute map.
+        rebuildChopMidiMap (*next, getMidiRootNote(), isFavoritesViewEnabled(), isMidiBankModeEnabled());
+        next->recordedNoteToChopIndex = next->midiMap.noteToChopIndex;
+        // Membership edits within Favorites retire the old map's held voice.
+        // Entering the view only changes the mapping for future note-ons;
+        // existing voices retain their chop ID and original note-off pairing.
         if (isFavoritesViewEnabled())
-            if (const auto previous = std::atomic_load (&chopState); previous != nullptr)
+            if (const auto previous = std::atomic_load (&chopState);
+                previous != nullptr && previous->midiMap.favoritesOnly)
+                for (int channel = 0; channel < 16; ++channel)
                 for (int note = 0; note < 128; ++note)
                 {
-                    const auto idAt = [note] (const ChopState& state)
+                    const auto idAt = [note, channel] (const ChopState& state)
                     {
-                        const int index = state.midiMap.noteToChopIndex[(size_t) note];
+                        const int index = state.midiMap.channelNoteToChopIndex[(size_t) channel][(size_t) note];
                         return index >= 0 && (size_t) index < state.chops.size() ? state.chops[(size_t) index].id : -1;
                     };
                     if (idAt (*previous) != idAt (*next))
@@ -5338,6 +5694,18 @@ void AudioPluginAudioProcessor::publishChopState (std::shared_ptr<ChopState> nex
                         break;
                     }
                 }
+        int bankCount = 1;
+        for (const int channel : next->midiMap.channelForChopIndex) bankCount = juce::jmax (bankCount, channel);
+        int selectedBank = juce::jlimit (1, bankCount, getKeyboardMidiBank());
+        const auto hasNotes = [&] (int channel)
+        {
+            const auto& notes = next->midiMap.channelNoteToChopIndex[(size_t) (channel - 1)];
+            return std::any_of (notes.begin(), notes.end(), [] (int index) { return index >= 0; });
+        };
+        if (! hasNotes (selectedBank))
+            for (int channel = 1; channel <= bankCount; ++channel)
+                if (hasNotes (channel)) { selectedBank = channel; break; }
+        keyboardMidiBank.store (selectedBank, std::memory_order_release);
         next->published = true;
     }
 
@@ -5368,6 +5736,15 @@ int AudioPluginAudioProcessor::getMidiNoteForChopId (int chopId) const noexcept
     return -1;
 }
 
+std::bitset<128> AudioPluginAudioProcessor::getHeldHostMidiNotes() const noexcept
+{
+    std::bitset<128> notes;
+    for (size_t i = 0; i < heldHostMidiChannels.size(); ++i)
+        notes.set (i, (heldHostMidiChannels[i].load (std::memory_order_relaxed)
+                      & (isMidiBankModeEnabled() ? (1u << (getKeyboardMidiBank() - 1)) : 0xffffu)) != 0);
+    return notes;
+}
+
 std::bitset<128> AudioPluginAudioProcessor::getMappedMidiNotes() const noexcept
 {
     std::bitset<128> mapped;
@@ -5376,7 +5753,7 @@ std::bitset<128> AudioPluginAudioProcessor::getMappedMidiNotes() const noexcept
         return mapped;
 
     for (int note = 0; note < 128; ++note)
-        if (state->midiMap.noteToChopIndex[(size_t) note] >= 0)
+        if (state->midiMap.channelNoteToChopIndex[(size_t) (getKeyboardMidiBank() - 1)][(size_t) note] >= 0)
             mapped.set ((size_t) note);
 
     return mapped;
@@ -5943,6 +6320,7 @@ AudioPluginAudioProcessor::createStemMix (const StemSet& stems, int muteMask)
         newSample->fileName                  = stems.source->fileName;
         newSample->leadingContentStartSample = stems.source->leadingContentStartSample;
         newSample->serializedStateData       = stems.source->serializedStateData;
+        newSample->deferredStateData         = stems.source->deferredStateData;
         newSample->buffer                    = std::move (mix);
     }
 
@@ -6913,14 +7291,15 @@ int AudioPluginAudioProcessor::addManualChop (int startSample, int endSample, in
 
 int AudioPluginAudioProcessor::getNextManualChopMidiNote() const noexcept
 {
+    const int root = getMidiRootNote();
     const auto current = std::atomic_load (&chopState);
     if (current == nullptr)
-        return manualChopDefaultRootNote;
+        return root;
 
-    // Lowest free note at or above C3. Walking upward keeps a run of chops
+    // Lowest free note at or above this sample's saved root. Walking upward keeps a run of chops
     // made without pads landing on consecutive keys, and reusing gaps means
     // deleting a chop frees its pad for the next one.
-    for (int note = manualChopDefaultRootNote; note <= 127; ++note)
+    for (int note = root; note <= 127; ++note)
     {
         bool taken = false;
         for (const auto& chop : current->chops)
@@ -6936,8 +7315,8 @@ int AudioPluginAudioProcessor::getNextManualChopMidiNote() const noexcept
             return note;
     }
 
-    // Every pad from C3 up is spoken for. -1 falls back to the legacy
-    // positional map rather than silently stealing an existing assignment.
+    // Every pitch in the first range is spoken for. -1 uses the positional map
+    // (including later ranges) rather than stealing an existing assignment.
     return -1;
 }
 
@@ -7513,7 +7892,6 @@ void AudioPluginAudioProcessor::setFavoritesViewEnabled (bool enabled)
     if (enabled == isFavoritesViewEnabled()) return;
     cancelManualChopCapture();
     favoritesViewEnabled.store (enabled, std::memory_order_release);
-    pendingTransportCommand.store ((int) TransportCommand::silence, std::memory_order_release);
     if (const auto current = std::atomic_load (&chopState); current != nullptr)
     {
         auto next = std::make_shared<ChopState> (*current);

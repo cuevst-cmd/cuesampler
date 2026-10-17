@@ -11,6 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ARCHIVE = "Bungee-7354c0c-modified-source.zip"
+LAME_SOURCE_ARCHIVE = "LAME-3.100-source.zip"
 
 
 def write_if_changed(path, data):
@@ -25,7 +26,7 @@ def license_text():
     return (text.rstrip() + "\n").encode("utf-8-sig")
 
 
-def stage(output, juce, bungee, ort):
+def stage(output, juce, bungee, ort, lame):
     files = {
         "THIRD_PARTY_NOTICES.txt": ROOT / "THIRD_PARTY_NOTICES.txt",
         "EULA.md": ROOT / "EULA.md",
@@ -39,6 +40,7 @@ def stage(output, juce, bungee, ort):
         "ONNX-Runtime-MIT.txt": ort / "LICENSE",
         "ONNX-Runtime-ThirdPartyNotices.txt": ort / "ThirdPartyNotices.txt",
         "Cxxopts-LICENSE.txt": bungee / "submodules/cxxopts/LICENSE",
+        "LAME-LGPL-2.0.txt": lame / "COPYING",
     }
     for relative in ROOT.joinpath("tools/juce_license_files.txt").read_text().splitlines():
         files["JUCE-Dependencies/" + relative] = juce / relative
@@ -76,7 +78,22 @@ def stage(output, juce, bungee, ort):
     finally:
         temporary.unlink(missing_ok=True)
 
-    expected = set(files) | {"LICENSE.txt", SOURCE_ARCHIVE}
+    lame_temporary = output / (LAME_SOURCE_ARCHIVE + ".tmp")
+    try:
+        with zipfile.ZipFile(lame_temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path in sorted(lame.rglob("*")):
+                relative = path.relative_to(lame)
+                if ".git" in relative.parts or not path.is_file():
+                    continue
+                entry = zipfile.ZipInfo(relative.as_posix(), date_time=(2026, 1, 1, 0, 0, 0))
+                entry.compress_type = zipfile.ZIP_DEFLATED
+                entry.external_attr = (path.stat().st_mode & 0o777) << 16
+                archive.writestr(entry, path.read_bytes())
+        write_if_changed(output / LAME_SOURCE_ARCHIVE, lame_temporary.read_bytes())
+    finally:
+        lame_temporary.unlink(missing_ok=True)
+
+    expected = set(files) | {"LICENSE.txt", SOURCE_ARCHIVE, LAME_SOURCE_ARCHIVE}
     manifest = {
         "version": project_version(),
         "platform": "macOS",
@@ -103,6 +120,7 @@ def main():
     parser.add_argument("--juce-source", type=Path)
     parser.add_argument("--bungee-source", type=Path)
     parser.add_argument("--ort-source", type=Path)
+    parser.add_argument("--lame-source", type=Path)
     parser.add_argument("--bundle", type=Path, action="append", default=[])
     parser.add_argument("--verify-bundle", type=Path, action="append", default=[])
     parser.add_argument("--license-only", action="store_true")
@@ -113,7 +131,8 @@ def main():
     deps = args.build_dir / "_deps"
     output = args.output or args.build_dir / "release-notices-mac"
     expected = stage(output, args.juce_source or deps / "juce-src",
-                     args.bungee_source or deps / "bungee-src", args.ort_source or deps / "onnxruntime-src")
+                     args.bungee_source or deps / "bungee-src", args.ort_source or deps / "onnxruntime-src",
+                     args.lame_source or deps / "lame-src")
     for bundle in args.bundle + args.verify_bundle:
         with (bundle / "Contents/Info.plist").open("rb") as stream:
             info = plistlib.load(stream)

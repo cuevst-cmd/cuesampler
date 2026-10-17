@@ -2,7 +2,7 @@
 //
 // Covers the properties the project-restore path depends on: keys are stable
 // for identical audio and distinct for anything else, a stored entry decodes
-// back sample-accurately, a damaged or foreign entry is refused rather than
+// back with MP3 timing intact, a damaged or foreign entry is refused rather than
 // half-decoded, and prune() honours its budget oldest-first.
 //
 //   cmake -S . -B build -DCUE_BUILD_STEM_CACHE_TEST=ON
@@ -60,6 +60,21 @@ float maxDifference (const juce::AudioBuffer<float>& a, const juce::AudioBuffer<
             worst = juce::jmax (worst, std::abs (a.getReadPointer (ch)[i] - b.getReadPointer (ch)[i]));
 
     return worst;
+}
+
+double correlation (const juce::AudioBuffer<float>& a, const juce::AudioBuffer<float>& b)
+{
+    if (a.getNumChannels() != b.getNumChannels() || a.getNumSamples() != b.getNumSamples())
+        return 0.0;
+    double dot = 0.0, aa = 0.0, bb = 0.0;
+    for (int ch = 0; ch < a.getNumChannels(); ++ch)
+        for (int i = 0; i < a.getNumSamples(); ++i)
+        {
+            const auto x = (double) a.getSample (ch, i);
+            const auto y = (double) b.getSample (ch, i);
+            dot += x * y; aa += x * x; bb += y * y;
+        }
+    return dot / std::sqrt (aa * bb);
 }
 
 } // namespace
@@ -157,29 +172,50 @@ int main (int argc, char** argv)
     check (cuesampler::StemCache::load (key, read), "load finds the stored entry");
     check (read.sampleRate == sampleRate, "the sample rate round-trips");
 
-    // 24-bit FLAC: one LSB is ~1.2e-7, so anything at 1e-6 is a real corruption.
-    check (maxDifference (written.drums,  read.drums)  < 1.0e-6f, "drums round-trip sample-accurately");
-    check (maxDifference (written.bass,   read.bass)   < 1.0e-6f, "bass round-trips sample-accurately");
-    check (maxDifference (written.vocals, read.vocals) < 1.0e-6f, "vocals round-trip sample-accurately");
+    check (correlation (written.drums,  read.drums)  > 0.85, "drums survive the MP3 round trip without timing drift");
+    check (correlation (written.bass,   read.bass)   > 0.85, "bass survives the MP3 round trip without timing drift");
+    check (correlation (written.vocals, read.vocals) > 0.85, "vocals survive the MP3 round trip without timing drift");
 
     // Stems must not be swapped in the container.
     check (maxDifference (written.drums, read.bass) > 0.01f, "stems keep their identity");
 
-    // Floating-point overshoots and quiet detail must survive exactly.
+    // MP3 is intentionally lossy and full-scale limited; unusual float values
+    // must still decode safely without changing the logical shape.
     written.drums.setSample (0, 0, 1.25f);
     written.bass.setSample (0, 0, -1.5f);
     written.vocals.setSample (1, 1, 1.0e-12f);
     check (cuesampler::StemCache::store (key, written), "store float peaks");
     check (cuesampler::StemCache::load (key, read), "load float peaks");
-    check (maxDifference (written.drums, read.drums) == 0.0f, "positive overshoots survive bit-exactly");
-    check (maxDifference (written.bass, read.bass) == 0.0f, "negative overshoots survive bit-exactly");
-    check (maxDifference (written.vocals, read.vocals) == 0.0f, "quiet detail survives bit-exactly");
+    check (read.drums.getNumSamples() == numSamples && read.drums.getNumChannels() == 2,
+           "MP3 stems retain their exact logical dimensions");
+    check (std::isfinite (read.drums.getSample (0, 0)) && std::isfinite (read.bass.getSample (0, 0)),
+           "out-of-range source peaks decode to finite audio");
+    check (correlation (written.vocals, read.vocals) > 0.85, "quiet content does not disturb stem alignment");
 
     juce::MemoryBlock portable;
     check (cuesampler::StemCache::encode (written, portable), "encode portable project stems");
     cuesampler::StemCache::clear();
     check (cuesampler::StemCache::decode (portable, read), "decode stems without the disk cache");
-    check (maxDifference (written.drums, read.drums) == 0.0f, "portable stems are exact");
+    check (correlation (written.drums, read.drums) > 0.85, "portable MP3 stems retain timing and identity");
+    check ((juce::int64) portable.getSize() < (juce::int64) numSamples * 2 * 3 * (juce::int64) sizeof (float) / 3,
+           "portable MP3 stems are substantially smaller than float PCM");
+
+    // MP3 is limited to 48 kHz, but project frame coordinates must remain in
+    // the original clock so high-rate chop bounds do not move after recall.
+    cuesampler::StemCache::Entry highRate;
+    highRate.sampleRate = 96000.0;
+    for (auto* stem : { &highRate.drums, &highRate.bass, &highRate.vocals })
+    {
+        stem->setSize (2, 9600);
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = 0; i < 9600; ++i)
+                stem->setSample (ch, i, 0.4f * std::sin ((float) (juce::MathConstants<double>::twoPi * 1000.0 * i / 96000.0)));
+    }
+    check (cuesampler::StemCache::encode (highRate, portable)
+           && cuesampler::StemCache::decode (portable, read)
+           && read.sampleRate == 96000.0 && read.drums.getNumSamples() == 9600
+           && correlation (highRate.drums, read.drums) > 0.98,
+           "96 kHz projects retain their sample clock and stem alignment");
 
     // Version-1 projects must still read their original FLAC cache entries.
     juce::MemoryBlock legacy;

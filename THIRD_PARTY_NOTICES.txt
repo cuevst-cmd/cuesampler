@@ -26,6 +26,12 @@ Source: https://github.com/microsoft/onnxruntime/tree/v1.18.1
 Source: https://github.com/microsoft/onnxruntime/tree/v1.20.1
 Licence: MIT. See ONNX-Runtime-MIT.txt and its third-party notices.
 
+LAME 3.100 MP3 encoder
+Source: https://sourceforge.net/projects/lame/files/lame/3.100/
+Licence: GNU Library General Public License version 2 or later. LAME is shipped
+as a separate shared library. See LAME-LGPL-2.0.txt; its complete unmodified
+source is provided in LAME-3.100-source.zip.
+
 Microsoft DirectML 1.15.2 (Windows only)
 Source: https://www.nuget.org/packages/Microsoft.AI.DirectML/1.15.2
 Licence: Microsoft Software License Terms. See DirectML-LICENSE.txt and its

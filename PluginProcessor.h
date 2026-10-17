@@ -9,6 +9,7 @@
 #include "KeyDetector.h"
 #include "ChopAudioCache.h"
 #include "WarpMap.h"
+#include "MidiNoteNames.h"
 
 #include <array>
 #include <bitset>
@@ -22,9 +23,16 @@
 //==============================================================================
 class AudioPluginAudioProcessor final : public juce::AudioProcessor,
                                         private juce::AsyncUpdater,
-                                        private juce::Timer
+                                        private juce::Timer,
+                                        private juce::MidiKeyboardState::Listener
 {
 public:
+    struct SamplePersistenceData
+    {
+        // Replaced atomically by the persistence worker; never read by rendering.
+        std::shared_ptr<const juce::var> data;
+    };
+
     struct LoadedSampleData
     {
         juce::AudioBuffer<float> buffer;
@@ -34,6 +42,15 @@ public:
         juce::String fileName;
         int leadingContentStartSample = 0;
         juce::var serializedStateData; // shared immutable binary data; no audio copy per mute
+        std::shared_ptr<SamplePersistenceData> deferredStateData;
+
+        juce::var getSerializedStateData() const
+        {
+            if (deferredStateData != nullptr)
+                if (const auto data = std::atomic_load (&deferredStateData->data))
+                    return *data;
+            return serializedStateData;
+        }
     };
 
     enum class SampleLoadResult
@@ -119,30 +136,23 @@ public:
         }
     };
 
-    // The single authority on which MIDI note plays which chop.
-    //
-    // There used to be two answers to that question: the audio thread resolved
-    // explicit `assignedMidiNote` pins first and fell back to a positional
-    // `note - root` map, while the UI only ever did the positional maths and
-    // never checked for a collision. When a pinned chop and a positional chop
-    // wanted the same note, the pinned one played and the UI still reported the
-    // positional one as live — so a chop could be silently unreachable while
-    // every readout insisted it was fine.
-    //
-    // This resolves both rules once, at publish time, so the two can no longer
-    // drift. It also turns the audio thread's per-note linear scan into an
-    // array read, and makes "this chop has no pad at all" a first-class state
-    // the UI can draw instead of an invisible failure.
+    // Absolute note map shared by host MIDI and screen keys. Explicit pins win
+    // collisions; positional chops fill the remaining keys. Built off the audio thread.
     struct ChopMidiMap
     {
-        // note -> index into ChopState::chops, or -1 for a note with no chop.
+        // Bank-1 compatibility view; channelNoteToChopIndex is the audio lookup.
+        // Each entry is an index into ChopState::chops, or -1 for no chop.
         std::array<int, 128> noteToChopIndex {};
+        std::array<std::array<int, 128>, 16> channelNoteToChopIndex {};
         // Parallel to ChopState::chops. -1 means UNREACHABLE: the chop exists
         // and is selectable by mouse, but no note will ever trigger it.
         std::vector<int>     noteForChopIndex;
+        std::vector<int>     channelForChopIndex; // 1..16, or 0 when unreachable
+        bool channelBanks = false;
         // The root the positional half of the map was resolved against. Cached
-        // so a stale map is detectable, and because the octave shift moves it.
+        // so a stale map is detectable when a sample or project changes.
         int                  rootNote = 0;
+        bool                 favoritesOnly = false;
     };
 
     struct ChopState
@@ -153,7 +163,8 @@ public:
         // Derived, never edited by hand, never serialized. Rebuilt by
         // publishChopState() on the way in — that is the only correct way to
         // install a new chop set.
-        ChopMidiMap midiMap;
+        ChopMidiMap midiMap; // fixed absolute MIDI assignments
+        std::array<int, 128> recordedNoteToChopIndex {}; // stable DAW mapping
         std::vector<int> favoriteChopIndices; // derived, ordered for Favorites view
         // Set by publishChopState once this object has been handed to the audio
         // thread. From that moment it is immutable: anything wanting to publish
@@ -200,7 +211,19 @@ public:
 
     //==============================================================================
     // Sample loading
+    struct SampleImportStatus
+    {
+        juce::String fileName;
+        // -1 while reading the source snapshot, then decoding progress from 0 to 1.
+        std::atomic<float> progress { -1.0f };
+    };
+    std::shared_ptr<const SampleImportStatus> getSampleImportStatus() const
+    {
+        return std::atomic_load (&sampleImportStatus);
+    }
     SampleLoadResult loadAudioFile (const juce::File& file);
+    // UI imports prepare and publish on a worker; completion runs on the message thread.
+    void loadAudioFileAsync (const juce::File& file, std::function<void (SampleLoadResult)> completed);
     std::shared_ptr<const LoadedSampleData> getLoadedSample() const;
 
     void startPlayback() noexcept;
@@ -233,37 +256,43 @@ public:
     // in-plugin load prompt without repeating it when the editor is reopened.
     bool claimInitialLoadSamplePrompt() noexcept;
 
-    // MIDI octave shift, in octaves, applied to the chop note mapping so users
-    // whose keyboard lacks octave buttons can reach all chops. 0 = default
-    // (C2 -> chop 1). Clamped to [midiOctaveOffsetMin, midiOctaveOffsetMax].
+    // Keyboard viewport only: C0 through C10. Host MIDI stays absolute.
     void setMidiOctaveOffset (int octaves);
     int  getMidiOctaveOffset() const noexcept;
+    int  getMidiOctaveOffsetMin() const noexcept;
+    int getKeyboardStartNote() const noexcept { return getMidiOctaveOffset() * 12; }
 
-    // Lowest MIDI note that triggers chop 1 with the current octave shift.
+    // Fixed root for positional chops, independent of the keyboard viewport.
     int  getMidiRootNote() const noexcept;
 
-    // MIDI note that actually triggers the given chop under the current octave
-    // shift, or -1 when nothing will ever trigger it (see ChopMidiMap). Both
-    // answers come from the resolved map, so they always agree with what the
-    // audio thread does.
+    // Absolute MIDI note for a chop, shared by screen keys and host MIDI.
     int  getMidiNoteForChopId (int chopId) const noexcept;
     int  getSelectedChopMidiNote() const noexcept;
+    int getMidiChannelForChopId (int chopId) const noexcept;
+    void setMidiBankModeEnabled (bool enabled);
+    bool isMidiBankModeEnabled() const noexcept { return midiBankMode.load (std::memory_order_acquire); }
+    void setKeyboardMidiBank (int channel);
+    int getKeyboardMidiBank() const noexcept { return keyboardMidiBank.load (std::memory_order_acquire); }
+    int getMidiBankCount() const noexcept;
+    int getAvailableMidiBankCount() const noexcept; // UI ranges; legacy channel aliases remain intact
 
-    // Every note that will trigger something, for lighting the on-screen
+    // Every on-screen note that will trigger something, for lighting the
     // keyboard. Bit n set == note n plays a chop.
     std::bitset<128> getMappedMidiNotes() const noexcept;
+    std::bitset<128> getHeldHostMidiNotes() const noexcept;
+    // Low 11 bits: note + zero-based channel. Upper bits: event revision.
+    // UI observation only; never changes the MIDI-to-chop lookup.
+    uint32_t getLatestHostMidiKeyEvent() const noexcept { return latestHostMidiKeyEvent.load (std::memory_order_acquire); }
 
-    // How many chops no note can reach. Non-zero means pins and the positional
-    // map are fighting and some chops are silently dead — worth telling the
-    // user about rather than hiding.
+    // Chops without a playable MIDI note, including unassigned pins.
     int  getUnreachableChopCount() const noexcept;
 
-    // Mirrors the incoming MIDI stream for the editor's on-screen keyboard,
-    // and injects notes played by clicking it back into processBlock.
+    // UI-owned key state; its listener queues on-screen notes separately from
+    // the host stream. Host key lights use getHeldHostMidiNotes().
     juce::MidiKeyboardState keyboardState;
 
-    static constexpr int midiOctaveOffsetMin = -3;
-    static constexpr int midiOctaveOffsetMax = 4;
+    static constexpr int midiOctaveOffsetMin = 0;
+    static constexpr int midiOctaveOffsetMax = 10;
     void setGridBpmTrim (float trimBpm);
     void setDoubleTempoEnabled (bool enabled);
     bool getDoubleTempoEnabled() const noexcept { return doubleTempoEnabled.load (std::memory_order_acquire); }
@@ -448,8 +477,8 @@ public:
     int  addManualChop (int startSample, int endSample, int assignedMidiNote);
     void armManualChopCapture (int startSample) noexcept;
     void cancelManualChopCapture() noexcept;
-    // Lowest unassigned MIDI note at or above C3, for manual chops completed
-    // without holding a pad. Returns -1 only if every pad from C3 up is taken.
+    // Lowest unassigned MIDI note at or above FL Studio C4, for manual chops completed
+    // without holding a pad. Returns -1 only if every pad from C4 up is taken.
     int getNextManualChopMidiNote() const noexcept;
     int getManualChopCaptureHeldNote() const noexcept;
     int getManualChopCaptureCompletedNote() const noexcept;
@@ -487,13 +516,13 @@ public:
     void undoLastEdit();
 
     // Non-realtime export: capture controls once, then render on a dedicated worker.
-    // Floating-point WAV preserves source/stem peaks. Completion runs on the UI thread.
+    // MP3 export encoding runs on a worker. Completion runs on the UI thread.
     struct ChopExportRequest;
     std::shared_ptr<const ChopExportRequest> captureChopExport (int chopId, bool applySync, const juce::File& directory = {});
     bool isChopExportCurrent (const std::shared_ptr<const ChopExportRequest>&);
     void renderChopExportAsync (std::shared_ptr<const ChopExportRequest>, std::function<void (juce::File)>);
     void saveChopExportAsync (juce::File source, juce::File destination, std::function<void (bool)> completed);
-    juce::File renderChopToTempWav (int chopId, bool applySync, const juce::File& directory = {}); // synchronous non-realtime/test API
+    juce::File renderChopToTempWav (int chopId, bool applySync, const juce::File& directory = {}); // synchronous MP3 render/test API; retained name for source compatibility
 
     juce::String loadedFileName;
     double sampleSampleRate = 0.0;
@@ -504,6 +533,8 @@ private:
     static juce::File renderChopExport (const ChopExportRequest&);
     class TempoAnalysisJob;
     class DeferredSampleRestoreJob;
+    class SampleImportJob;
+    class SampleStateEncodingJob;
     class WarpRenderJob;
     class KeyDetectionJob;
     class PreparedWarmJob;
@@ -563,6 +594,9 @@ private:
         juce::String restoredStemCacheKey;
         int restoredBarsPerChop = 1;
         int restoredMidiOctaveOffset = 0;
+        int restoredRecordedMidiRoot = 36;
+        bool restoredMidiBankMode = false;
+        int restoredKeyboardMidiBank = 1;
         double restoredPlaybackPosition = 0.0;
     };
 
@@ -795,7 +829,7 @@ private:
     // UI can never see a chop list whose mapping has not caught up. Assigning
     // to chopState directly is what let the two drift apart in the first place.
     void publishChopState (std::shared_ptr<ChopState> next);
-    static void rebuildChopMidiMap (ChopState& state, int rootNote, bool favoritesOnly = false);
+    static void rebuildChopMidiMap (ChopState& state, int rootNote, bool favoritesOnly = false, bool channelBanks = false);
 
     std::shared_ptr<ChopState> chopState;
 
@@ -892,6 +926,8 @@ private:
     std::atomic<bool> warpModeActive { false };
     std::atomic<int>  warpDivision   { WarpDivision_Beat };
     std::atomic<uint64_t> restoreGeneration { 0 };
+    std::atomic<uint64_t> sampleImportGeneration { 0 };
+    std::shared_ptr<SampleImportStatus> sampleImportStatus;
     std::atomic<uint64_t> tempoAnalysisGeneration { 0 };
     std::atomic<uint64_t> keyDetectionGeneration { 0 };
     std::atomic<bool> tempoAnalysisInProgress { false };
@@ -956,8 +992,27 @@ private:
     std::atomic<bool> doubleTempoEnabled { false };
     std::atomic<bool> favoritesViewEnabled { false };
     std::atomic<int> chopBarsCount { 1 };
+    static_assert (std::atomic<uint16_t>::is_always_lock_free);
+    static_assert (std::atomic<uint32_t>::is_always_lock_free);
+    std::array<std::atomic<uint16_t>, 128> heldHostMidiChannels {};
+    std::atomic<uint32_t> latestHostMidiKeyEvent { 0 };
     std::atomic<int> heldMidiNote { -1 };
-    std::atomic<int> midiOctaveOffset { 0 };
+    bool heldMidiIsOnScreen = false; // audio-thread owned source pairing
+    int heldMidiChannel = 1;
+    bool captureMidiIsOnScreen = false;
+    struct OnScreenMidiEvent { int channel = 1, note = 0; float velocity = 0.0f; };
+    // UI is the producer; audio is the consumer. No buffer growth or locking.
+    juce::AbstractFifo onScreenMidiFifo { 256 };
+    std::array<OnScreenMidiEvent, 256> onScreenMidiEvents;
+    std::atomic<bool> onScreenMidiOverflow { false };
+    void handleNoteOn (juce::MidiKeyboardState*, int channel, int note, float velocity) override;
+    void handleNoteOff (juce::MidiKeyboardState*, int channel, int note, float velocity) override;
+    void enqueueOnScreenMidi (int channel, int note, float velocity);
+    std::atomic<int> midiOctaveOffset { cuesampler::defaultKeyboardStartNote / 12 };
+    // Retain older projects' absolute mapping; OCT never modifies this root.
+    std::atomic<int> recordedMidiRoot { cuesampler::defaultKeyboardStartNote };
+    std::atomic<bool> midiBankMode { true };
+    std::atomic<int> keyboardMidiBank { 1 };
     std::atomic<bool> manualChopModeActive { false };
     std::atomic<bool> manualChopCaptureArmed { false };
     std::atomic<int> manualChopCaptureStartSample { 0 };
@@ -1028,12 +1083,16 @@ private:
                                         std::shared_ptr<LoadedSampleData> restoredSample,
                                         uint64_t completedRestoreGeneration,
                                         std::shared_ptr<const StemSet> restoredStems);
-    bool serializeSampleToStateData (const LoadedSampleData& sampleData, juce::MemoryBlock& stateData) const;
+    bool serializeSampleToStateData (const LoadedSampleData& sampleData, juce::MemoryBlock& stateData,
+                                    const std::function<bool (float)>& progress = {}) const;
     std::shared_ptr<LoadedSampleData> createLoadedSampleDataFromStateData (const juce::MemoryBlock& stateData,
                                                                            const juce::String& fileName);
     std::shared_ptr<LoadedSampleData> createLoadedSampleDataFromFile (
         const juce::File& file,
-        SampleLoadResult* loadResult = nullptr);
+        SampleLoadResult* loadResult = nullptr,
+        const std::function<bool (float)>& progress = {},
+        bool deferStateEncoding = false);
+    void publishImportedSample (const std::shared_ptr<LoadedSampleData>& sampleData);
     KeyDetector::Result tryReadKeyFromMetadata (const juce::File& file);
     bool computeGridTimingMetrics (const TempoAnalysisData& analysis,
                                    double& beatPeriodSeconds,
@@ -1052,10 +1111,14 @@ private:
                           double currentHostRate,
                           bool blockHasHostPpq,
                           bool blockHostTransportPlaying,
-                          double blockStartHostPpq);
+                          double blockStartHostPpq,
+                          bool onScreen = false);
 
     // Thread pools moved to the end of the class so they are destroyed first.
     juce::ThreadPool exportThreadPool { 1 };
+    juce::ThreadPool sampleImportThreadPool { 1 };
+    juce::ThreadPool sampleStateEncodingThreadPool { 1, juce::Thread::osDefaultStackSize,
+                                                     juce::Thread::Priority::low };
     juce::ThreadPool restoreThreadPool { 1 };
     juce::ThreadPool analysisThreadPool { 1 };
     juce::ThreadPool warpRenderThreadPool { 1 };

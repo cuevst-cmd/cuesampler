@@ -5,18 +5,41 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
 
 //==============================================================================
-// Mel scale conversion helpers
+// Slaney's piecewise-linear/log mel scale, as used by torchaudio's
+// melscale_fbanks(mel_scale="slaney", norm=None) in beat_this/preprocessing.py.
 static double hzToMel (double hz) noexcept
 {
-    return 2595.0 * std::log10 (1.0 + hz / 700.0);
+    constexpr double linearStep = 200.0 / 3.0;
+    const double logStep = std::log (6.4) / 27.0;
+    return hz < 1000.0 ? hz / linearStep
+                       : 15.0 + std::log (hz / 1000.0) / logStep;
 }
 
 static double melToHz (double mel) noexcept
 {
-    return 700.0 * (std::pow (10.0, mel / 2595.0) - 1.0);
+    constexpr double linearStep = 200.0 / 3.0;
+    const double logStep = std::log (6.4) / 27.0;
+    return mel < 15.0 ? mel * linearStep
+                      : 1000.0 * std::exp ((mel - 15.0) * logStep);
+}
+
+// PyTorch's reflect padding excludes the endpoint. Repeating that reflection
+// also handles clips shorter than the 512-sample STFT padding (which PyTorch
+// itself rejects). A single-sample clip has no neighbouring sample to reflect.
+static int reflectedIndex (int64_t index, int numSamples) noexcept
+{
+    if (numSamples <= 1)
+        return 0;
+
+    const int64_t period = 2 * (int64_t) (numSamples - 1);
+    index %= period;
+    if (index < 0)
+        index += period;
+    return (int) (index < numSamples ? index : period - index);
 }
 
 //==============================================================================
@@ -73,35 +96,34 @@ void BeatThisAnalyzer::buildMelFilters()
     for (int i = 0; i < numPoints; ++i)
         melPoints[i] = melMin + (melMax - melMin) * (double) i / (double) (numPoints - 1);
 
-    // Convert back to Hz then to FFT bin index
-    std::vector<int> binPoints (numPoints);
+    // Preserve the continuous frequency coordinates: rounding triangle edges
+    // onto FFT bins changes the lowest mel bands particularly strongly.
+    std::vector<double> hzPoints (numPoints);
     for (int i = 0; i < numPoints; ++i)
-    {
-        const double hz  = melToHz (melPoints[i]);
-        const double bin = hz * (double) kFftSize / kTargetSampleRate;
-        binPoints[i]     = juce::jlimit (0, numFftBins - 1, (int) std::round (bin));
-    }
+        hzPoints[(size_t) i] = melToHz (melPoints[(size_t) i]);
 
     // Build sparse triangular filters — only store the non-zero bin range per band
     melFilters.resize ((size_t) kMelBins);
 
     for (int m = 0; m < kMelBins; ++m)
     {
-        const int left   = binPoints[m];
-        const int centre = binPoints[m + 1];
-        const int right  = binPoints[m + 2];
+        const double left   = hzPoints[(size_t) m];
+        const double centre = hzPoints[(size_t) m + 1];
+        const double right  = hzPoints[(size_t) m + 2];
+        const double binHz  = kTargetSampleRate / kFftSize;
+        const int firstBin  = juce::jlimit (0, numFftBins - 1, (int) std::ceil (left / binHz));
+        const int lastBin   = juce::jlimit (firstBin, numFftBins - 1, (int) std::floor (right / binHz));
 
-        melFilters[(size_t) m].startBin = left;
-        melFilters[(size_t) m].weights.assign ((size_t) (right - left + 1), 0.0f);
+        melFilters[(size_t) m].startBin = firstBin;
+        melFilters[(size_t) m].weights.assign ((size_t) (lastBin - firstBin + 1), 0.0f);
         auto& w = melFilters[(size_t) m].weights;
 
-        for (int bin = left; bin < centre; ++bin)
-            if (centre > left)
-                w[(size_t) (bin - left)] = (float) (bin - left) / (float) (centre - left);
-
-        for (int bin = centre; bin <= right; ++bin)
-            if (right > centre)
-                w[(size_t) (bin - left)] = (float) (right - bin) / (float) (right - centre);
+        for (int bin = firstBin; bin <= lastBin; ++bin)
+        {
+            const double hz = bin * binHz;
+            w[(size_t) (bin - firstBin)] = (float) std::max (0.0, std::min (
+                (hz - left) / (centre - left), (right - hz) / (right - centre)));
+        }
     }
 }
 
@@ -112,31 +134,104 @@ std::vector<float> BeatThisAnalyzer::resampleToMono (const juce::AudioBuffer<flo
                                                       int endSample) const
 {
     const int numChannels = buffer.getNumChannels();
+    startSample = juce::jlimit (0, buffer.getNumSamples(), startSample);
+    endSample   = juce::jlimit (startSample, buffer.getNumSamples(), endSample);
     const int numSrcSamples = endSample - startSample;
 
-    if (numSrcSamples <= 0 || numChannels <= 0 || sourceSampleRate <= 0.0)
+    if (numSrcSamples <= 0 || numChannels <= 0 || sourceSampleRate <= 0.0
+        || ! std::isfinite (sourceSampleRate))
         return {};
 
-    // Target number of samples at 22050 Hz
-    const double ratio   = kTargetSampleRate / sourceSampleRate;
-    const int numDstSamples = juce::jmax (1, (int) std::round ((double) numSrcSamples * ratio));
+    const double ratio = kTargetSampleRate / sourceSampleRate;
+    const double outputLength = std::round ((double) numSrcSamples * ratio);
+    if (! std::isfinite (outputLength) || outputLength > std::numeric_limits<int>::max())
+        return {};
 
-    std::vector<float> mono (numDstSamples, 0.0f);
-
-    for (int dstIdx = 0; dstIdx < numDstSamples; ++dstIdx)
+    // Avoid filtering or changing samples when no conversion is required.
+    if (sourceSampleRate == kTargetSampleRate)
     {
-        const double srcFloat = (double) dstIdx / ratio;
-        const int    srcLo    = (int) srcFloat;
-        const float  frac     = (float) (srcFloat - (double) srcLo);
-        const int    srcHi    = juce::jmin (srcLo + 1, numSrcSamples - 1);
-
-        float sum = 0.0f;
+        std::vector<float> mono ((size_t) numSrcSamples, 0.0f);
         for (int ch = 0; ch < numChannels; ++ch)
         {
-            const float* data = buffer.getReadPointer (ch, startSample);
-            sum += data[srcLo] * (1.0f - frac) + data[srcHi] * frac;
+            const auto* channel = buffer.getReadPointer (ch, startSample);
+            for (int i = 0; i < numSrcSamples; ++i)
+                mono[(size_t) i] += channel[i] / (float) numChannels;
         }
-        mono[(size_t) dstIdx] = sum / (float) numChannels;
+        return mono;
+    }
+
+    // Offline band-limited resampling. A cutoff below the lower Nyquist leaves
+    // room for the Blackman transition band; scaling its width when downsampling
+    // prevents high-frequency content aliasing into the model's beat features.
+    // The phase table avoids evaluating trigonometry for every output sample.
+    // This is deliberately independent of any host/audio-thread resampler.
+    constexpr int numPhases = 512;
+    const double cutoff = 0.95 * std::min (1.0, ratio);
+    const double requiredHalfWidth = std::ceil (64.0 / cutoff);
+    if (requiredHalfWidth > 8192.0) // Reject impractical/invalid source rates.
+        return {};
+    const int halfWidth = (int) requiredHalfWidth;
+    const int numTaps = 2 * halfWidth + 1;
+    std::vector<float> kernels ((size_t) (numPhases + 1) * (size_t) numTaps);
+
+    for (int phase = 0; phase <= numPhases; ++phase)
+    {
+        auto* kernel = kernels.data() + (size_t) phase * (size_t) numTaps;
+        const double fraction = (double) phase / numPhases;
+        double sum = 0.0;
+        for (int tap = 0; tap < numTaps; ++tap)
+        {
+            const double distance = (double) (tap - halfWidth) - fraction;
+            const double x = distance / halfWidth;
+            const double angle = juce::MathConstants<double>::pi * cutoff * distance;
+            const double sinc = std::abs (angle) < 1.0e-12 ? 1.0 : std::sin (angle) / angle;
+            const double window = std::abs (x) >= 1.0 ? 0.0
+                : 0.42 + 0.5 * std::cos (juce::MathConstants<double>::pi * x)
+                       + 0.08 * std::cos (juce::MathConstants<double>::twoPi * x);
+            kernel[tap] = (float) (cutoff * sinc * window);
+            sum += kernel[tap];
+        }
+        for (int tap = 0; tap < numTaps; ++tap)
+            kernel[tap] = (float) (kernel[tap] / sum);
+    }
+
+    // Downmix once, rather than averaging channels inside every filter tap.
+    // Reflection supplies complete filter support without delaying the result.
+    std::vector<float> source ((size_t) numSrcSamples + 2 * (size_t) halfWidth, 0.0f);
+    for (int ch = 0; ch < numChannels; ++ch)
+    {
+        const auto* channel = buffer.getReadPointer (ch, startSample);
+        for (int i = 0; i < numSrcSamples; ++i)
+            source[(size_t) halfWidth + (size_t) i] += channel[i] / (float) numChannels;
+    }
+    for (int i = 0; i < halfWidth; ++i)
+    {
+        source[(size_t) i] = source[(size_t) halfWidth
+            + (size_t) reflectedIndex ((int64_t) i - halfWidth, numSrcSamples)];
+        source[(size_t) halfWidth + (size_t) numSrcSamples + (size_t) i]
+            = source[(size_t) halfWidth
+                + (size_t) reflectedIndex ((int64_t) numSrcSamples + i, numSrcSamples)];
+    }
+
+    const int numDstSamples = juce::jmax (1, (int) outputLength);
+    std::vector<float> mono ((size_t) numDstSamples);
+    for (int dstIdx = 0; dstIdx < numDstSamples; ++dstIdx)
+    {
+        const double position = (double) dstIdx / ratio;
+        const int sourceIndex = std::min ((int) position, numSrcSamples - 1);
+        const double phasePosition = (position - sourceIndex) * numPhases;
+        const int phase = std::min ((int) phasePosition, numPhases - 1);
+        const float blend = (float) (phasePosition - phase);
+        const auto* kernel = kernels.data() + (size_t) phase * (size_t) numTaps;
+        const auto* nextKernel = kernel + numTaps;
+        const auto* samples = source.data() + sourceIndex;
+        double sum = 0.0;
+        for (int tap = 0; tap < numTaps; ++tap)
+        {
+            const float weight = kernel[tap] + blend * (nextKernel[tap] - kernel[tap]);
+            sum += samples[tap] * weight;
+        }
+        mono[(size_t) dstIdx] = (float) sum;
     }
 
     return mono;
@@ -149,32 +244,35 @@ BeatThisAnalyzer::computeMelSpectrogram (const std::vector<float>& mono) const
     if (mono.empty())
         return {};
 
-    // Hann window
+    // torch.hann_window defaults to periodic=True. Its denominator is n_fft,
+    // rather than n_fft - 1 (the latter produces a symmetric analysis window).
     std::vector<float> window ((size_t) kFftSize);
     for (int i = 0; i < kFftSize; ++i)
-        window[(size_t) i] = 0.5f * (1.0f - std::cos (juce::MathConstants<float>::twoPi * (float) i / (float) (kFftSize - 1)));
+        window[(size_t) i] = (float) (0.5 * (1.0 - std::cos (
+            juce::MathConstants<double>::twoPi * (double) i / kFftSize)));
 
     juce::dsp::FFT fft (static_cast<int> (std::log2 (kFftSize)));
 
     const int halfWin     = kFftSize / 2;
     const int totalSamples = (int) mono.size();
-    const int estFrames   = juce::jmax (1, (int) std::ceil ((double) totalSamples / kHopSize));
+    const int numFrames = 1 + totalSamples / kHopSize;
+    const float fftNormalisation = 1.0f / std::sqrt ((float) kFftSize);
 
     // Flat output: [numFrames * kMelBins] — avoids per-frame heap allocation
     std::vector<float> flat;
-    flat.reserve ((size_t) (estFrames * kMelBins));
+    flat.reserve ((size_t) numFrames * (size_t) kMelBins);
 
     std::vector<float> fftBuf ((size_t) kFftSize * 2);
 
-    for (int centre = 0; centre < totalSamples; centre += kHopSize)
+    for (int frame = 0; frame < numFrames; ++frame)
     {
+        const int centre = frame * kHopSize;
         std::fill (fftBuf.begin(), fftBuf.end(), 0.0f);
 
         for (int i = 0; i < kFftSize; ++i)
         {
-            const int srcIdx = centre - halfWin + i;
-            if (srcIdx >= 0 && srcIdx < totalSamples)
-                fftBuf[(size_t) i] = mono[(size_t) srcIdx] * window[(size_t) i];
+            const int srcIdx = reflectedIndex ((int64_t) centre - halfWin + i, totalSamples);
+            fftBuf[(size_t) i] = mono[(size_t) srcIdx] * window[(size_t) i];
         }
 
         fft.performFrequencyOnlyForwardTransform (fftBuf.data());
@@ -188,7 +286,9 @@ BeatThisAnalyzer::computeMelSpectrogram (const std::vector<float>& mono) const
             for (int k = 0; k < numWeights; ++k)
                 energy += filt.weights[(size_t) k] * fftBuf[(size_t) (filt.startBin + k)];
 
-            flat.push_back (std::log (1.0f + kLogScale * juce::jmax (0.0f, energy)));
+            // normalized="frame_length", power=1: normalize FFT magnitudes by
+            // sqrt(n_fft), and apply no Slaney area normalization to the bank.
+            flat.push_back (std::log1p (kLogScale * fftNormalisation * juce::jmax (0.0f, energy)));
         }
     }
 
@@ -202,6 +302,10 @@ BeatThisAnalyzer::runOnnxInferenceChunk (const std::vector<float>& flatMel,
                                          int startFrame,
                                          int endFrame) const
 {
+    if (startFrame < 0 || endFrame <= startFrame || endFrame > totalFrames
+        || flatMel.size() != (size_t) totalFrames * kMelBins)
+        return {};
+
     const int64_t batchSize = 1;
     const int64_t numFrames = (int64_t) (endFrame - startFrame);
     const int64_t melBins   = kMelBins;
@@ -236,10 +340,14 @@ BeatThisAnalyzer::runOnnxInferenceChunk (const std::vector<float>& flatMel,
 
     auto extractProbs = [&] (int idx) -> std::vector<float>
     {
+        const auto info = outputTensors[(size_t) idx].GetTensorTypeAndShapeInfo();
+        const auto shape = info.GetShape();
+        if (shape.size() != 2 || shape[0] != 1 || shape[1] != numFrames
+            || info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+            return {};
         const float* raw = outputTensors[(size_t) idx].GetTensorData<float>();
-        const int64_t n  = outputTensors[(size_t) idx].GetTensorTypeAndShapeInfo().GetShape()[1];
-        std::vector<float> probs ((size_t) n);
-        for (int64_t i = 0; i < n; ++i)
+        std::vector<float> probs ((size_t) numFrames);
+        for (int64_t i = 0; i < numFrames; ++i)
             probs[(size_t) i] = sigmoid (raw[i]);
         return probs;
     };
@@ -251,225 +359,189 @@ BeatThisAnalyzer::runOnnxInferenceChunk (const std::vector<float>& flatMel,
 BeatThisAnalyzer::BeatDownbeatProbs
 BeatThisAnalyzer::runOnnxInference (const std::vector<float>& flatMel, int numFrames) const
 {
-    if (! sessionReady.load() || flatMel.empty() || numFrames <= 0)
+    if (! sessionReady.load() || numFrames <= 0
+        || flatMel.size() != (size_t) numFrames * kMelBins)
         return {};
 
-    if (numFrames <= kMaxChunkFrames)
-        return runOnnxInferenceChunk (flatMel, numFrames, 0, numFrames);
+    // Match Spect2Frames: 30-second chunks, six context frames on each side,
+    // and keep the first prediction in overlaps. Discarding only one side of
+    // an overlap would insert frames and shift every later beat timestamp.
+    constexpr int chunkFrames = 1500;
+    constexpr int borderFrames = 6;
+    constexpr int stepFrames = chunkFrames - 2 * borderFrames;
+    std::vector<int> starts;
+    for (int start = -borderFrames; start < numFrames - borderFrames; start += stepFrames)
+        starts.push_back (start);
+    if (numFrames > stepFrames)
+        starts.back() = numFrames - (chunkFrames - borderFrames);
 
-    // Chunk with overlap; stitch both beat and downbeat arrays together.
     BeatDownbeatProbs merged;
-    merged.beat.reserve ((size_t) numFrames);
-    merged.downbeat.reserve ((size_t) numFrames);
-
-    const int halfOverlap = kChunkOverlap / 2;
-    const int step        = kMaxChunkFrames - kChunkOverlap;
-
-    for (int chunkStart = 0; chunkStart < numFrames; chunkStart += step)
+    merged.beat.resize ((size_t) numFrames);
+    merged.downbeat.resize ((size_t) numFrames);
+    int writtenUntil = 0;
+    for (const int start : starts)
     {
-        const int chunkEnd = juce::jmin (chunkStart + kMaxChunkFrames, numFrames);
-        auto chunk = runOnnxInferenceChunk (flatMel, numFrames, chunkStart, chunkEnd);
-
-        if (chunk.beat.empty())
+        const int sourceStart = juce::jmax (0, start);
+        const int sourceEnd = juce::jmin (numFrames, start + chunkFrames);
+        const int leftPad = juce::jmax (0, -start);
+        const int rightPad = juce::jlimit (0, borderFrames, start + chunkFrames - numFrames);
+        const int inputFrames = leftPad + sourceEnd - sourceStart + rightPad;
+        std::vector<float> padded ((size_t) inputFrames * kMelBins, 0.0f);
+        std::copy (flatMel.begin() + (size_t) sourceStart * kMelBins,
+                   flatMel.begin() + (size_t) sourceEnd * kMelBins,
+                   padded.begin() + (size_t) leftPad * kMelBins);
+        const auto chunk = runOnnxInferenceChunk (padded, inputFrames, 0, inputFrames);
+        if (chunk.beat.size() != (size_t) inputFrames
+            || chunk.downbeat.size() != (size_t) inputFrames)
             return {};
 
-        const int keepFrom = (chunkStart == 0) ? 0 : juce::jmin (halfOverlap, (int) chunk.beat.size());
-        for (int i = keepFrom; i < (int) chunk.beat.size(); ++i)
+        const int keepStart = juce::jmax (writtenUntil, start + borderFrames);
+        const int keepEnd = juce::jmin (numFrames, start + inputFrames - borderFrames);
+        for (int frame = keepStart; frame < keepEnd; ++frame)
         {
-            merged.beat.push_back (chunk.beat[(size_t) i]);
-            merged.downbeat.push_back (chunk.downbeat[(size_t) i]);
+            merged.beat[(size_t) frame] = chunk.beat[(size_t) (frame - start)];
+            merged.downbeat[(size_t) frame] = chunk.downbeat[(size_t) (frame - start)];
         }
+        writtenUntil = keepEnd;
     }
-
-    return merged;
-}
-
-//==============================================================================
-double BeatThisAnalyzer::estimateGlobalTempoACF (const std::vector<float>& activations)
-{
-    if (activations.empty())
-        return 0.0;
-        
-    // Search between 70 BPM and 160 BPM
-    const int maxLagFrames = (int) std::round (kFps * (60.0 / 70.0));
-    const int minLagFrames = (int) std::round (kFps * (60.0 / 160.0));
-    
-    if ((int)activations.size() <= maxLagFrames)
-        return 0.0;
-        
-    double bestScore = -1.0;
-    int bestLag = 0;
-    
-    for (int lag = minLagFrames; lag <= maxLagFrames; ++lag)
-    {
-        double acf = 0.0;
-        for (size_t i = 0; i < activations.size() - lag; ++i)
-            acf += activations[i] * activations[i + lag];
-            
-        // Tempo prior: Gaussian centered at 110 BPM
-        double currentBpm = 60.0 / ((double)lag / kFps);
-        double diff = currentBpm - 110.0;
-        double prior = std::exp (-(diff * diff) / (2.0 * 30.0 * 30.0));
-        
-        double score = acf * prior;
-        if (score > bestScore)
-        {
-            bestScore = score;
-            bestLag = lag;
-        }
-    }
-    
-    return (double)bestLag;
-}
-
-//==============================================================================
-std::vector<int> BeatThisAnalyzer::dpBeatTrack (const std::vector<float>& activations, double targetIntervalFrames)
-{
-    if (activations.empty() || targetIntervalFrames <= 0.0)
-        return {};
-        
-    const int n = (int) activations.size();
-    std::vector<double> dpScore (n, -1e9);
-    std::vector<int> dpBacklink (n, -1);
-    
-    const double txWt = 15.0; // Strong penalty for deviating from target interval
-    
-    // Evaluate local maxima to speed up DP and avoid picking the slope of a peak.
-    std::vector<int> candidates;
-    candidates.reserve (n / 10);
-    for (int i = 1; i < n - 1; ++i)
-    {
-        if (activations[(size_t) i] >= 0.1f && 
-            activations[(size_t) i] >= activations[(size_t) (i-1)] && 
-            activations[(size_t) i] >= activations[(size_t) (i+1)])
-        {
-            candidates.push_back(i);
-        }
-    }
-    
-    if (candidates.empty())
-        return {};
-
-    for (size_t c = 0; c < candidates.size(); ++c)
-    {
-        int i = candidates[c];
-        double bestPrevScore = 0.0; // Base score for starting a new sequence
-        int bestPrevIdx = -1;
-        
-        // Search backwards among previous candidates
-        for (int c_prev = (int)c - 1; c_prev >= 0; --c_prev)
-        {
-            int j = candidates[(size_t)c_prev];
-            double interval = (double)(i - j);
-            
-            if (interval > targetIntervalFrames * 3.5)
-                break; // Don't look too far back
-                
-            // Quantize interval to the nearest multiple of targetIntervalFrames
-            double ratio = interval / targetIntervalFrames;
-            int numBeats = (int)std::round (ratio);
-            if (numBeats < 1) numBeats = 1;
-            if (numBeats > 3) numBeats = 3;
-            
-            double adjustedRatio = ratio / (double)numBeats;
-            double penalty = -txWt * std::pow (std::log2 (adjustedRatio), 2.0);
-            
-            // Penalize skipped beats to favor continuous tracking
-            double skipPenalty = (numBeats - 1) * 2.0; 
-            
-            double score = dpScore[(size_t) j] + penalty - skipPenalty;
-            if (score > bestPrevScore)
-            {
-                bestPrevScore = score;
-                bestPrevIdx = j;
-            }
-        }
-        
-        dpScore[(size_t) i] = bestPrevScore + (double)activations[(size_t) i];
-        dpBacklink[(size_t) i] = bestPrevIdx;
-    }
-    
-    // Find the best ending beat
-    double maxScore = -1e9;
-    int bestEndIdx = -1;
-    for (int i : candidates)
-    {
-        if (dpScore[(size_t) i] > maxScore)
-        {
-            maxScore = dpScore[(size_t) i];
-            bestEndIdx = i;
-        }
-    }
-    
-    std::vector<int> path;
-    int curr = bestEndIdx;
-    while (curr != -1)
-    {
-        path.push_back (curr);
-        curr = dpBacklink[(size_t) curr];
-    }
-    std::reverse (path.begin(), path.end());
-    
-    // Interpolate any skipped beats for a solid grid
-    std::vector<int> filledPath;
-    if (!path.empty())
-    {
-        filledPath.push_back (path[0]);
-        for (size_t k = 1; k < path.size(); ++k)
-        {
-            int prev = path[k-1];
-            int currBeat = path[k];
-            double ratio = (double)(currBeat - prev) / targetIntervalFrames;
-            int numBeats = (int)std::round (ratio);
-            
-            if (numBeats > 1 && numBeats <= 4)
-            {
-                for (int b = 1; b < numBeats; ++b)
-                {
-                    int interpolated = prev + (int)std::round ((double)(currBeat - prev) * b / numBeats);
-                    filledPath.push_back (interpolated);
-                }
-            }
-            filledPath.push_back (currBeat);
-        }
-    }
-    
-    return filledPath;
+    return writtenUntil == numFrames ? merged : BeatDownbeatProbs {};
 }
 
 //==============================================================================
 std::vector<int> BeatThisAnalyzer::peakPick (const std::vector<float>& activations,
-                                              float threshold,
-                                              int minGapFrames)
+                                           float threshold,
+                                           int radiusFrames)
 {
     std::vector<int> peaks;
-    if (activations.empty())
-        return peaks;
-
-    // Simple peak-picking: local max above threshold with minimum gap
-    for (int i = 1; i < (int) activations.size() - 1; ++i)
+    for (int i = 0; i < (int) activations.size(); ++i)
     {
-        if (activations[(size_t) i] < threshold)
+        const auto value = activations[(size_t) i];
+        if (! std::isfinite (value) || value <= threshold)
             continue;
 
-        const bool isLocalMax = (activations[(size_t) i] >= activations[(size_t) i - 1])
-                             && (activations[(size_t) i] >= activations[(size_t) i + 1]);
-        if (! isLocalMax)
+        bool isMaximum = true;
+        for (int j = juce::jmax (0, i - radiusFrames);
+             j <= juce::jmin ((int) activations.size() - 1, i + radiusFrames); ++j)
+            if (activations[(size_t) j] > value)
+                isMaximum = false;
+        if (! isMaximum)
             continue;
 
-        if (! peaks.empty() && (i - peaks.back()) < minGapFrames)
+        // Collapse a flat-topped peak to its centre, as in the reference
+        // minimal postprocessor, rather than treating each frame as a beat.
+        int plateauEnd = i;
+        while (plateauEnd + 1 < (int) activations.size()
+               && activations[(size_t) plateauEnd + 1] == value)
+            ++plateauEnd;
+        peaks.push_back ((i + plateauEnd) / 2);
+        i = plateauEnd;
+    }
+    return peaks;
+}
+
+BeatThisAnalyzer::Result BeatThisAnalyzer::decodeBeatProbabilities (
+    const std::vector<float>& beatProbs,
+    const std::vector<float>& downbeatProbs,
+    double analysisStartSecs)
+{
+    Result result;
+    if (! std::isfinite (analysisStartSecs)
+        || std::any_of (beatProbs.begin(), beatProbs.end(),
+                        [] (float p) { return ! std::isfinite (p); }))
+        return result;
+
+    // Beat This was trained to work with minimal peak picking. Do not force
+    // its predictions through a preferred tempo or infer beats by dividing
+    // downbeat spacing by four: both change the metrical interpretation.
+    const auto beatFrames = peakPick (beatProbs, kBeatThreshold, 3);
+    if (beatFrames.size() < 4)
+        return result;
+
+    result.beatPositionsSecs.reserve (beatFrames.size());
+    double strength = 0.0;
+    for (const int frame : beatFrames)
+    {
+        double position = (double) frame;
+        if (frame > 0 && frame + 1 < (int) beatProbs.size())
         {
-            // Keep the taller peak
-            if (activations[(size_t) i] > activations[(size_t) peaks.back()])
-                peaks.back() = i;
+            const double left = beatProbs[(size_t) frame - 1];
+            const double centre = beatProbs[(size_t) frame];
+            const double right = beatProbs[(size_t) frame + 1];
+            const double curvature = left - 2.0 * centre + right;
+            if (curvature < -1.0e-6)
+                position += juce::jlimit (-0.5, 0.5, 0.5 * (left - right) / curvature);
         }
-        else
-        {
-            peaks.push_back (i);
-        }
+        result.beatPositionsSecs.push_back (analysisStartSecs + position / kFps);
+        strength += (double) beatProbs[(size_t) frame];
     }
 
-    return peaks;
+    std::vector<double> intervals;
+    intervals.reserve (beatFrames.size() - 1);
+    for (size_t i = 1; i < result.beatPositionsSecs.size(); ++i)
+    {
+        const auto interval = result.beatPositionsSecs[i] - result.beatPositionsSecs[i - 1];
+        if (interval >= 0.15 && interval <= 3.0)
+            intervals.push_back (interval);
+    }
+    if (intervals.size() < 3)
+        return Result {};
+
+    auto sorted = intervals;
+    std::sort (sorted.begin(), sorted.end());
+    const size_t middle = sorted.size() / 2;
+    // Pick an observed median. Averaging two separated tempo modes can land
+    // in a gap containing no actual intervals and invalidate a tempo change.
+    const double median = sorted[middle];
+    double sum = 0.0;
+    int inlierCount = 0;
+    for (const auto interval : intervals)
+        if (std::abs (interval - median) <= median * 0.2)
+        {
+            sum += interval;
+            ++inlierCount;
+        }
+    if (inlierCount < 3)
+        return Result {};
+
+    result.beatPeriodSecs = sum / (double) inlierCount;
+    result.estimatedBpm = 60.0 / result.beatPeriodSecs;
+    result.firstBeatSecs = result.beatPositionsSecs.front();
+    const double evidence = juce::jmin (1.0, (double) intervals.size() / 8.0);
+    const double continuity = (double) inlierCount / (double) (beatFrames.size() - 1);
+    const double intervalCoverage = (double) intervals.size() / (double) (beatFrames.size() - 1);
+    result.confidence = (float) juce::jlimit (0.0, 1.0,
+        strength / (double) beatFrames.size() * evidence * intervalCoverage * (0.75 + 0.25 * continuity));
+
+    // Four-interval averages distinguish sustained tempo movement from
+    // frame quantisation and alternating early/late expressive beat timing.
+    double localVariance = 0.0;
+    int localCount = 0;
+    for (size_t i = 4; i < result.beatPositionsSecs.size(); ++i)
+    {
+        const auto localPeriod = (result.beatPositionsSecs[i] - result.beatPositionsSecs[i - 4]) / 4.0;
+        localVariance += std::pow (localPeriod / result.beatPeriodSecs - 1.0, 2.0);
+        ++localCount;
+    }
+    result.likelyDrifting = localCount > 0 && std::sqrt (localVariance / (double) localCount) > 0.03;
+
+    // Preserve observed downbeats, including triple/odd meters. The legacy
+    // phase remains modulo four for the existing fixed four-beat chop UI;
+    // it is never used to infer BPM or synthesize additional bar markers.
+    for (const int downbeat : peakPick (downbeatProbs, kBeatThreshold, 3))
+    {
+        const auto nearest = std::min_element (beatFrames.begin(), beatFrames.end(),
+            [downbeat] (int a, int b) { return std::abs (a - downbeat) < std::abs (b - downbeat); });
+        if (std::abs (*nearest - downbeat) > 5)
+            continue;
+        const auto beatIndex = (size_t) std::distance (beatFrames.begin(), nearest);
+        const auto time = result.beatPositionsSecs[beatIndex];
+        if (result.barPositionsSecs.empty())
+            result.downbeatPhase = (int) (beatIndex % 4);
+        if (result.barPositionsSecs.empty() || time > result.barPositionsSecs.back())
+            result.barPositionsSecs.push_back (time);
+    }
+    result.valid = true;
+    return result;
 }
 
 //==============================================================================
@@ -516,163 +588,7 @@ BeatThisAnalyzer::analyze (const juce::AudioBuffer<float>& buffer,
         probs = runOnnxInference (flatMel, numMelFrames);
     }
 
-    if (probs.beat.empty())
-        return result;
-
-    const auto& beatProbs     = probs.beat;
-    const auto& downbeatProbs = probs.downbeat;
-
-    // -- 4. Global Tempo Estimation via Autocorrelation
-    double acfIntervalFrames = estimateGlobalTempoACF (beatProbs);
-    
-    // Check downbeats to anchor the global tempo
-    // Min gap for downbeats is roughly 3 beats
-    const int minDbGapFrames = juce::jmax (1, (int) std::round (kFps * (double) kMinBeatGapSecs * 3.0));
-    const auto downbeatIdxs = peakPick (downbeatProbs, 0.4f, minDbGapFrames);
-    
-    double targetIntervalFrames = acfIntervalFrames;
-    
-    if (downbeatIdxs.size() >= 2)
-    {
-        std::vector<double> dbIntervals;
-        dbIntervals.reserve (downbeatIdxs.size() - 1);
-        for (size_t i = 1; i < downbeatIdxs.size(); ++i)
-            dbIntervals.push_back ((double)(downbeatIdxs[i] - downbeatIdxs[i-1]));
-            
-        std::sort (dbIntervals.begin(), dbIntervals.end());
-        double medianDb = dbIntervals[dbIntervals.size() / 2];
-        double derivedBeatInterval = medianDb / 4.0;
-        
-        // If the downbeat-derived beat interval is reasonable (70 - 160 BPM)
-        // we heavily trust it because soul/funk downbeats are very clear.
-        if (derivedBeatInterval >= (kFps * 60.0 / 160.0) && derivedBeatInterval <= (kFps * 60.0 / 70.0))
-        {
-            targetIntervalFrames = derivedBeatInterval;
-        }
-    }
-    
-    if (targetIntervalFrames <= 0.0)
-    {
-        // Fallback to naive estimation or default 120 bpm
-        targetIntervalFrames = kFps * 0.5;
-    }
-
-    // -- 5. Dynamic Programming Beat Tracking
-    const auto beatFrameIdxs = dpBeatTrack (beatProbs, targetIntervalFrames);
-
-    if (beatFrameIdxs.size() < 2)
-        return result;
-
-    // -- 6. Convert frame indices to seconds with parabolic sub-frame interpolation.
-    const double analysisStartSecs = (double) start / sampleRate;
-    std::vector<double> beatPosSecs;
-    beatPosSecs.reserve (beatFrameIdxs.size());
-    for (int idx : beatFrameIdxs)
-    {
-        double refinedIdx = idx;
-        if (idx > 0 && idx < (int) beatProbs.size() - 1)
-        {
-            const float a     = beatProbs[(size_t) (idx - 1)];
-            const float b     = beatProbs[(size_t) idx];
-            const float c     = beatProbs[(size_t) (idx + 1)];
-            const float denom = a - 2.0f * b + c;
-            if (std::abs (denom) > 1e-6f)
-                refinedIdx = (double) idx - 0.5 * (double) (c - a) / (double) denom;
-        }
-        beatPosSecs.push_back (analysisStartSecs + refinedIdx / kFps);
-    }
-
-    // -- 7. Compute BPM from beat intervals
-    std::vector<double> intervals;
-    intervals.reserve (beatPosSecs.size() - 1);
-    for (size_t i = 1; i < beatPosSecs.size(); ++i)
-    {
-        const double iv = beatPosSecs[i] - beatPosSecs[i - 1];
-        if (iv > 0.1 && iv < 2.0)
-            intervals.push_back (iv);
-    }
-
-    if (intervals.empty())
-        return result;
-
-    std::vector<double> sortedIntervals = intervals;
-    std::sort (sortedIntervals.begin(), sortedIntervals.end());
-    const size_t nIv = sortedIntervals.size();
-    const double medianInterval = (nIv % 2 == 0)
-        ? 0.5 * (sortedIntervals[nIv / 2 - 1] + sortedIntervals[nIv / 2])
-        : sortedIntervals[nIv / 2];
-
-    if (medianInterval <= 0.0)
-        return result;
-
-    double intervalSum   = 0.0;
-    int    intervalCount = 0;
-    for (double iv : intervals)
-    {
-        if (std::abs (iv - medianInterval) / medianInterval <= 0.20)
-        {
-            intervalSum += iv;
-            ++intervalCount;
-        }
-    }
-    const double refinedInterval = (intervalCount >= 3)
-        ? intervalSum / (double) intervalCount
-        : medianInterval;
-
-    double variance = 0.0;
-    for (double iv : intervals)
-    {
-        const double d = iv - medianInterval;
-        variance += d * d;
-    }
-    variance /= (double) intervals.size();
-    const double drift = std::sqrt (variance) / medianInterval;
-
-    // Confidence: mean beat activation at detected peaks
-    float meanBeatStrength = 0.0f;
-    for (int idx : beatFrameIdxs)
-        meanBeatStrength += beatProbs[(size_t) idx];
-    meanBeatStrength /= (float) beatFrameIdxs.size();
-
-    // -- 8. Downbeat phase (0–3)
-    int downbeatPhase = 0;
-    if (! downbeatProbs.empty())
-    {
-        double bestPhaseScore = -1.0;
-        for (int phase = 0; phase < 4 && phase < (int) beatFrameIdxs.size(); ++phase)
-        {
-            double phaseScore = 0.0;
-            for (int b = phase; b < (int) beatFrameIdxs.size(); b += 4)
-            {
-                const int frameIdx = beatFrameIdxs[(size_t) b];
-                if (frameIdx < (int) downbeatProbs.size())
-                    phaseScore += (double) downbeatProbs[(size_t) frameIdx];
-            }
-            if (phaseScore > bestPhaseScore)
-            {
-                bestPhaseScore = phaseScore;
-                downbeatPhase  = phase;
-            }
-        }
-    }
-
-    // -- 9. Bar positions
-    std::vector<double> barPosSecs;
-    for (int b = downbeatPhase; b < (int) beatPosSecs.size(); b += 4)
-        barPosSecs.push_back (beatPosSecs[(size_t) b]);
-
-    // -- 10. Fill result
-    result.valid            = true;
-    result.estimatedBpm     = 60.0 / refinedInterval;
-    result.beatPeriodSecs   = refinedInterval;
-    result.firstBeatSecs    = beatPosSecs.front();
-    result.confidence       = juce::jlimit (0.0f, 1.0f, meanBeatStrength);
-    result.likelyDrifting   = drift > 0.03;
-    result.downbeatPhase    = downbeatPhase;
-    result.beatPositionsSecs = std::move (beatPosSecs);
-    result.barPositionsSecs  = std::move (barPosSecs);
-
-    return result;
+    return decodeBeatProbabilities (probs.beat, probs.downbeat, (double) start / sampleRate);
 }
 
 //==============================================================================

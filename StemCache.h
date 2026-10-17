@@ -18,8 +18,8 @@ namespace cuesampler
 // the model that computed it. New projects also embed the container so their
 // recall does not depend on the lifetime of this optional disk cache.
 //
-// New entries contain three lossless 32-bit float WAV streams. Version-1 FLAC
-// entries remain readable for older projects. Files are written atomically via
+// New entries contain three 320 kbps MP3 streams. Version-1 FLAC and version-2
+// float-WAV entries remain readable for older projects. Files are written atomically via
 // a temp file + rename so a crash mid-write can never leave a half-entry that
 // later reads as valid. Everything here is blocking file I/O — call it from a
 // background thread, never the message or audio thread.
@@ -39,7 +39,7 @@ public:
     // The key must be PERSISTED (see the processor's "stemCacheKey" state
     // property) rather than recomputed when reopening legacy projects: their
     // 16-bit embedded source hashes differently from the original float audio.
-    // New projects embed both source and stems losslessly.
+    // New projects embed both source and stems in compact MP3 form.
     static juce::String makeKey (const juce::AudioBuffer<float>& buffer,
                                  double sampleRate,
                                  const juce::String& modelId);

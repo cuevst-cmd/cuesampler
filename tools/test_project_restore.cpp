@@ -1,7 +1,15 @@
 #include "PluginProcessor.h"
 #include "StemCache.h"
+#include "Mp3AudioCodec.h"
+#include "MidiNoteNames.h"
+#include "FlOctaveShortcut.h"
+#include "LaptopMidiInput.h"
+#include "LaptopNoteRouter.h"
+#include "NativeLaptopKeyboard.h"
+#include "FlLinkProtocol.h"
 #include "WaveformColourAnalysis.h"
 #include <juce_gui_basics/juce_gui_basics.h>
+#include <juce_audio_utils/juce_audio_utils.h>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -26,6 +34,18 @@ bool equal (const juce::AudioBuffer<float>& a, const juce::AudioBuffer<float>& b
     for (int c = 0; c < a.getNumChannels(); ++c)
         if (std::memcmp (a.getReadPointer (c), b.getReadPointer (c), (size_t) a.getNumSamples() * sizeof(float)) != 0) return false;
     return true;
+}
+double correlation (const juce::AudioBuffer<float>& a, const juce::AudioBuffer<float>& b)
+{
+    if (a.getNumChannels() != b.getNumChannels() || a.getNumSamples() != b.getNumSamples()) return 0.0;
+    double dot = 0.0, aa = 0.0, bb = 0.0;
+    for (int c = 0; c < a.getNumChannels(); ++c)
+        for (int i = 0; i < a.getNumSamples(); ++i)
+        {
+            const auto x = (double) a.getSample (c, i), y = (double) b.getSample (c, i);
+            dot += x * y; aa += x * x; bb += y * y;
+        }
+    return dot / std::sqrt (aa * bb);
 }
 void pump()
 {
@@ -56,6 +76,13 @@ juce::TextButton* findButton (juce::Component& parent, const juce::String& text)
         if (auto* found = findButton (*child, text)) return found;
     return nullptr;
 }
+juce::Component* findType (juce::Component& parent, const juce::String& name)
+{
+    if (juce::String (typeid (parent).name()).contains (name)) return &parent;
+    for (auto* child : parent.getChildren())
+        if (auto* found = findType (*child, name)) return found;
+    return nullptr;
+}
 }
 
 // Test-only access to exercise real worker publication and serialization without
@@ -65,6 +92,10 @@ struct CueSamplerStateTests
     using P = AudioPluginAudioProcessor;
     static void setup (P& p)
     {
+        // An existing C4 project fixture: new imports use C2, but recall and
+        // edit tests must continue exercising this saved project's old map.
+        p.recordedMidiRoot.store (48);
+        p.midiBankMode.store (false);
         auto source = std::make_shared<P::LoadedSampleData>();
         source->sampleRate = 8000;
         source->fileName = "restore fixture";
@@ -139,18 +170,14 @@ struct CueSamplerStateTests
         return ! p.pendingRestoreState.isValid() && std::atomic_load (&p.loadedSample) != nullptr;
     }
 
-    static juce::AudioBuffer<float> readExport (const juce::File& file, double expectedRate)
+    static juce::AudioBuffer<float> readExport (const juce::File& file, double expectedRate, int expectedSamples)
     {
-        juce::WavAudioFormat wav;
-        auto input = file.createInputStream();
-        std::unique_ptr<juce::AudioFormatReader> reader (
-            input != nullptr ? wav.createReaderFor (input.release(), true) : nullptr);
-        check (reader != nullptr, "export produces a readable WAV");
-        if (reader == nullptr) return {};
-        check (reader->sampleRate == expectedRate && reader->usesFloatingPointData && reader->bitsPerSample == 32,
-               "export rate and floating-point format are correct");
-        juce::AudioBuffer<float> result ((int) reader->numChannels, (int) reader->lengthInSamples);
-        reader->read (&result, 0, result.getNumSamples(), 0, true, true);
+        juce::MemoryBlock encoded;
+        check (file.getFileExtension().equalsIgnoreCase (".mp3") && file.loadFileAsData (encoded),
+               "export produces an MP3 file");
+        juce::AudioBuffer<float> result;
+        check (cuesampler::Mp3AudioCodec::decode (encoded, expectedRate, 2, expectedSamples, result),
+               "export MP3 decodes at the requested rate and logical length");
         file.deleteFile();
         return result;
     }
@@ -247,7 +274,8 @@ struct CueSamplerStateTests
             if (warp) c.warpMarkers = { { start + 22050, 0.7, false, 0 } };
             std::atomic_store (&p.chopState, std::shared_ptr<P::ChopState> (state));
             p.pitchSemitones.store (pitch); p.halfTimeEnabled.store (half); p.hostSampleRate.store (rate);
-            const auto audio = readExport (p.renderChopToTempWav (7, false, scratch), rate);
+            const auto expectedFrames = (int) std::llround (rate * (half ? 2.0 : 1.0));
+            const auto audio = readExport (p.renderChopToTempWav (7, false, scratch), rate, expectedFrames);
             if (audio.getNumSamples() == 0) return;
             const double stretch = half ? 2.0 : 1.0;
             check (audio.getNumSamples() == (int) std::llround (rate * stretch), "processed export has exact loop length");
@@ -284,9 +312,9 @@ struct CueSamplerStateTests
         source->buffer.setSample (0, 88199, 1.75f);
         std::atomic_store (&p.chopState, std::shared_ptr<P::ChopState> (exact));
         p.pitchSemitones.store (0); p.halfTimeEnabled.store (false); p.hostSampleRate.store (44100);
-        const auto reversed = readExport (p.renderChopToTempWav (7, false, scratch), 44100);
-        check (reversed.getNumSamples() == 44000 && reversed.getSample (0, 0) == 1.75f,
-               "reverse/cue export preserves unclipped floating peaks at the correct boundary");
+        const auto reversed = readExport (p.renderChopToTempWav (7, false, scratch), 44100, 44000);
+        check (reversed.getNumSamples() == 44000 && std::abs (reversed.getSample (0, 0)) > 0.5f,
+               "reverse/cue MP3 export keeps the peak at the correct boundary");
 
         auto stems = std::make_shared<P::StemSet>();
         stems->source = source;
@@ -295,8 +323,8 @@ struct CueSamplerStateTests
         stems->vocals = source->buffer; stems->vocals.applyGain (0.125f);
         std::atomic_store (&p.stemSet, std::shared_ptr<const P::StemSet> (stems));
         p.appliedStemMask.store (0); p.muteDrums.store (true); p.muteVocals.store (true);
-        const auto muted = readExport (p.renderChopToTempWav (7, false, scratch), 44100);
-        check (muted.getNumSamples() == 44000 && muted.getSample (0, 0) == 1.75f * 0.625f,
+        const auto muted = readExport (p.renderChopToTempWav (7, false, scratch), 44100, 44000);
+        check (muted.getNumSamples() == 44000 && muted.getRMSLevel (0, 2000, 8000) < reversed.getRMSLevel (0, 2000, 8000) * 0.72f,
                "export immediately honours stem mutes before playback remix publishes");
 
         p.muteDrums.store (false); p.muteVocals.store (false);
@@ -310,7 +338,7 @@ struct CueSamplerStateTests
         p.renderChopExportAsync (request, [&] (juce::File file) { asyncFile = file; done = true; });
         check (juce::Time::getMillisecondCounterHiRes() - start < 100, "export dispatch does not block the UI for rendering");
         check (waitFor ([&] { return done; }), "background export completes on the message thread");
-        const auto asyncAudio = readExport (asyncFile, 44100);
+        const auto asyncAudio = readExport (asyncFile, 44100, 44100);
         if (asyncAudio.getNumSamples() > 22050)
         {
             int crossings = 0;
@@ -333,7 +361,7 @@ struct CueSamplerStateTests
         shortChop.attackMilliseconds = 10; shortChop.releaseMilliseconds = 4000;
         p.pitchSemitones.store (0);
         std::atomic_store (&p.chopState, shortLayout);
-        const auto shortAudio = readExport (p.renderChopToTempWav (7, false, scratch), 44100);
+        const auto shortAudio = readExport (p.renderChopToTempWav (7, false, scratch), 44100, 4410);
         check (shortAudio.getNumSamples() == 4410 && shortAudio.getRMSLevel (0, 500, 1500) > 0.1f,
                "short chop with attack and long release keeps an audible body");
         check (shortAudio.getNumSamples() == 4410 && std::abs (shortAudio.getSample (0, 4409)) < 0.001f,
@@ -347,7 +375,7 @@ struct CueSamplerStateTests
         p.muteBass.store (true); // applied mix remains original, intentionally
         p.pitchSemitones.store (5);
         const auto tempoFile = p.renderChopToTempWav (7, true, scratch);
-        const auto tempoAudio = readExport (tempoFile, 44100);
+        const auto tempoAudio = readExport (tempoFile, 44100, 66150);
         check (tempoAudio.getNumSamples() == 66150, "host tempo is captured without waiting for an audio callback");
         check (tempoAudio.getNumSamples() == 66150 && tempoAudio.getRMSLevel (0, 22050, 11025) < 0.13f
                && tempoAudio.getRMSLevel (0, 22050, 11025) > 0.07f,
@@ -368,16 +396,16 @@ struct CueSamplerStateTests
         cachedFile.deleteFile();
 
         const auto copySource = p.renderChopToTempWav (7, false, scratch);
-        const auto copyDestination = scratch.getChildFile ("saved export.wav");
+        const auto copyDestination = scratch.getChildFile ("saved export.mp3");
         copyDestination.replaceWithText ("old contents");
         bool copyDone = false, copyOK = false;
         p.saveChopExportAsync (copySource, copyDestination, [&] (bool ok) { copyOK = ok; copyDone = true; });
         check (waitFor ([&] { return copyDone; }) && copyOK && ! copySource.existsAsFile(),
                "background Save As replaces destination and cleans up temporary audio");
-        readExport (copyDestination, 44100);
+        readExport (copyDestination, 44100, 44100);
         const auto failedSource = p.renderChopToTempWav (7, false, scratch);
         copyDone = false; copyOK = true;
-        p.saveChopExportAsync (failedSource, scratch.getChildFile ("missing-parent/export.wav"),
+        p.saveChopExportAsync (failedSource, scratch.getChildFile ("missing-parent/export.mp3"),
                               [&] (bool ok) { copyOK = ok; copyDone = true; });
         check (waitFor ([&] { return copyDone; }) && ! copyOK && failedSource.existsAsFile(),
                "failed background Save As retains the rendered audio for recovery");
@@ -515,7 +543,7 @@ struct CueSamplerStateTests
         gate->signal();
         check (waitFor ([&] { return p.exportThreadPool.getNumJobs() == 0; }), "early-release export preparation completes");
         for (int i = 0; i < 10; ++i) pump();
-        check (findButton (*editor, "SAVE WAV...") == nullptr, "preparation click does not open the ADSR menu");
+        check (findButton (*editor, "SAVE MP3...") == nullptr, "preparation click does not open the ADSR menu");
 
         auto reuseGate = std::make_shared<juce::WaitableEvent>();
         p.exportThreadPool.addJob ([reuseGate] { reuseGate->wait (10000); });
@@ -530,7 +558,7 @@ struct CueSamplerStateTests
         for (int i = 0; i < 10; ++i) pump();
         auto adsrClick = eventAt (adsrPoint, true);
         wave->mouseDown (adsrClick); wave->mouseUp (adsrClick);
-        check (findButton (*editor, "SAVE WAV...") != nullptr, "ADSR opens the envelope menu with a separate Save WAV action");
+        check (findButton (*editor, "SAVE MP3...") != nullptr, "ADSR opens the envelope menu with a separate Save MP3 action");
     }
 
     // Opt-in CPU paint benchmark; timings are reported, never used as flaky CI assertions.
@@ -601,6 +629,118 @@ struct CueSamplerStateTests
             }
     }
 
+    static void runWaveformZoom (const juce::File& scratch)
+    {
+        P p; setup (p);
+        p.setWaveformZoom (0.0f);
+        p.setWaveformScroll (0.0f);
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+        // The console harness has no NSApplication event loop for the GL orb.
+        if (auto* orb = findType (*editor, "VisualizerOrb")) orb->setVisible (false);
+        editor->addToDesktop (juce::ComponentPeer::windowIsTemporary);
+        editor->setVisible (true);
+        for (int i = 0; i < 30; ++i) pump();
+        check (findButton (*editor, "ZOOM +") == nullptr
+               && findButton (*editor, "ZOOM -") == nullptr
+               && findButton (*editor, "FIT") == nullptr, "redundant horizontal zoom buttons are removed");
+        auto* heightPlus = findButton (*editor, "+");
+        check (heightPlus != nullptr, "waveform height control remains available");
+        if (heightPlus == nullptr) return;
+        auto* wave = heightPlus->getParentComponent();
+        juce::ScrollBar* bar = nullptr;
+        for (auto* child : wave->getChildren())
+            if (auto* candidate = dynamic_cast<juce::ScrollBar*> (child)) bar = candidate;
+        check (bar != nullptr, "zoom tests can inspect the waveform viewport");
+        if (bar == nullptr) return;
+        juce::Slider* zoomKnob = nullptr;
+        std::function<void (juce::Component&)> findZoom = [&] (juce::Component& c)
+        {
+            if (auto* slider = dynamic_cast<juce::Slider*> (&c);
+                slider != nullptr && slider->getTooltip().startsWith ("ZOOM:")) zoomKnob = slider;
+            for (auto* child : c.getChildren()) findZoom (*child);
+        };
+        findZoom (*editor);
+        check (zoomKnob != nullptr, "zoom knob is available for binding checks");
+        if (zoomKnob == nullptr) return;
+
+        const auto event = [wave] (float x, juce::ModifierKeys mods = {})
+        {
+            const juce::Point<float> point (x, 150.0f);
+            return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), point,
+                mods, 1, 0, 0, 0, 0, wave, wave,
+                juce::Time::getCurrentTime(), point, juce::Time::getCurrentTime(), 0, false);
+        };
+        const auto centre = event ((float) wave->getWidth() * 0.5f);
+        zoomKnob->setValue (0.0, juce::sendNotificationSync);
+        juce::MouseWheelDetails wheel {};
+        wheel.isSmooth = true;
+        wheel.deltaY = 0.01f;
+        for (int i = 0; i < 100; ++i) wave->mouseWheelMove (centre, wheel);
+        check (std::abs (p.getWaveformZoom() - 0.08f) < 0.00001f,
+               "rapid small trackpad deltas accumulate before animation ticks");
+        if (zoomKnob != nullptr)
+            check (std::abs (zoomKnob->getValue() - p.getWaveformZoom()) < 0.00001,
+                   "trackpad zoom synchronizes the ZOOM knob");
+        zoomKnob->setValue (0.0, juce::sendNotificationSync);
+        zoomKnob->setValue (0.2, juce::sendNotificationSync);
+        check (std::abs (p.getWaveformZoom() - 0.2f) < 0.00001f,
+               "ZOOM knob updates horizontal zoom");
+        zoomKnob->setValue (0.0, juce::sendNotificationSync);
+        check (waitFor ([&] { return ! bar->isVisible(); }), "zero zoom shows the entire sample");
+        zoomKnob->setValue (0.2, juce::sendNotificationSync);
+        check (waitFor ([&] { return std::abs (bar->getCurrentRangeSize() - 1.0 / std::pow (10.0, 1.2)) < 0.0001; }),
+               "knob zoom animates to the requested viewport");
+        const double beforeSize = bar->getCurrentRangeSize();
+        const double beforeCentre = bar->getCurrentRangeStart() + beforeSize * 0.5;
+        wave->mouseMagnify (centre, 2.0f);
+        check (p.getWaveformZoom() > 0.2f, "native pinch zoom changes the viewport target");
+        check (waitFor ([&] { return std::abs (bar->getCurrentRangeSize() * 2.0 - beforeSize) < 0.001; }),
+               "pinch scale doubles horizontal magnification");
+        check (std::abs (bar->getCurrentRangeStart() + bar->getCurrentRangeSize() * 0.5 - beforeCentre) < 0.001,
+               "pinch keeps the sample under the pointer anchored");
+        wave->mouseMagnify (centre, 0.5f);
+        check (std::abs (p.getWaveformZoom() - 0.2f) < 0.00001f, "reverse pinch returns to the previous zoom");
+        const float savedZoom = p.getWaveformZoom();
+        wave->mouseMagnify (centre, 0.0f);
+        wave->mouseMagnify (event (0.0f), 2.0f);
+        check (p.getWaveformZoom() == savedZoom, "invalid or out-of-display pinch events leave zoom unchanged");
+        wheel.deltaY = 0.0f;
+        wheel.deltaX = -0.01f;
+        const float scrollBefore = p.getWaveformScroll();
+        for (int i = 0; i < 100; ++i) wave->mouseWheelMove (centre, wheel);
+        check (std::abs (p.getWaveformScroll() - scrollBefore - 0.02f) < 0.00001f,
+               "rapid horizontal trackpad scrolling retains every delta");
+        wheel.deltaY = 0.001f;
+        wave->mouseWheelMove (centre, wheel);
+        check (p.getWaveformZoom() == savedZoom, "horizontal trackpad pan ignores vertical drift");
+        wheel.deltaX = 0.001f;
+        wheel.deltaY = 0.01f;
+        const float driftScroll = p.getWaveformScroll();
+        wave->mouseWheelMove (centre, wheel);
+        check (std::abs (p.getWaveformZoom() - savedZoom - 0.0008f) < 0.00001f,
+               "vertical trackpad zoom ignores horizontal drift");
+        check (p.getWaveformScroll() != driftScroll, "vertical zoom adjusts scroll to preserve the pointer anchor");
+        zoomKnob->setValue (savedZoom, juce::sendNotificationSync);
+        const auto ctrlEvent = event ((float) wave->getWidth() * 0.5f, juce::ModifierKeys (juce::ModifierKeys::ctrlModifier));
+        wheel.deltaX = 0.1f;
+        wave->mouseWheelMove (ctrlEvent, wheel);
+        check (std::abs (p.getWaveformZoom() - savedZoom - 0.0008f) < 0.00001f,
+               "Ctrl-wheel pinch translation zooms even with horizontal drift");
+        zoomKnob->setValue (savedZoom, juce::sendNotificationSync);
+        juce::MemoryBlock state;
+        p.getStateInformation (state);
+        P reopened;
+        reopened.setStateInformation (state.getData(), (int) state.getSize());
+        check (waitFor ([&] { return restored (reopened); })
+               && std::abs (reopened.getWaveformZoom() - savedZoom) < 0.00001f
+               && std::abs (reopened.getWaveformScroll() - p.getWaveformScroll()) < 0.00001f,
+               "gesture and knob viewport changes survive project restore");
+        juce::FileOutputStream screenshot (scratch.getParentDirectory().getChildFile ("waveform-zoom.png"));
+        screenshot.setPosition (0);
+        screenshot.truncate();
+        juce::PNGImageFormat().writeImageToStream (wave->createComponentSnapshot (wave->getLocalBounds()), screenshot);
+    }
+
     static void runPerformanceUi (const juce::File& scratch)
     {
         const auto findType = [] (juce::Component& root, const juce::String& name)
@@ -619,6 +759,7 @@ struct CueSamplerStateTests
             p.setWaveformZoom (0.15f);
             p.playbackSamplePosition.store (1000);
             std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+            if (auto* orb = findType (*editor, "VisualizerOrb")) orb->setVisible (false);
             editor->addToDesktop (juce::ComponentPeer::windowIsTemporary);
             editor->setVisible (true);
             auto* wave = findType (*editor, "WaveformDisplayComponent");
@@ -663,6 +804,8 @@ struct CueSamplerStateTests
         p.publishChopState (layout);
         p.setFavoritesViewEnabled (true);
         std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+        // The console harness has no NSApplication event loop for the GL orb.
+        if (auto* orb = findType (*editor, "VisualizerOrb")) orb->setVisible (false);
         editor->addToDesktop (juce::ComponentPeer::windowIsTemporary);
         editor->setVisible (true);
         auto* view = findType (*editor, "FavoritesViewComponent");
@@ -716,7 +859,7 @@ struct CueSamplerStateTests
         juce::AudioBuffer<float> audio (2, 64); juce::MidiBuffer midi;
         p.processBlock (audio, midi);
         check (p.getChopState()->favoriteChopIndices.size() == 2
-               && p.getMidiNoteForChopId (1) == 36 && p.getMidiNoteForChopId (2) == 37,
+               && p.getMidiNoteForChopId (1) == 48 && p.getMidiNoteForChopId (2) == 49,
                "double-clicking a favorite preserves membership, order and MIDI assignments");
         check (p.isPlaying() && p.getLastTriggeredChopId() == 1,
                "double-clicking a favorite still auditions the pad");
@@ -780,6 +923,1100 @@ struct CueSamplerStateTests
         check (p.isFavoritesViewEnabled(), "a stale Edit Chop action safely ignores a removed selection");
     }
 
+    static void runFavoritesAudio()
+    {
+        P p; setup (p);
+        auto layout = std::make_shared<P::ChopState>();
+        for (int i = 0; i < 3; ++i)
+        {
+            P::ChopDefinition chop;
+            chop.id = i + 1; chop.startSample = i * 16000; chop.endSample = (i + 1) * 16000;
+            chop.favorite = true; chop.favoriteOrder = 3 - i;
+            layout->chops.push_back (chop);
+        }
+        layout->selectedChopId = 1; layout->nextChopId = 4;
+        p.publishChopState (layout);
+        p.prepareToPlay (8000, 64);
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+        // The console harness has no NSApplication event loop for the GL orb.
+        if (auto* orb = findType (*editor, "VisualizerOrb")) orb->setVisible (false);
+        editor->addToDesktop (juce::ComponentPeer::windowIsTemporary);
+        editor->setVisible (true);
+        auto* button = findButton (*editor, "FAVORITES");
+        auto* view = findType (*editor, "FavoritesViewComponent");
+        auto* grid = view != nullptr ? view->getChildComponent (0) : nullptr;
+        check (button != nullptr && grid != nullptr, "Favorites audio controls exist");
+        if (button == nullptr || grid == nullptr) return;
+        juce::AudioBuffer<float> audio (2, 64); juce::MidiBuffer midi;
+        const auto render = [&]
+        {
+            p.processBlock (audio, midi); midi.clear();
+            return audio.getMagnitude (0, audio.getNumSamples());
+        };
+        p.startPlayback();
+        check (render() > 0.001f, "transport produces audio before Favorites");
+        button->onClick();
+        check (render() > 0.001f && p.isPlaying(), "transport continues when Favorites opens");
+        button->onClick();
+        check (render() > 0.001f && p.isPlaying(), "transport continues when Favorites closes");
+        // Opening the view must also preserve a not-yet-consumed Play request.
+        p.startPlayback(); button->onClick();
+        check (render() > 0.001f && p.isPlaying(), "Favorites does not overwrite a pending Play command");
+        for (auto mode : { P::ChopPlaybackMode::Gate, P::ChopPlaybackMode::OneShot })
+        {
+            p.setChopPlaybackMode (mode);
+            button->onClick();
+            const auto currentState = p.getChopState();
+            const auto& hostMap = currentState->midiMap.noteToChopIndex;
+            const int heldNote = (int) std::distance (hostMap.begin(), std::find (hostMap.begin(), hostMap.end(), 0));
+            midi.addEvent (juce::MidiMessage::noteOn (1, heldNote, (juce::uint8) 100), 0);
+            render();
+            button->onClick();
+            check (render() > 0.001f && p.voice.activeChopId == 1,
+                   "entering Favorites preserves the sounding MIDI chop despite remapping");
+            midi.addEvent (juce::MidiMessage::noteOff (1, heldNote), 0);
+            for (int block = 0; block < 20; ++block) render();
+            check (mode == P::ChopPlaybackMode::OneShot ? p.isPlaying() : ! p.isPlaying(),
+                   "original MIDI note-off still respects Gate and One Shot after view switching");
+            for (int slot = 0; slot < 3; ++slot)
+            {
+                midi.addEvent (juce::MidiMessage::noteOn (1, 48 + slot, (juce::uint8) 100), 0);
+                bool audible = render() > 0.001f;
+                // Exercise selection refresh and change listeners while sounding.
+                for (int block = 0; block < 12; ++block) { pump(); audible = render() > 0.001f && audible; }
+                check (audible && p.getLastTriggeredChopId() == 3 - slot,
+                       "Favorites MIDI stays audible after UI selection refresh");
+                midi.addEvent (juce::MidiMessage::noteOff (1, 48 + slot), 0);
+                render();
+                if (mode == P::ChopPlaybackMode::OneShot)
+                    check (render() > 0.001f, "Favorites One Shot continues after MIDI note-off");
+            }
+            for (int slot = 0; slot < 3; ++slot)
+            {
+                const auto point = juce::Point<float> ((slot + 0.5f) * grid->getWidth() / 3.0f,
+                                                       grid->getHeight() * 0.5f);
+                const auto now = juce::Time::getCurrentTime();
+                const auto click = juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), point,
+                    juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier), 1, 0, 0, 0, 0,
+                    grid, grid, now, point, now, 1, false);
+                grid->mouseDown (click);
+                bool audible = render() > 0.001f;
+                for (int block = 0; block < 12; ++block) { pump(); audible = render() > 0.001f && audible; }
+                check (audible && p.getLastTriggeredChopId() == 3 - slot
+                       && p.voice.playbackTriggeredByMouse,
+                       "Favorites mouse tiles stay audible after UI refresh");
+                grid->mouseUp (click);
+                for (int block = 0; block < 20; ++block) render();
+                check (mode == P::ChopPlaybackMode::OneShot ? p.isPlaying() : ! p.isPlaying(),
+                       "Favorites mouse release respects Gate and One Shot");
+            }
+        }
+        const auto point = juce::Point<float> (grid->getWidth() / 6.0f, grid->getHeight() * 0.5f);
+        const auto now = juce::Time::getCurrentTime();
+        const auto click = juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), point,
+            juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier), 1, 0, 0, 0, 0,
+            grid, grid, now, point, now, 1, false);
+        p.setChopPlaybackMode (P::ChopPlaybackMode::Gate);
+        grid->mouseDown (click); render();
+        view->setVisible (false);
+        for (int block = 0; block < 20; ++block) render();
+        check (! p.isPlaying() && ! p.mousePreviewHeld.load(), "hiding Favorites releases a mouse Gate");
+        view->setVisible (true);
+        p.setChopPlaybackMode (P::ChopPlaybackMode::OneShot);
+        grid->mouseDown (click); grid->mouseUp (click);
+        check (render() > 0.001f && p.isPlaying(), "a complete Favorites click between audio blocks starts a One Shot");
+    }
+
+    static void runSampleImport (const juce::File& scratch)
+    {
+        P p;
+        p.prepareToPlay (48000, 128);
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+        // Keep GL out of the console harness; import still runs real UI listeners.
+        if (auto* orb = findType (*editor, "VisualizerOrb")) orb->setVisible (false);
+        for (const auto rate : { 44100, 48000 })
+            for (const auto channels : { 1, 2 })
+            {
+                const auto file = scratch.getChildFile ("import-" + juce::String (rate)
+                                                     + "-" + juce::String (channels) + ".wav");
+                juce::AudioBuffer<float> signal (channels, rate);
+                for (int channel = 0; channel < channels; ++channel)
+                    for (int i = 0; i < rate; ++i)
+                        signal.setSample (channel, i, 0.2f * std::sin ((float) i * 0.04f));
+                auto output = file.createOutputStream();
+                auto writer = juce::WavAudioFormat().createWriterFor (output.get(), rate,
+                    (unsigned int) channels, 24, {}, 0);
+                check (writer != nullptr, "create real WAV import fixture");
+                if (writer == nullptr) return;
+                output.release();
+                check (writer->writeFromAudioSampleBuffer (signal, 0, rate), "write WAV import fixture");
+                delete writer;
+                // A replacement sample starts a fresh C2 layout, even after
+                // opening a project that retained its historical C4 mapping.
+                p.recordedMidiRoot.store (48); p.setMidiBankModeEnabled (false); p.setMidiOctaveOffset (7);
+                std::cout << "IMPORT " << rate << " Hz / " << channels << " channels" << std::endl;
+                check (p.loadAudioFile (file) == P::SampleLoadResult::loaded, "sample imports successfully");
+                for (int i = 0; i < 10; ++i) pump();
+                check (p.getLoadedSample() != nullptr && p.getLoadedSample()->buffer.getNumSamples() == rate,
+                       "import publishes the complete source for UI and playback");
+                check (p.getMidiRootNote() == 24 && p.getKeyboardStartNote() == 24 && p.isMidiBankModeEnabled()
+                       && p.getKeyboardMidiBank() == 1,
+                       "new import resets old project mapping to C2 with automatic full-range MIDI banks");
+                juce::AudioBuffer<float> audio (2, 128);
+                juce::MidiBuffer midi;
+                p.startPlayback(); p.processBlock (audio, midi);
+                check (audio.getMagnitude (0,128) > 0.001f, "imported sample produces audio");
+            }
+
+        // Hold the worker to prove UI dispatch returns without decoding/encoding,
+        // and that a newer selection discards an older queued import.
+        juce::WaitableEvent workerEntered, releaseWorker;
+        p.sampleImportThreadPool.addJob ([&]
+        {
+            workerEntered.signal();
+            releaseWorker.wait (5000);
+        });
+        check (workerEntered.wait (5000), "import worker is held for dispatch regression");
+        p.recordedMidiRoot.store (48); p.setMidiBankModeEnabled (false); p.setMidiOctaveOffset (7);
+        const auto previous = p.getLoadedSample();
+        bool supersededCompleted = false, completed = false;
+        p.loadAudioFileAsync (scratch.getChildFile ("import-44100-1.wav"),
+                             [&] (auto) { supersededCompleted = true; });
+        p.loadAudioFileAsync (scratch.getChildFile ("import-48000-2.wav"),
+                             [&] (auto result) { completed = result == P::SampleLoadResult::loaded; });
+        check (p.getSampleImportStatus() != nullptr
+               && p.getSampleImportStatus()->fileName == "import-48000-2.wav",
+               "loading state immediately identifies the latest selected file");
+        check (p.getLoadedSample() == previous && ! completed,
+               "async import returns while worker is busy and preserves current playback sample");
+        check (p.getMidiRootNote() == 48 && ! p.isMidiBankModeEnabled() && p.getKeyboardStartNote() == 84,
+               "pending replacement leaves existing project MIDI assignments intact");
+        auto* loading = findType (*editor, "SampleImportOverlayComponent");
+        auto* chooseAnother = findButton (*editor, "CHOOSE ANOTHER SAMPLE");
+        check (waitFor ([&] { return loading != nullptr && loading->isVisible(); })
+               && chooseAnother != nullptr && chooseAnother->isEnabled(),
+               "loading overlay offers an enabled replacement control");
+        if (loading != nullptr)
+        {
+            juce::FileOutputStream screenshot (scratch.getParentDirectory().getChildFile ("sample-import-loading.png"));
+            screenshot.setPosition (0); screenshot.truncate();
+            juce::PNGImageFormat().writeImageToStream (loading->createComponentSnapshot (loading->getLocalBounds()), screenshot);
+        }
+        releaseWorker.signal();
+        check (waitFor ([&] { return completed; }), "async import completes on the message thread");
+        check (! supersededCompleted && p.getLoadedSample()->sourceFile.getFileName() == "import-48000-2.wav",
+               "latest import wins over a superseded request");
+        check (p.getMidiRootNote() == 24 && p.getKeyboardStartNote() == 24 && p.isMidiBankModeEnabled()
+               && p.getKeyboardMidiBank() == 1,
+               "successful async replacement starts at C2 with automatic MIDI ranges");
+        check (p.getSampleImportStatus() == nullptr, "successful import clears its loading state");
+
+        // Drop a replacement onto the actual loading panel, including an
+        // unsupported first entry, to exercise the UI path while already busy.
+        workerEntered.reset(); releaseWorker.reset();
+        p.sampleImportThreadPool.addJob ([&]
+        {
+            workerEntered.signal();
+            releaseWorker.wait (5000);
+        });
+        check (workerEntered.wait (5000), "hold worker for loading-panel replacement");
+        p.loadAudioFileAsync (scratch.getChildFile ("import-48000-2.wav"), {});
+        check (waitFor ([&] { return loading != nullptr && loading->isVisible(); }),
+               "loading panel reappears for a subsequent replacement");
+        auto* dropTarget = dynamic_cast<juce::FileDragAndDropTarget*> (loading);
+        check (dropTarget != nullptr, "loading panel accepts replacement file drops");
+        if (dropTarget != nullptr)
+            dropTarget->filesDropped ({ scratch.getChildFile ("ignore.txt").getFullPathName(),
+                                       scratch.getChildFile ("import-44100-1.wav").getFullPathName() }, 20, 20);
+        check (p.getSampleImportStatus()->fileName == "import-44100-1.wav",
+               "drop replaces the pending filename immediately");
+        releaseWorker.signal();
+        check (waitFor ([&] { return p.getSampleImportStatus() == nullptr; })
+               && p.getLoadedSample()->sourceFile.getFileName() == "import-44100-1.wav",
+               "different sample replaces the old audio after preparation");
+        check (waitFor ([&] { return loading != nullptr && ! loading->isVisible(); }),
+               "loading panel disappears when replacement is ready");
+        const auto imported = p.getLoadedSample();
+        check (imported->getSerializedStateData().getBinaryData() != nullptr,
+               "async publication includes embedded project audio immediately");
+        p.recordedMidiRoot.store (48); p.setMidiBankModeEnabled (false); p.setMidiOctaveOffset (7);
+        bool failed = false;
+        p.loadAudioFileAsync (scratch.getChildFile ("missing-import.wav"),
+                             [&] (auto result) { failed = result == P::SampleLoadResult::failed; });
+        check (waitFor ([&] { return failed; }) && p.getLoadedSample() == imported,
+               "failed async import preserves the current sample");
+        check (p.getMidiRootNote() == 48 && ! p.isMidiBankModeEnabled() && p.getKeyboardStartNote() == 84,
+               "failed replacement preserves the current project's MIDI root, channel aliases and viewport");
+        check (p.getSampleImportStatus() == nullptr, "failed import clears the loading state");
+
+        juce::MemoryBlock savedState;
+        p.getStateInformation (savedState);
+        workerEntered.reset(); releaseWorker.reset();
+        p.sampleImportThreadPool.addJob ([&]
+        {
+            workerEntered.signal();
+            releaseWorker.wait (5000);
+        });
+        check (workerEntered.wait (5000), "hold import worker before project restoration");
+        bool staleCompleted = false;
+        p.loadAudioFileAsync (scratch.getChildFile ("import-44100-1.wav"),
+                             [&] (auto) { staleCompleted = true; });
+        p.setStateInformation (savedState.getData(), (int) savedState.getSize());
+        releaseWorker.signal();
+        check (waitFor ([&] { return restored (p)
+                                   && p.sampleImportThreadPool.getNumJobs() == 0; }),
+               "restoration completes with a queued import canceled");
+        check (! staleCompleted && p.getLoadedSample()->buffer.getNumSamples() == imported->buffer.getNumSamples()
+               && p.getSampleImportStatus() == nullptr,
+               "pending import cannot replace restored project audio");
+        check (p.getMidiRootNote() == 48 && ! p.isMidiBankModeEnabled() && p.getKeyboardStartNote() == 84,
+               "canceled stale import cannot overwrite the restored project's MIDI assignments");
+
+        int progressCalls = 0;
+        juce::MemoryBlock canceledEncoding;
+        check (! cuesampler::Mp3AudioCodec::encode (imported->buffer, imported->sampleRate,
+                    canceledEncoding, nullptr, 320, [&] (float) { return ++progressCalls < 3; })
+               && progressCalls == 3,
+               "abandoned import encoding cancels between audio blocks");
+
+        // Keep compaction blocked: import and an immediate self-contained save
+        // must succeed independently of MP3 encoding and the original disk file.
+        juce::WaitableEvent encoderEntered, releaseEncoder;
+        p.sampleStateEncodingThreadPool.addJob ([&]
+        {
+            encoderEntered.signal();
+            releaseEncoder.wait (5000);
+        });
+        check (encoderEntered.wait (5000), "hold optional persistence compression");
+        const auto removable = scratch.getChildFile ("delete-after-import.wav");
+        check (scratch.getChildFile ("import-48000-2.wav").copyFileTo (removable), "create removable import fixture");
+        p.loadAudioFileAsync (removable, {});
+        check (waitFor ([&] { return p.getSampleImportStatus() == nullptr; }),
+               "sample is ready while persistence compression is blocked");
+        check (p.getMidiRootNote() == 24 && p.getKeyboardStartNote() == 24 && p.isMidiBankModeEnabled()
+               && p.getKeyboardMidiBank() == 1,
+               "replacement after legacy project recall resets the layout to C2");
+        const auto fastSample = std::atomic_load (&p.loadedSample);
+        const auto snapshot = fastSample->getSerializedStateData();
+        check (snapshot.getBinaryData() != nullptr
+               && std::memcmp (snapshot.getBinaryData()->getData(), "RIFF", 4) == 0,
+               "uncompressed source snapshot is embedded before compaction");
+        juce::MemoryBlock immediateSave;
+        p.getStateInformation (immediateSave);
+        check (removable.deleteFile(), "remove original file before immediate-save recall");
+        P immediateRecall;
+        immediateRecall.setStateInformation (immediateSave.getData(), (int) immediateSave.getSize());
+        check (waitFor ([&] { return restored (immediateRecall); })
+               && equal (fastSample->buffer, immediateRecall.getLoadedSample()->buffer),
+               "immediate save recalls exact audio without the source file or completed compression");
+
+        P::StemSet stems;
+        stems.source = fastSample;
+        stems.drums.setSize (fastSample->buffer.getNumChannels(), fastSample->buffer.getNumSamples());
+        stems.drums.clear();
+        const auto mixed = P::createStemMix (stems, 1);
+        check (mixed != nullptr && mixed->deferredStateData == fastSample->deferredStateData,
+               "stem remixes share the source persistence snapshot");
+        releaseEncoder.signal();
+        check (waitFor ([&]
+        {
+            const auto data = fastSample->getSerializedStateData();
+            return data.getBinaryData() != nullptr && std::memcmp (data.getBinaryData()->getData(), "CUMP", 4) == 0;
+        }), "source snapshot compacts to MP3 after playback is available");
+        check (p.getLoadedSample() == fastSample
+               && mixed->getSerializedStateData() == fastSample->getSerializedStateData(),
+               "compaction preserves playback identity and reaches existing stem remixes");
+        juce::MemoryBlock compactSave;
+        p.getStateInformation (compactSave);
+        P compactRecall;
+        compactRecall.setStateInformation (compactSave.getData(), (int) compactSave.getSize());
+        check (waitFor ([&] { return restored (compactRecall); })
+               && compactRecall.getLoadedSample()->buffer.getNumSamples() == fastSample->buffer.getNumSamples(),
+               "compacted project still recalls with the same sample clock");
+    }
+
+    static void runImportBenchmark (const juce::File& scratch)
+    {
+        constexpr int rate = 48000, samples = rate * 30;
+        juce::AudioBuffer<float> signal (2, samples);
+        for (int i = 0; i < samples; ++i)
+        {
+            signal.setSample (0, i, 0.2f * std::sin ((float) i * 0.04f));
+            signal.setSample (1, i, 0.2f * std::sin ((float) i * 0.06f));
+        }
+        const auto file = scratch.getChildFile ("import-benchmark.wav");
+        auto output = file.createOutputStream();
+        std::unique_ptr<juce::AudioFormatWriter> writer (juce::WavAudioFormat().createWriterFor (
+            output.get(), rate, 2, 24, {}, 0));
+        if (writer == nullptr) { check (false, "create import benchmark fixture"); return; }
+        output.release();
+        check (writer->writeFromAudioSampleBuffer (signal, 0, samples), "write 30-second stereo benchmark");
+        writer.reset();
+        P p;
+        std::array<double, 3> before {}, after {};
+        for (size_t i = 0; i < before.size(); ++i)
+        {
+            auto start = juce::Time::getMillisecondCounterHiRes();
+            const auto legacy = p.createLoadedSampleDataFromFile (file);
+            before[i] = juce::Time::getMillisecondCounterHiRes() - start;
+            start = juce::Time::getMillisecondCounterHiRes();
+            const auto fast = p.createLoadedSampleDataFromFile (file, nullptr, {}, true);
+            after[i] = juce::Time::getMillisecondCounterHiRes() - start;
+            check (legacy != nullptr && fast != nullptr && equal (legacy->buffer, fast->buffer),
+                   "fast and previous import paths decode identical audio");
+        }
+        std::sort (before.begin(), before.end()); std::sort (after.begin(), after.end());
+        std::cout << "IMPORT BENCHMARK 30s / 48kHz / stereo WAV: median before=" << before[1]
+                  << " ms, ready before compression=" << after[1] << " ms, speedup="
+                  << before[1] / after[1] << "x (decode/persistence preparation only)" << std::endl;
+    }
+
+    static void runOctaveBanking (const juce::File& scratch)
+    {
+        {
+            std::vector<juce::MidiMessage> preview, host;
+            cuesampler::LaptopNoteRouter router (
+                [&] (const auto& message) { preview.push_back (message); },
+                [&] (const auto& message) { host.push_back (message); });
+            router.send (juce::MidiMessage::noteOn (1, 48, (juce::uint8) 100), false);
+            router.send (juce::MidiMessage::noteOff (1, 48), true);
+            check (preview.size() == 2 && host.empty() && preview.back().isNoteOff(),
+                   "connecting FL cannot redirect a local held note's release or duplicate playback");
+            router.send (juce::MidiMessage::noteOn (3, 107, (juce::uint8) 100), true);
+            router.send (juce::MidiMessage::noteOff (3, 107), false);
+            check (preview.size() == 2 && host.size() == 2 && host.back().getChannel() == 3
+                   && host.back().getNoteNumber() == 107 && host.back().isNoteOff(),
+                   "disconnecting FL retains the original remote channel and pitch for release");
+
+            cuesampler::LaptopPhysicalKeys physical;
+            cuesampler::LaptopMidiInput input ([&] (const auto& message) { router.send (message, false); });
+            auto down = [&] (int key) { return input.press (key, 48, 1); };
+            auto up = [&] (int key) { input.releaseKey (key); };
+            physical.down (6, 'Z', false, down);
+            physical.releaseAll ([&] { input.releaseAll(); });
+            const auto count = preview.size();
+            physical.down (6, 'Z', true, down);
+            check (preview.size() == count, "native held-key repeats cannot retrigger after OCT or focus changes");
+            physical.reconcile ([] (int) { return false; }, up);
+            physical.down (6, 'Z', false, down);
+            check (preview.size() == count + 1 && preview.back().isNoteOn(),
+                   "physical reconciliation clears blocked laptop keys without JUCE's event cache");
+            physical.up (6, up);
+        }
+        {
+            using Result = cuesampler::FlOctaveShortcutResult;
+            using Layout = cuesampler::FlTypingLayout;
+            std::vector<int> dispatched;
+            const auto post = [&] (cuesampler::FlOctaveShortcut shortcut)
+            {
+                dispatched.push_back (shortcut.octave);
+                return true;
+            };
+            for (int octave = 2; octave <= 6; ++octave)
+            {
+                const auto key = cuesampler::makeFlOctaveShortcut (octave * 12);
+                check (key && key->macKeyCode == 84 + octave - 2,
+                       "FL shortcut uses the absolute numeric-keypad octave key");
+                check (cuesampler::dispatchFlOctaveShortcut (octave * 12, { true, true, false, true }, post) == Result::queued,
+                       "active FL window receives each supported octave request");
+            }
+            check (dispatched == std::vector<int> ({ 2, 3, 4, 5, 6 }), "octave requests are absolute, with no accumulating relative transpose");
+            for (int octave = 4; octave <= 8; ++octave)
+            {
+                const auto key = cuesampler::makeFlOctaveShortcut (octave * 12, Layout::extended);
+                check (key && key->octave == octave - 2 && key->macKeyCode == 84 + octave - 4,
+                       "extended C4-C8 requests still use only documented FL shortcuts 2-6");
+            }
+            check (! cuesampler::makeFlOctaveShortcut (36, Layout::extended)
+                   && ! cuesampler::makeFlOctaveShortcut (108, Layout::extended),
+                   "extended layout cannot request an unsupported FL shortcut");
+            const auto layoutFile = juce::File (__FILE__).getParentDirectory().getParentDirectory()
+                .getChildFile ("assets/fl-studio/CUE SAMPLER Extended.scr");
+            const auto lines = juce::StringArray::fromLines (layoutFile.loadFileAsString().trimEnd());
+            check (lines.size() == 52 && lines[42] == "72" && lines[14] == "84", "extended layout preserves the normal Z/Q piano rows");
+            std::bitset<128> reachable;
+            for (int octave = 4; octave <= 8; ++octave)
+            {
+                const auto key = cuesampler::makeFlOctaveShortcut (octave * 12, Layout::extended);
+                for (const auto& line : lines)
+                    if (line.containsOnly ("0123456789"))
+                    {
+                        const int note = line.getIntValue() + (key->octave - 4) * 12;
+                        if (note >= 0 && note <= 127) reachable.set ((size_t) note);
+                    }
+                check (lines[42].getIntValue() + (key->octave - 4) * 12 == octave * 12,
+                       "same laptop key records the requested absolute extended octave");
+            }
+            check (reachable.count() == 80 && reachable.test (48) && reachable.test (127),
+                   "extended layout and documented shortcuts cover every MIDI note from C4 to G10");
+            for (const int count : { 1, 12, 13, 36, 37, 80, 100 })
+            {
+                std::bitset<128> mapped;
+                for (int i = 0; i < count && 48 + i < 128; ++i) mapped.set ((size_t) (48 + i));
+                const int last = (juce::jmin (127, 48 + count - 1) / 12) * 12;
+                const auto view = cuesampler::keyboardOctaveRange (mapped);
+                const auto extended = cuesampler::keyboardOctaveRange (mapped, 48, 96, 32);
+                check (view.hasNotes && view.firstNote == 48 && view.lastNote == last,
+                       "keyboard navigation follows mapped chops, including a partial final octave");
+                check (extended.hasNotes && extended.firstNote == 48 && extended.lastNote == juce::jmin (96, last),
+                       "extended range follows chops and keeps highest notes reachable on upper keys");
+            }
+            check (! cuesampler::keyboardOctaveRange ({}).hasNotes, "empty chop maps disable octave navigation");
+            std::bitset<128> sparse; sparse.set (36); sparse.set (127);
+            check (cuesampler::keyboardOctaveRange (sparse).firstNote == 36
+                   && cuesampler::keyboardOctaveRange (sparse).lastNote == 120,
+                   "range follows actual absolute pins rather than assuming chop count or root");
+            for (const int note : { -12, 0, 12, 25, 73, 84, 120, 128 })
+                check (cuesampler::dispatchFlOctaveShortcut (note, { true, true, false, true }, post) == Result::unsupportedOctave,
+                       "unsupported octave cannot emit a different FL shortcut");
+            check (cuesampler::dispatchFlOctaveShortcut (60, { false, true, false, true }, post) == Result::unsupportedHost,
+                   "bridge does not dispatch in another host");
+            check (cuesampler::dispatchFlOctaveShortcut (60, { true, false, false, true }, post) == Result::inactiveHost,
+                   "bridge does not dispatch while FL is inactive");
+            check (cuesampler::dispatchFlOctaveShortcut (60, { true, true, true, true }, post) == Result::keysHeld,
+                   "held typing keys prevent octave changes and mismatched note-offs");
+            check (cuesampler::dispatchFlOctaveShortcut (60, { true, true, false, false }, post) == Result::unavailableWindow,
+                   "dialog or missing target window prevents dispatch");
+            check (dispatched.size() == 5, "all blocked requests emit zero shortcuts");
+            check (cuesampler::dispatchFlOctaveShortcut (60, { true, true, false, true }, [] (auto) { return false; }) == Result::failed,
+                   "failed native dispatch is not reported as queued");
+            if (! cuesampler::isFlOctaveShortcutAvailable())
+                check (cuesampler::postFlOctaveShortcut (60) == Result::unsupportedHost,
+                       "real native bridge refuses shortcuts in the test process");
+        }
+        P p;
+        {
+            using Result = cuesampler::FlOctaveShortcutResult;
+            int view = 72;
+            std::vector<int> requested;
+            const auto post = [&] (int note) { requested.push_back (note); return Result::queued; };
+            const auto show = [&] (int note) { view = note; };
+            auto result = cuesampler::stepFlTypingOctave (view, -1, post, show);
+            check (result == Result::queued && view == 60 && requested == std::vector<int> { 60 },
+                   "OCT minus from C6 requests FL C5 and shows the same absolute octave");
+            for (const auto blocked : { Result::keysHeld, Result::inactiveHost, Result::unavailableWindow, Result::failed })
+            {
+                result = cuesampler::stepFlTypingOctave (view, -1, [blocked] (int) { return blocked; }, show);
+                check (result == blocked && view == 60, "blocked FL octave request cannot move the screen keyboard");
+            }
+            for (int i = 0; i < 10; ++i) cuesampler::stepFlTypingOctave (view, -1, post, show);
+            check (view == 24 && requested == std::vector<int> ({ 60, 48, 36, 24 }),
+                   "FL OCT minus stops at C2 without sending unsupported or repeated shortcuts");
+            requested.clear();
+            for (int i = 0; i < 4; ++i) cuesampler::stepFlTypingOctave (view, 1, post, show);
+            check (view == 72 && requested == std::vector<int> ({ 36, 48, 60, 72 }),
+                   "FL OCT plus reaches C6 with matching native octave requests");
+            for (int i = 0; i < 10; ++i) result = cuesampler::stepFlTypingOctave (view, 1, post, show);
+            check (view == 120 && ! result && requested == std::vector<int> ({ 36, 48, 60, 72 }),
+                   "OCT browses screen keys through C10 without sending unsupported FL shortcuts");
+            for (int i = 0; i < 3; ++i)
+                check (cuesampler::stepFlTypingOctave (view, -1, post, show) == Result::viewOnly,
+                       "higher screen-keyboard navigation leaves FL's typing octave unchanged");
+            check (view == 84 && cuesampler::flTypingViewForNote (view, 72) == 84,
+                   "FL typing and clips cannot pull the user out of the higher screen-keyboard view");
+            result = cuesampler::stepFlTypingOctave (view, -1, [] (int) { return Result::keysHeld; }, show);
+            check (result == Result::keysHeld && view == 84, "blocked return to native typing keeps the C7 view intact");
+            result = cuesampler::stepFlTypingOctave (view, -1, post, show);
+            check (result == Result::queued && view == 72 && requested.back() == 72,
+                   "returning from screen C7 to C6 resynchronizes FL's actual octave");
+            view = 12;
+            requested.clear();
+            result = cuesampler::stepFlTypingOctave (view, -1, post, show, 0);
+            check (result == Result::viewOnly && view == 0 && requested.empty(),
+                   "old C0 projects retain their lower screen keys without unsupported native commands");
+            check (cuesampler::flTypingViewForNote (0, 72) == 72,
+                   "first FL C6 input reveals the matching C6 screen octave");
+            check (cuesampler::flTypingViewForNote (60, 72) == 60
+                   && cuesampler::flTypingViewForNote (60, 84) == 60,
+                   "overlapping typing rows keep one stable viewport and their actual note labels");
+            check (cuesampler::flTypingViewForNote (72, 24) == 24,
+                   "changing FL's octave externally reveals lower incoming notes");
+            check (cuesampler::flTypingViewForNote (72, 0) == 72
+                   && cuesampler::flTypingViewForNote (72, 127) == 72,
+                   "non-typing controller notes cannot invent unsupported FL octave commands");
+        }
+        check (p.getParameters().isEmpty(), "FL Link controller identity is absent from the testing build");
+        auto source = std::make_shared<P::LoadedSampleData>();
+        source->sampleRate = 8000; source->fileName = "octave fixture";
+        source->buffer.setSize (2, 220 * 128);
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = 0; i < source->buffer.getNumSamples(); ++i)
+                source->buffer.setSample (ch, i, 0.2f * std::sin ((float) i * 0.1f));
+        juce::MemoryBlock sourceState;
+        check (p.serializeSampleToStateData (*source, sourceState), "encode octave fixture for project recall");
+        source->serializedStateData = juce::var (sourceState);
+        {
+            P fresh;
+            check (fresh.getMidiRootNote() == 24 && fresh.getKeyboardStartNote() == 24,
+                   "new processors start their first chop and keyboard view at FL C2");
+            std::atomic_store (&fresh.loadedSample, source);
+            auto chops = std::make_shared<P::ChopState>();
+            for (int i = 0; i < 220; ++i)
+            {
+                P::ChopDefinition chop;
+                chop.id = i + 1; chop.startSample = i * 128; chop.endSample = (i + 1) * 128;
+                chops->chops.push_back (chop);
+            }
+            chops->selectedChopId = 1; chops->nextChopId = 221;
+            fresh.publishChopState (chops); fresh.prepareToPlay (8000, 64);
+            check (fresh.getMidiNoteForChopId (1) == 24 && fresh.getMidiNoteForChopId (49) == 72
+                   && fresh.getMidiNoteForChopId (61) == 84 && fresh.getMidiNoteForChopId (104) == 127
+                   && fresh.getMidiNoteForChopId (105) == 24 && fresh.getMidiChannelForChopId (105) == 2
+                   && fresh.getMidiBankCount() == 3 && fresh.getUnreachableChopCount() == 0,
+                   "C2-root chops fill C2-G10 and restart at C2 on each later MIDI channel");
+            juce::AudioBuffer<float> audio (2, 64); juce::MidiBuffer midi;
+            const auto render = [&] { fresh.processBlock (audio, midi); midi.clear(); };
+            bool complete = true;
+            for (int i = 0; i < 220; ++i)
+            {
+                const int note = 24 + i % 104, channel = i / 104 + 1;
+                fresh.keyboardState.noteOn (channel, note, 1.0f); render();
+                complete &= fresh.getLastTriggeredChopId() == i + 1;
+                fresh.keyboardState.noteOff (channel, note, 0.0f); render();
+                midi.addEvent (juce::MidiMessage::noteOn (channel, note, (juce::uint8) 100), 0); render();
+                complete &= fresh.getLastTriggeredChopId() == i + 1;
+                midi.addEvent (juce::MidiMessage::noteOff (channel, note), 0); render();
+            }
+            check (complete, "all 220 C2-root screen and host channel/note pairs trigger the same chops");
+            fresh.setMidiOctaveOffset (7);
+            midi.addEvent (juce::MidiMessage::noteOn (1, 24, (juce::uint8) 100), 0); render();
+            check (fresh.getLastTriggeredChopId() == 1, "first chop remains DAW C2 while viewing higher screen octaves");
+            midi.addEvent (juce::MidiMessage::noteOff (1, 24), 0); render();
+            fresh.keyboardState.noteOn (1, 127, 1.0f); render();
+            check (fresh.getLastTriggeredChopId() == 104, "G10 screen key reaches the last chop of the C2-root range");
+            fresh.keyboardState.noteOff (1, 127, 0.0f); render();
+            juce::MemoryBlock saved; fresh.getStateInformation (saved);
+            P recall; recall.setStateInformation (saved.getData(), (int) saved.getSize());
+            check (waitFor ([&] { return restored (recall); }) && recall.getMidiRootNote() == 24
+                   && recall.getKeyboardStartNote() == 84 && recall.getMidiNoteForChopId (1) == 24
+                   && recall.getMidiChannelForChopId (209) == 3,
+                   "C2 mapping, overflow ranges and the higher screen view survive project recall");
+        }
+        // Keep the existing full-128-note fixture to verify old C0 projects.
+        p.recordedMidiRoot.store (0); p.setMidiOctaveOffset (0);
+        std::atomic_store (&p.loadedSample, source);
+        auto layout = std::make_shared<P::ChopState>();
+        for (int i = 0; i < 128; ++i)
+        {
+            P::ChopDefinition chop;
+            chop.id = i + 1; chop.startSample = i * 128; chop.endSample = (i + 1) * 128;
+            layout->chops.push_back (chop);
+        }
+        layout->selectedChopId = 1; layout->nextChopId = 129;
+        p.publishChopState (layout); p.prepareToPlay (8000, 64);
+        const auto original = p.getChopState();
+        check (cuesampler::midiNoteName (0) == "C0" && cuesampler::midiNoteName (12) == "C1"
+               && cuesampler::midiNoteName (48) == "C4" && cuesampler::midiNoteName (60) == "C5"
+               && cuesampler::midiNoteName (72) == "C6" && cuesampler::midiNoteName (127) == "G10",
+               "note labels match FL Studio throughout the MIDI range");
+        check (p.getMidiRootNote() == 0 && p.isMidiBankModeEnabled()
+               && p.getMidiNoteForChopId (1) == 0 && p.getMidiNoteForChopId (13) == 12
+               && p.getMidiNoteForChopId (100) == 99,
+               "saved C0 positional chops keep their original consecutive absolute MIDI notes");
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+        if (auto* orb = findType (*editor, "VisualizerOrb")) orb->setVisible (false);
+        editor->addToDesktop (juce::ComponentPeer::windowIsTemporary);
+        editor->setVisible (true);
+        juce::Button* plus = nullptr; juce::Button* minus = nullptr; juce::Button* flLink = nullptr;
+        juce::Button* theme = nullptr;
+        juce::Slider* chopRange = nullptr;
+        std::function<void (juce::Component&)> find = [&] (juce::Component& c)
+        {
+            if (auto* b = dynamic_cast<juce::Button*> (&c))
+            {
+                if (b->getComponentID() == "octave-up") plus = b;
+                if (b->getComponentID() == "octave-down") minus = b;
+                if (b->getComponentID() == "fl-octave-link") flLink = b;
+                if (b->getTooltip() == "Switch between light and dark themes.") theme = b;
+            }
+            if (auto* slider = dynamic_cast<juce::Slider*> (&c); slider != nullptr && slider->getComponentID() == "chop-range")
+                chopRange = slider;
+            for (auto* child : c.getChildren()) find (*child);
+        };
+        find (*editor);
+        check (chopRange == nullptr,
+               "CHOPS slider is absent from the editor");
+        auto* keys = dynamic_cast<juce::MidiKeyboardComponent*> (findType (*editor, "GlassKeyboard"));
+        check (plus != nullptr && minus != nullptr && keys != nullptr, "OCT buttons and keyboard are present");
+        if (plus == nullptr || minus == nullptr || keys == nullptr) return;
+        check (flLink == nullptr, "FL LINK button is absent from the testing build");
+        check (! keys->keyPressed (juce::KeyPress ('z', 0, 0))
+               && ! keys->keyPressed (juce::KeyPress ('a', 0, 0)),
+               "CUE leaves laptop piano keys to the DAW");
+        {
+            juce::FileOutputStream image (scratch.getParentDirectory().getChildFile ("fl-octave-controls.png"));
+            image.setPosition (0); image.truncate();
+            auto* controls = plus->getParentComponent();
+            juce::PNGImageFormat().writeImageToStream (controls->createComponentSnapshot (controls->getLocalBounds()), image);
+        }
+        check (keys->getOctaveForMiddleC() == 5 && keys->getWhiteNoteText (0) == "C0"
+               && keys->getLowestVisibleKey() == 0, "screen keyboard starts at FL Studio C0");
+        if (theme != nullptr && theme->onClick)
+        {
+            // Visual QA artifacts use the real component tree. Restore both
+            // the editor size and persisted theme before behavioral checks.
+            struct RestoreVisualState
+            {
+                juce::Component& editor;
+                juce::Button& theme;
+                const juce::Point<int> size;
+                const juce::String themeName;
+                ~RestoreVisualState()
+                {
+                    editor.setSize (size.x, size.y);
+                    if (theme.getButtonText() != themeName && theme.onClick) theme.onClick();
+                }
+            } restore { *editor, *theme, { editor->getWidth(), editor->getHeight() }, theme->getButtonText() };
+            const auto writeSnapshot = [&] (const juce::String& name, juce::Rectangle<int> bounds)
+            {
+                juce::FileOutputStream image (scratch.getParentDirectory().getChildFile (name));
+                image.setPosition (0); image.truncate();
+                juce::PNGImageFormat().writeImageToStream (editor->createComponentSnapshot (bounds), image);
+            };
+            for (const auto* themeName : { "dark", "light" })
+            {
+                if (theme->getButtonText() != juce::String (themeName).toUpperCase()) theme->onClick();
+                editor->setSize (restore.size.x, restore.size.y);
+                const auto keyBounds = editor->getLocalArea (keys, keys->getLocalBounds());
+                const float scale = (float) keyBounds.getHeight() / (float) keys->getHeight();
+                const auto footerBounds = keyBounds.toFloat().expanded (8.0f * scale, 4.0f * scale)
+                    .withTop ((float) keyBounds.getY() - 32.0f * scale)
+                    .withBottom ((float) keyBounds.getBottom() + 6.0f * scale)
+                    .getSmallestIntegerContainer().getIntersection (editor->getLocalBounds());
+                writeSnapshot ("keyboard-footer-" + juce::String (themeName) + ".png", footerBounds);
+                writeSnapshot ("keyboard-ui-" + juce::String (themeName) + ".png", editor->getLocalBounds());
+                editor->setSize (juce::roundToInt ((float) restore.size.x * 0.85f),
+                                 juce::roundToInt ((float) restore.size.y * 0.85f));
+                writeSnapshot ("keyboard-ui-minimum-" + juce::String (themeName) + ".png", editor->getLocalBounds());
+            }
+        }
+        plus->triggerClick();
+        check (waitFor ([&] { return keys->getLowestVisibleKey() == 12; }), "OCT + shows C1");
+        plus->triggerClick();
+        check (waitFor ([&] { return keys->getLowestVisibleKey() == 24; }), "second OCT + shows C2");
+        {
+            juce::FileOutputStream image (scratch.getParentDirectory().getChildFile ("octave-keyboard.png"));
+            image.setPosition (0); image.truncate();
+            juce::PNGImageFormat().writeImageToStream (keys->createComponentSnapshot (keys->getLocalBounds()), image);
+        }
+        check (p.getChopState() == original, "OCT navigation never republishes or remaps chops");
+        juce::AudioBuffer<float> audio (2, 64); juce::MidiBuffer midi;
+        const auto render = [&] { p.processBlock (audio, midi); midi.clear(); };
+        // Reproduce the reported mismatch through the actual host audio path.
+        // Even when the screen shows C2 or C0, FL C6 must remain MIDI 72.
+        midi.addEvent (juce::MidiMessage::noteOn (1, 72, (juce::uint8) 100), 0);
+        p.processBlock (audio, midi);
+        check (midi.getNumEvents() == 1 && (*midi.begin()).getMessage().getNoteNumber() == 72,
+               "host MIDI keeps its original C6 note");
+        midi.clear();
+        check (p.getLastTriggeredChopId() == 73
+               && p.getHeldHostMidiNotes().test (72) && ! p.getHeldHostMidiNotes().test (24),
+               "incoming FL C6 plays and illuminates CUE C6 while viewing C2");
+        const auto observedC6 = p.getLatestHostMidiKeyEvent();
+        check (observedC6 != 0 && (observedC6 & 2047u) == 72,
+               "audio publishes the real incoming note/channel to the UI without translating MIDI");
+        midi.addEvent (juce::MidiMessage::noteOff (1, 72), 0); render();
+        check (p.getLatestHostMidiKeyEvent() == observedC6,
+               "short host taps remain observable after note-off");
+        for (int step = 0; step < 2; ++step) minus->onClick();
+        midi.addEvent (juce::MidiMessage::noteOn (1, 72, (juce::uint8) 100), 0); render();
+        check (p.getLatestHostMidiKeyEvent() != observedC6 && (p.getLatestHostMidiKeyEvent() & 2047u) == 72,
+               "repeated host notes receive a fresh UI observation");
+        check (p.getKeyboardStartNote() == 0 && keys->getLowestVisibleKey() == 0
+               && p.getLastTriggeredChopId() == 73,
+               "viewing C0 cannot reinterpret incoming FL C6 as C0");
+        midi.addEvent (juce::MidiMessage::noteOff (1, 72), 0); render();
+        for (int step = 0; step < 10; ++step) plus->onClick();
+        midi.addEvent (juce::MidiMessage::noteOn (1, 72, (juce::uint8) 100), 0); render();
+        check (p.getKeyboardStartNote() == 120 && ! plus->isEnabled()
+               && p.getLastTriggeredChopId() == 73 && p.getChopState() == original,
+               "OCT C10 leaves recorded C6 playback and the chop map unchanged");
+        midi.addEvent (juce::MidiMessage::noteOff (1, 72), 0); render();
+        midi.addEvent (juce::MidiMessage::noteOn (1, 127, (juce::uint8) 100), 0); render();
+        check (p.getLastTriggeredChopId() == 128 && p.getHeldHostMidiNotes().test (127),
+               "absolute G10 reaches chop 128 and illuminates G10");
+        midi.addEvent (juce::MidiMessage::noteOff (1, 127), 0); render();
+        // Compare every screen note against host playback, including both ends
+        // of the MIDI range, while OCT is deliberately on a different page.
+        bool sameNotes = true;
+        for (int note = 0; note < 128; ++note)
+        {
+            const auto beforeScreen = p.getLatestHostMidiKeyEvent();
+            p.keyboardState.noteOn (1, note, 1.0f); render();
+            const int screenChop = p.getLastTriggeredChopId();
+            sameNotes &= p.getLatestHostMidiKeyEvent() == beforeScreen;
+            p.keyboardState.noteOff (1, note, 0.0f); render();
+            midi.addEvent (juce::MidiMessage::noteOn (1, note, (juce::uint8) 100), 0); render();
+            sameNotes &= screenChop == note + 1 && p.getLastTriggeredChopId() == screenChop;
+            midi.addEvent (juce::MidiMessage::noteOff (1, note), 0); render();
+        }
+        check (sameNotes, "all 128 screen keys and DAW notes trigger the same chops");
+        juce::MemoryBlock localSaved; p.getStateInformation (localSaved);
+        auto localTree = juce::ValueTree::readFromData ((const char*) localSaved.getData() + 4, localSaved.getSize() - 4);
+        check (! (bool) localTree.getProperty ("keyboardMidiNavigation")
+               && (int) localTree.getProperty ("keyboardMidiInputBase") == -1,
+               "saved state disables learned octave translation for older builds");
+        // Projects from the previous build may still contain a learned C6 base.
+        localTree.setProperty ("keyboardMidiNavigation", true, nullptr);
+        localTree.setProperty ("keyboardMidiInputBase", 72, nullptr);
+        P localRecall; localRecall.applyParsedRestoreState (p.parseDeferredRestoreState (localTree));
+        std::atomic_store (&localRecall.loadedSample, source); localRecall.publishChopState (std::make_shared<P::ChopState> (*p.getChopState()));
+        localRecall.prepareToPlay (8000, 64);
+        midi.addEvent (juce::MidiMessage::noteOn (1, 72, (juce::uint8) 100), 0);
+        localRecall.processBlock (audio, midi); midi.clear();
+        check (localRecall.getKeyboardStartNote() == 120 && localRecall.getLastTriggeredChopId() == 73,
+               "recall ignores obsolete learned transposition and keeps FL C6 at CUE C6");
+        midi.addEvent (juce::MidiMessage::noteOn (1, 79, (juce::uint8) 100), 0); render();
+        for (int step = 0; step < 8; ++step) minus->onClick();
+        midi.addEvent (juce::MidiMessage::noteOff (2, 79), 0); render();
+        check (p.heldMidiNote.load() == 79, "different MIDI channel cannot release the held voice");
+        midi.addEvent (juce::MidiMessage::noteOff (1, 79), 0); render();
+        check (p.heldMidiNote.load() == -1 && p.getHeldHostMidiNotes().none(),
+               "matching note releases after OCT changes and clears its lamp");
+        {
+            int hostSends = 0;
+            cuesampler::LaptopNoteRouter router ([&] (const auto& message)
+                {
+                    if (message.isNoteOn()) p.keyboardState.noteOn (message.getChannel(), message.getNoteNumber(), message.getFloatVelocity());
+                    else p.keyboardState.noteOff (message.getChannel(), message.getNoteNumber(), 0.0f);
+                }, [&] (const auto&) { ++hostSends; });
+            cuesampler::LaptopMidiInput input ([&] (const auto& message) { router.send (message, false); });
+            input.press ('Z', 84, 1); render();
+            check (p.getLastTriggeredChopId() == 85 && hostSends == 0,
+                   "unconnected laptop input plays its chop through the real UI-to-audio queue without a MIDI device");
+            input.releaseKey ('Z'); render();
+            check (p.onScreenMidiFifo.getNumReady() == 0 && hostSends == 0,
+                   "local laptop release is consumed by processBlock without host routing");
+        }
+        midi.addEvent (juce::MidiMessage::noteOn (1, 0, (juce::uint8) 100), 0); render();
+        check (p.getLastTriggeredChopId() == 1, "DAW C0 still plays chop 1 after OCT changes");
+        midi.addEvent (juce::MidiMessage::noteOn (1, 12, (juce::uint8) 100), 0); render();
+        check (p.getLastTriggeredChopId() == 13, "DAW C1 always plays its fixed C1 chop");
+        // Exercise the same keyboard-state listener used by native mouse keys.
+        // Native pointer hit testing depends on desktop window occlusion and is
+        // left to the host UI smoke check, not the console audio harness.
+        const int visibleNote = keys->getRangeStart();
+        p.keyboardState.noteOn (1, visibleNote, 1.0f); render();
+        check (visibleNote == 24 && p.getLastTriggeredChopId() == 25,
+               "screen keyboard C2 MIDI plays its fixed C2 chop");
+        p.keyboardState.noteOff (1, visibleNote, 0.0f); render();
+        midi.addEvent (juce::MidiMessage::noteOn (1, 0, (juce::uint8) 100), 0); render();
+        minus->onClick();
+        midi.addEvent (juce::MidiMessage::noteOff (1, 0), 0); render();
+        check (p.voice.envelopeReleaseTriggered || ! p.voice.playbackActive, "held MIDI notes release after octave navigation");
+        juce::MemoryBlock saved; p.getStateInformation (saved);
+        const auto tree = juce::ValueTree::readFromData ((const char*) saved.getData() + 4, saved.getSize() - 4);
+        const auto parsed = p.parseDeferredRestoreState (tree);
+        check (parsed.restoredMidiOctaveOffset == 1 && parsed.restoredRecordedMidiRoot == 0,
+               "state saves the C1 viewport independently from fixed C0 mapping");
+        P recall; recall.applyParsedRestoreState (parsed);
+        std::atomic_store (&recall.loadedSample, source); recall.publishChopState (parsed.chopState);
+        recall.prepareToPlay (8000, 64);
+        midi.addEvent (juce::MidiMessage::noteOn (1, 0, (juce::uint8) 100), 0);
+        recall.processBlock (audio, midi); midi.clear();
+        check (recall.getKeyboardStartNote() == 12 && recall.getLastTriggeredChopId() == 1,
+               "recalled viewport does not transpose DAW C0");
+        auto c4Project = tree.createCopy();
+        c4Project.setProperty ("recordedMidiRoot", 48, nullptr);
+        c4Project.setProperty ("keyboardStartNote", 60, nullptr);
+        c4Project.setProperty ("midiChannelBanks", false, nullptr);
+        c4Project.removeProperty ("keyboardMidiNavigation", nullptr);
+        c4Project.removeProperty ("keyboardMidiInputBase", nullptr);
+        const auto c4Restore = p.parseDeferredRestoreState (c4Project);
+        P c4Recall; c4Recall.applyParsedRestoreState (c4Restore);
+        std::atomic_store (&c4Recall.loadedSample, source); c4Recall.publishChopState (c4Restore.chopState);
+        c4Recall.prepareToPlay (8000, 64);
+        bool legacyChannels = c4Recall.getMidiRootNote() == 48 && c4Recall.getKeyboardStartNote() == 60
+                           && ! c4Recall.isMidiBankModeEnabled();
+        for (int channel = 1; channel <= 16; ++channel)
+        {
+            midi.addEvent (juce::MidiMessage::noteOn (channel, 48, (juce::uint8) 100), 0);
+            c4Recall.processBlock (audio, midi); midi.clear();
+            legacyChannels &= c4Recall.getLastTriggeredChopId() == 1;
+            midi.addEvent (juce::MidiMessage::noteOff (channel, 48), 0);
+            c4Recall.processBlock (audio, midi); midi.clear();
+        }
+        check (legacyChannels, "existing C4 recordings retain their original pitch and all 16 channel aliases");
+        check (c4Recall.getAvailableMidiBankCount() == 1,
+               "legacy all-channel recordings do not expose a slider that would silently replace their assignments");
+        juce::MemoryBlock c4Saved; c4Recall.getStateInformation (c4Saved);
+        const auto c4Tree = juce::ValueTree::readFromData ((const char*) c4Saved.getData() + 4, c4Saved.getSize() - 4);
+        check ((int) c4Tree.getProperty ("recordedMidiRoot") == 48
+               && ! (bool) c4Tree.getProperty ("midiChannelBanks")
+               && (int) c4Tree.getProperty ("keyboardStartNote") == 60,
+               "saving an existing C4 project preserves its mapping mode and absolute viewport");
+        auto bankedC4Project = c4Project.createCopy();
+        bankedC4Project.setProperty ("midiChannelBanks", true, nullptr);
+        const auto bankedC4Restore = p.parseDeferredRestoreState (bankedC4Project);
+        P bankedC4Recall; bankedC4Recall.applyParsedRestoreState (bankedC4Restore);
+        bankedC4Recall.publishChopState (bankedC4Restore.chopState);
+        check (bankedC4Recall.getMidiRootNote() == 48 && bankedC4Recall.getMidiBankCount() == 2
+               && bankedC4Recall.getMidiNoteForChopId (80) == 127
+               && bankedC4Recall.getMidiNoteForChopId (81) == 48
+               && bankedC4Recall.getMidiChannelForChopId (81) == 2,
+               "existing banked C4 projects retain their original 80-note range assignments");
+        auto legacy = tree.createCopy(); legacy.removeProperty ("keyboardStartNote", nullptr);
+        legacy.setProperty ("recordedMidiRoot", 36, nullptr); legacy.setProperty ("midiOctaveOffset", 2, nullptr);
+        const auto migrated = p.parseDeferredRestoreState (legacy);
+        check (migrated.restoredRecordedMidiRoot == 36 && migrated.restoredMidiOctaveOffset == 4,
+               "older saved assignments survive without treating transposition as a viewport");
+        legacy.removeProperty ("recordedMidiRoot", nullptr);
+        check (p.parseDeferredRestoreState (legacy).restoredRecordedMidiRoot == 60, "oldest projects retain their historical MIDI root");
+        for (int i = 0; i < 12; ++i) plus->onClick();
+        check (p.getKeyboardStartNote() == 120 && ! plus->isEnabled(), "OCT + stops at C10");
+        for (int i = 0; i < 16; ++i) minus->onClick();
+        check (p.getKeyboardStartNote() == 0 && ! minus->isEnabled(), "OCT - reaches C0 and stops only at the MIDI lower limit");
+        auto pinned = std::make_shared<P::ChopState> (*layout); pinned->chops[0].assignedMidiNote = 84;
+        p.publishChopState (pinned); p.setMidiOctaveOffset (3);
+        check (p.getMidiNoteForChopId (1) == 84, "explicit MIDI assignments remain fixed after OCT navigation");
+        midi.addEvent (juce::MidiMessage::noteOn (1, 84, (juce::uint8) 100), 0); render();
+        check (p.getLastTriggeredChopId() == 1, "manual explicit note pins remain playable after octave navigation");
+        midi.addEvent (juce::MidiMessage::noteOff (1, 84), 0); render();
+        p.keyboardState.noteOn (1, 84, 1.0f); render();
+        for (int i = 0; i < 300; ++i) p.enqueueOnScreenMidi (1, 84, 1.0f);
+        render();
+        check (p.onScreenMidiFifo.getNumReady() == 0 && ! p.voice.playbackActive, "screen MIDI queue overflow cannot strand a held voice");
+        keys->setAvailableRange (96, 127);
+        check (keys->getRectangleForKey (127).getRight() <= (float) keys->getWidth() + 1.0f,
+               "extended last keyboard view fits every key through G10");
+        {
+            juce::FileOutputStream image (scratch.getParentDirectory().getChildFile ("extended-keyboard.png"));
+            image.setPosition (0); image.truncate();
+            juce::PNGImageFormat().writeImageToStream (keys->createComponentSnapshot (keys->getLocalBounds()), image);
+        }
+        for (const int count : { 12, 36, 37, 49 })
+        {
+            auto partial = std::make_shared<P::ChopState> (*layout);
+            partial->chops.resize ((size_t) count);
+            p.publishChopState (partial); p.setMidiOctaveOffset (0);
+            const auto fixedMap = p.getChopState();
+            for (int step = 0; step < 10; ++step) plus->onClick();
+            check (p.getKeyboardStartNote() == 120 && ! plus->isEnabled(),
+                   "OCT reaches C10 even when the sample has fewer mapped chops");
+            check (p.getChopState() == fixedMap && ! plus->getTooltip().contains ("CHOPS slider"),
+                   "C10 limit preserves MIDI assignments and has no obsolete slider hint");
+            check (chopRange == nullptr,
+                   "short samples have no chop-range slider");
+            midi.addEvent (juce::MidiMessage::noteOn (1, 0, (juce::uint8) 100), 0); render();
+            check (p.getLastTriggeredChopId() == 1, "adaptive octave limits preserve recorded C0 playback");
+            midi.addEvent (juce::MidiMessage::noteOff (1, 0), 0); render();
+        }
+        auto thresholdLayout = std::make_shared<P::ChopState>();
+        for (int i = 0; i < 257; ++i)
+        {
+            P::ChopDefinition chop;
+            chop.id = i + 1; chop.startSample = i * 128; chop.endSample = (i + 1) * 128;
+            thresholdLayout->chops.push_back (chop);
+        }
+        thresholdLayout->selectedChopId = 1; thresholdLayout->nextChopId = 258;
+        for (const int count : { 127, 128, 129, 256, 257 })
+        {
+            auto boundary = std::make_shared<P::ChopState> (*thresholdLayout);
+            boundary->chops.resize ((size_t) count);
+            p.publishChopState (boundary);
+            p.notifyEditStateChanged();
+            const int expectedRanges = (count + 127) / 128;
+            check (waitFor ([&] { return p.getMidiBankCount() == expectedRanges && p.getUnreachableChopCount() == 0
+                   && chopRange == nullptr; }),
+                   "overflow channel mappings remain available without a range slider");
+            check (p.getMidiNoteForChopId (count) == (count - 1) % 128
+                   && p.getMidiChannelForChopId (count) == (count - 1) / 128 + 1,
+                   "each exact range boundary restarts at C0 on the next fixed MIDI channel");
+        }
+        // Verify all absolute channel/note pairs across the overflow range.
+        auto song = std::make_shared<P::ChopState>();
+        for (int i = 0; i < 220; ++i)
+        {
+            P::ChopDefinition chop;
+            chop.id = i + 1; chop.startSample = i * 128; chop.endSample = (i + 1) * 128;
+            song->chops.push_back (chop);
+        }
+        song->selectedChopId = 1; song->nextChopId = 221;
+        p.publishChopState (song);
+        check (p.isMidiBankModeEnabled() && p.getMidiBankCount() == 2 && p.getUnreachableChopCount() == 0,
+               "new samples automatically map 220 chops in two fixed MIDI-channel ranges");
+        bool complete = true;
+        for (int i = 0; i < 220; ++i)
+        {
+            const int channel = i / 128 + 1, note = i % 128;
+            complete &= p.getMidiNoteForChopId (i + 1) == note && p.getMidiChannelForChopId (i + 1) == channel;
+            midi.addEvent (juce::MidiMessage::noteOn (channel, note, (juce::uint8) 100), 0); render();
+            complete &= p.getLastTriggeredChopId() == i + 1;
+            midi.addEvent (juce::MidiMessage::noteOff (channel, note), 0); render();
+        }
+        check (complete, "every one of 220 channel/note pairs triggers its own chop through processBlock");
+        const auto bankMap = p.getChopState();
+        p.setKeyboardMidiBank (1); p.setMidiOctaveOffset (0);
+        for (int step = 0; step < 20; ++step) plus->onClick();
+        check (p.getKeyboardMidiBank() == 1 && p.getKeyboardStartNote() == 120 && ! plus->isEnabled(),
+               "OCT stops at C10 without automatically changing the chop range");
+        check (chopRange == nullptr, "220 chops do not restore the removed range slider");
+        p.setKeyboardMidiBank (2); p.setMidiOctaveOffset (0);
+        check (waitFor ([&] { return keys->getMidiChannel() == 2 && keys->getLowestVisibleKey() == 0; }),
+               "editor follows a restored MIDI channel and keyboard view without the slider");
+        for (int step = 0; step < 16; ++step) minus->onClick();
+        check (p.getKeyboardMidiBank() == 2 && p.getKeyboardStartNote() == 0 && ! minus->isEnabled(),
+               "OCT reaches C0 in the final chop range without switching ranges");
+        for (int step = 0; step < 10; ++step) plus->onClick();
+        check (p.getKeyboardStartNote() == 120 && keys->getRangeEnd() == 127,
+               "last screen octave includes C10-G10 without going past MIDI 127");
+        // Pumping the editor may update selection after the last played note;
+        // compare the assignments rather than the immutable snapshot pointer.
+        check (p.getChopState()->midiMap.channelNoteToChopIndex == bankMap->midiMap.channelNoteToChopIndex,
+               "channel and octave navigation preserve the underlying absolute map");
+        p.setMidiOctaveOffset (0);
+        midi.addEvent (juce::MidiMessage::noteOn (1, 72, (juce::uint8) 100), 0); render();
+        check (p.getLastTriggeredChopId() == 73 && ! p.getHeldHostMidiNotes().test (72),
+               "viewing range 2 does not redirect channel-1 C6 or light a channel-2 key");
+        midi.addEvent (juce::MidiMessage::noteOff (1, 72), 0); render();
+        midi.addEvent (juce::MidiMessage::noteOn (2, 0, (juce::uint8) 100), 0); render();
+        check (p.getLastTriggeredChopId() == 129 && p.getHeldHostMidiNotes().test (0),
+               "DAW channel-2 C0 matches the range-2 screen key");
+        midi.addEvent (juce::MidiMessage::noteOff (2, 0), 0); render();
+        p.setMidiOctaveOffset (7);
+        midi.addEvent (juce::MidiMessage::noteOn (2, 91, (juce::uint8) 100), 0); render();
+        check (p.getLastTriggeredChopId() == 220, "DAW channel-2 G7 reaches chop 220 at its displayed pitch");
+        p.setKeyboardMidiBank (1); p.setMidiOctaveOffset (0);
+        midi.addEvent (juce::MidiMessage::noteOff (2, 91), 0); render();
+        check (p.heldMidiNote.load() == -1, "note-off releases safely even after range and octave changes");
+        p.setKeyboardMidiBank (2); p.setMidiOctaveOffset (10);
+        {
+            juce::FileOutputStream image (scratch.getParentDirectory().getChildFile ("simple-octave-controls.png"));
+            image.setPosition (0); image.truncate();
+            juce::PNGImageFormat().writeImageToStream (editor->createComponentSnapshot (editor->getLocalBounds()), image);
+        }
+        midi.addEvent (juce::MidiMessage::noteOn (1, 0, (juce::uint8) 100), 0); render();
+        check (p.getLastTriggeredChopId() == 1, "recorded channel-1 C0 keeps chop 1 while viewing range 2");
+        midi.addEvent (juce::MidiMessage::noteOn (2, 0, (juce::uint8) 100), 0); render();
+        check (p.getLastTriggeredChopId() == 129, "recorded channel-2 C0 keeps chop 129 while viewing range 2");
+        midi.addEvent (juce::MidiMessage::noteOff (1, 0), 0); render();
+        check (p.heldMidiNote.load() == 0 && p.heldMidiChannel == 2,
+               "another bank's note-off cannot release the held bank-2 note");
+        midi.addEvent (juce::MidiMessage::noteOff (2, 0), 0); render();
+        check (p.heldMidiNote.load() == -1, "matching channel/note releases the banked note");
+        p.keyboardState.noteOn (2, 91, 1.0f); render();
+        check (p.getLastTriggeredChopId() == 220, "range-2 G7 screen key reaches the song's last chop");
+        p.keyboardState.noteOff (2, 91, 0.0f); render();
+        juce::MemoryBlock bankSaved; p.getStateInformation (bankSaved);
+        P bankRecall; bankRecall.setStateInformation (bankSaved.getData(), (int) bankSaved.getSize());
+        check (waitFor ([&] { return restored (bankRecall); }) && bankRecall.isMidiBankModeEnabled()
+               && bankRecall.getKeyboardMidiBank() == 2 && bankRecall.getMidiChannelForChopId (220) == 2
+               && bankRecall.getMidiNoteForChopId (220) == 91,
+               "project recall retains all 220 assignments and selected bank");
+        auto favoritesSong = std::make_shared<P::ChopState> (*song);
+        for (int i = 0; i < 220; ++i)
+        {
+            favoritesSong->chops[(size_t) i].favorite = true;
+            favoritesSong->chops[(size_t) i].favoriteOrder = 220 - i;
+        }
+        // Favorites use their packed absolute notes even if the underlying
+        // chop has a manual pin.
+        favoritesSong->chops[147].assignedMidiNote = 72;
+        p.publishChopState (favoritesSong); p.setFavoritesViewEnabled (true);
+        check (p.getMidiChannelForChopId (1) == 2 && p.getMidiNoteForChopId (1) == 91
+               && p.getMidiChannelForChopId (220) == 1 && p.getMidiNoteForChopId (220) == 0,
+               "Favorites pack across all banks in favorite order");
+        p.setKeyboardMidiBank (1); p.setMidiOctaveOffset (0);
+        midi.addEvent (juce::MidiMessage::noteOn (1, 72, (juce::uint8) 100), 0); render();
+        check (p.getLastTriggeredChopId() == 148, "FL C6 matches packed Favorites C6 regardless of the viewport");
+        midi.addEvent (juce::MidiMessage::noteOff (1, 72), 0); render();
+        p.setFavoritesViewEnabled (false);
+        auto shortSong = std::make_shared<P::ChopState> (*song); shortSong->chops.resize (12);
+        p.publishChopState (shortSong);
+        check (p.getKeyboardMidiBank() == 1, "reducing chops clamps an obsolete selected bank");
+        auto overflow = std::make_shared<P::ChopState>(); overflow->chops.resize (2049);
+        P::rebuildChopMidiMap (*overflow, 0, false, true);
+        check (overflow->midiMap.channelForChopIndex[2047] == 16 && overflow->midiMap.noteForChopIndex[2047] == 127
+               && overflow->midiMap.noteForChopIndex[2048] == -1,
+               "16-bank boundary is checked without overflowing MIDI channels or notes");
+        auto sparseSong = std::make_shared<P::ChopState> (*thresholdLayout);
+        for (int i = 128; i < 256; ++i) sparseSong->chops[(size_t) i].assignedMidiNote = -2;
+        p.publishChopState (sparseSong); p.setKeyboardMidiBank (1); p.setMidiOctaveOffset (9);
+        plus->onClick();
+        check (p.getKeyboardMidiBank() == 1 && p.getKeyboardStartNote() == 120,
+               "C10 limit never changes ranges even when another range is empty");
+        p.setKeyboardMidiBank (3); p.setMidiOctaveOffset (0);
+        check (waitFor ([&] { return keys->getMidiChannel() == 3 && keys->getLowestVisibleKey() == 0; }),
+               "restored channel reaches later mapped chops beyond an empty middle range");
+        auto bankPins = std::make_shared<P::ChopState> (*song); bankPins->chops[0].assignedMidiNote = 60;
+        P::rebuildChopMidiMap (*bankPins, 0, false, true);
+        check (bankPins->midiMap.channelNoteToChopIndex[0][60] == 0
+               && bankPins->midiMap.noteForChopIndex[60] == -1
+               && bankPins->midiMap.channelNoteToChopIndex[1][60] == 188,
+               "explicit pins keep channel 1 and do not collide with later banks");
+        // The laptop source's output is exercised without a real MIDI device
+        // or injected operating-system keys. Feed its events through the host.
+        p.publishChopState (song);
+        std::vector<juce::MidiMessage> events;
+        {
+            cuesampler::LaptopMidiInput input ([&] (const auto& message) { events.push_back (message); });
+            input.press ('z', 0, 2); input.press ('z', 0, 2);
+            check (events.size() == 1 && events[0].getChannel() == 2 && events[0].getNoteNumber() == 0,
+                   "laptop key emits bank channel once and ignores OS repeat");
+            midi.addEvent (events[0], 0); render();
+            check (p.getLastTriggeredChopId() == 129, "laptop virtual-MIDI event plays range-2 C0 through the host MIDI path");
+            input.releaseAll();
+            check (events.back().isNoteOff() && events.back().getChannel() == 2 && events.back().getNoteNumber() == 0,
+                   "bank/focus change sends the original channel/note off");
+            const auto releasedCount = events.size();
+            input.press ('z', 48, 3);
+            check (events.size() == releasedCount, "held-key repeat cannot start a new-bank note before key-up");
+            input.releaseMissing ([] (int) { return false; });
+            events.clear(); input.press ('Q', 48, 3); input.press (',', 48, 3);
+            input.releaseMissing ([] (int key) { return key == ','; });
+            check (events.size() == 1, "overlapping laptop rows do not double-trigger or prematurely release a note");
+            input.releaseAll(); check (events.size() == 2 && events.back().isNoteOff(), "last overlapping key releases its note");
+            events.clear(); input.press ('Z', 120, 1); input.press ('B', 120, 1); input.press (']', 120, 1);
+            check (events.size() == 2 && events[1].getNoteNumber() == 127,
+                   "upper laptop keys cannot emit notes past MIDI 127");
+            input.releaseAll(); events.clear();
+            check (! input.press (' ', 48, 1) && events.empty(), "transport keys are not stolen by laptop input");
+            input.releaseMissing ([] (int) { return false; });
+            input.press ('Z', 0, 1);
+            check (! events.empty() && events.back().isNoteOn() && events.back().getNoteNumber() == 0,
+                   "laptop input emits absolute C0 MIDI to its sink");
+            input.releaseAll();
+            input.press ('B', 84, 2);
+            check (events.back().getChannel() == 2 && events.back().getNoteNumber() == 91,
+                   "range-2 C7 plus B reaches chop 220's G7 note");
+        }
+        check (events.back().isNoteOff(), "closing laptop input releases its held keys");
+
+        // Render the actual grid and active keyboard surfaces for visual QA.
+        if (theme != nullptr && theme->onClick)
+        {
+            const auto previousTheme = theme->getButtonText();
+            auto visualChops = std::make_shared<P::ChopState> (*layout);
+            visualChops->chops.resize (12);
+            visualChops->selectedChopId = 2; // selected black key, C#0
+            visualChops->chops[2].favorite = true;
+            visualChops->chops[3].favorite = true;
+            p.publishChopState (visualChops);
+            p.setKeyboardMidiBank (1); p.setMidiOctaveOffset (0);
+            auto analysis = std::make_shared<P::TempoAnalysisData>();
+            analysis->estimatedBpm = 120; analysis->beatPeriodSeconds = 0.5;
+            std::atomic_store (&p.tempoAnalysis, analysis);
+            p.setWaveformZoom (0.0f); p.setWaveformScroll (0.0f);
+            p.sampleChangeBroadcaster.sendChangeMessage();
+            p.notifyEditStateChanged();
+            waitFor ([&] { return keys->getLowestVisibleKey() == 0 && keys->getMidiChannel() == 1; });
+            p.keyboardState.noteOn (1, 3, 1.0f); // playing favorite black key
+            p.keyboardState.noteOn (1, 4, 1.0f); // playing white key
+            for (const auto* themeName : { "dark", "light" })
+            {
+                if (theme->getButtonText() != juce::String (themeName).toUpperCase()) theme->onClick();
+                for (int i = 0; i < 30; ++i) pump();
+                juce::FileOutputStream image (scratch.getParentDirectory().getChildFile (
+                    "grid-keyboard-active-" + juce::String (themeName) + ".png"));
+                image.setPosition (0); image.truncate();
+                juce::PNGImageFormat().writeImageToStream (editor->createComponentSnapshot (editor->getLocalBounds()), image);
+            }
+            p.keyboardState.noteOff (1, 3, 0.0f);
+            p.keyboardState.noteOff (1, 4, 0.0f);
+            if (theme->getButtonText() != previousTheme) theme->onClick();
+        }
+    }
+
     static void runFavorites()
     {
         P p;
@@ -807,12 +2044,12 @@ struct CueSamplerStateTests
         if (button == nullptr) return;
         button->onClick();
         check (p.isFavoritesViewEnabled() && button->getToggleState(), "Favorites button enters temporary performance view");
-        check (p.getMidiNoteForChopId (3) == 36 && p.getMidiNoteForChopId (1) == 37
-               && p.getMidiNoteForChopId (4) == 38 && p.getMidiNoteForChopId (2) == -1,
-               "only favorites map consecutively from C2, overriding pins temporarily");
+        check (p.getMidiNoteForChopId (3) == 48 && p.getMidiNoteForChopId (1) == 49
+               && p.getMidiNoteForChopId (4) == 50 && p.getMidiNoteForChopId (2) == -1,
+               "only favorites map consecutively from C4, overriding pins temporarily");
         p.setMidiOctaveOffset (-1);
-        check (p.getMidiOctaveOffset() == 1 && p.getMidiRootNote() == 36,
-               "Favorites keeps C2 without overwriting normal octave setting");
+        check (p.getMidiOctaveOffset() == 0 && p.getMidiRootNote() == 48,
+               "Favorites keeps fixed C4 notes while OCT navigates the keyboard");
         bool intact = p.getLoadedSample() == source && p.getChopState()->chops.size() == 4;
         for (int i = 0; i < 4; ++i)
         {
@@ -825,21 +2062,21 @@ struct CueSamplerStateTests
         p.prepareToPlay (8000, 64);
         juce::AudioBuffer<float> output (2, 64);
         juce::MidiBuffer midi;
-        midi.addEvent (juce::MidiMessage::noteOn (1, 36, (juce::uint8) 100), 0);
+        midi.addEvent (juce::MidiMessage::noteOn (1, 48, (juce::uint8) 100), 0);
         p.processBlock (output, midi);
-        check (p.getLastTriggeredChopId() == 3, "real MIDI C2 triggers the first favorited chop");
+        check (p.getLastTriggeredChopId() == 3, "real MIDI C4 triggers the first favorited chop");
         const auto revision = p.getChopTriggerRevision();
         midi.clear(); midi.addEvent (juce::MidiMessage::noteOn (1, 72, (juce::uint8) 100), 0);
         p.processBlock (output, midi);
         check (p.getChopTriggerRevision() == revision, "nonfavorite original MIDI assignment is inactive in Favorites");
         p.selectChopById (3); p.toggleSelectedChopFavorite();
-        check (p.getMidiNoteForChopId (1) == 36 && p.getMidiNoteForChopId (4) == 37,
+        check (p.getMidiNoteForChopId (1) == 48 && p.getMidiNoteForChopId (4) == 49,
                "removing a favorite closes the MIDI gap");
         midi.clear(); p.processBlock (output, midi);
         check (! p.voice.playbackActive, "remapping favorites silences a held voice safely on the audio thread");
         p.undoLastEdit();
         check (p.getChopState()->favoriteChopIndices == std::vector<int> { 2, 0, 3 }
-               && p.getMidiNoteForChopId (3) == 36, "Undo restores favorite order and compact MIDI mapping");
+               && p.getMidiNoteForChopId (3) == 48, "Undo restores favorite order and compact MIDI mapping");
         p.selectChopById (3); p.toggleSelectedChopFavorite();
         p.setFavoritesViewEnabled (false);
         p.selectChopById (3); p.toggleSelectedChopFavorite();
@@ -851,7 +2088,7 @@ struct CueSamplerStateTests
         reopened.setStateInformation (saved.getData(), (int) saved.getSize());
         check (waitFor ([&] { return restored (reopened); }) && reopened.isFavoritesViewEnabled()
                && reopened.getChopState()->favoriteChopIndices == std::vector<int> { 0, 3, 2 }
-               && reopened.getMidiNoteForChopId (1) == 36,
+               && reopened.getMidiNoteForChopId (1) == 48,
                "project recall restores Favorites view, chronology and MIDI map");
         std::unique_ptr<juce::AudioProcessorEditor> reopenedEditor (reopened.createEditor());
         auto* restoredButton = findButton (*reopenedEditor, "FAVORITES");
@@ -915,7 +2152,7 @@ struct CueSamplerStateTests
                "warp snapping follows doubled tempo");
         check (p.getLoadedSample() == originalAudio && p.getGridBpmTrim() == 0,
                "tempo correction preserves source audio and fine trim");
-        const auto exported = readExport (p.renderChopToTempWav (p.getChopState()->chops[0].id, true, scratch), 8000);
+        const auto exported = readExport (p.renderChopToTempWav (p.getChopState()->chops[0].id, true, scratch), 8000, 16000);
         check (exported.getNumSamples() == 16000, "120 BPM sync export retains a two-second corrected bar");
 
         juce::MemoryBlock saved;
@@ -1014,6 +2251,16 @@ struct CueSamplerStateTests
     static void runManualChops (const juce::File& scratch)
     {
         {
+            P p; setupManualFixture (p);
+            check (p.getNextManualChopMidiNote() == 24, "new manual layout starts at C2");
+            const int first = p.addManualChop (1000, 2000, p.getNextManualChopMidiNote());
+            check (p.getMidiNoteForChopId (first) == 24 && p.getNextManualChopMidiNote() == 25,
+                   "manual chops without a held key receive consecutive notes from C2");
+            P legacy; setupManualFixture (legacy); legacy.recordedMidiRoot.store (48);
+            check (legacy.getNextManualChopMidiNote() == 48,
+                   "existing C4 manual layouts keep their saved allocation root");
+        }
+        {
             P p; setupManualFixture (p); beginManualCapture (p);
             manualBlock (p, juce::MidiMessage::noteOff (1, 60));
             check (p.getManualChopCaptureEndSample() == 1140, "capture endpoint respects MIDI timestamps");
@@ -1098,9 +2345,18 @@ struct CueSamplerStateTests
             const auto sampleFile = scratch.getChildFile ("replacement.wav");
             auto sample = std::make_shared<P::LoadedSampleData>();
             sample->sampleRate = 8000; sample->buffer.setSize (1, 8000); sample->buffer.clear();
-            juce::MemoryBlock data;
-            p.serializeSampleToStateData (*sample, data);
-            sampleFile.replaceWithData (data.getData(), data.getSize());
+            {
+                // State audio uses a private float container. Import needs a
+                // real audio file rather than that container with a WAV suffix.
+                auto output = sampleFile.createOutputStream();
+                auto writer = std::unique_ptr<juce::AudioFormatWriter> (juce::WavAudioFormat().createWriterFor (
+                    output.get(), sample->sampleRate, 1, 24, {}, 0));
+                check (writer != nullptr, "create replacement WAV fixture");
+                if (writer == nullptr) return;
+                output.release();
+                check (writer->writeFromAudioSampleBuffer (sample->buffer, 0, sample->buffer.getNumSamples()),
+                       "write replacement WAV fixture");
+            }
             check (p.loadAudioFile (sampleFile) == P::SampleLoadResult::loaded, "replacement sample loads");
             p.commitPendingManualChopCaptures();
             check (p.getChopState()->chops.empty() && ! p.canUndoEdit(), "replacement clears active chops, history and stale capture");
@@ -1515,6 +2771,25 @@ struct CueSamplerStateTests
 
     static void run (bool testSeparation)
     {
+        {
+            P codec;
+            P::LoadedSampleData highRate;
+            highRate.sampleRate = 96000.0;
+            highRate.buffer.setSize (2, 9600);
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < 9600; ++i)
+                    highRate.buffer.setSample (ch, i, 0.4f * std::sin ((float) (juce::MathConstants<double>::twoPi * 1000.0 * i / 96000.0)));
+            juce::MemoryBlock compact;
+            const auto encoded = codec.serializeSampleToStateData (highRate, compact);
+            const auto decoded = encoded ? codec.createLoadedSampleDataFromStateData (compact, "96k") : nullptr;
+            check (decoded != nullptr && decoded->sampleRate == 96000.0
+                   && decoded->buffer.getNumSamples() == 9600
+                   && correlation (highRate.buffer, decoded->buffer) > 0.98,
+                   "96 kHz source state retains its sample clock and chop coordinates");
+            check ((juce::int64) compact.getSize() < (juce::int64) 9600 * 2 * (juce::int64) sizeof (float) / 2,
+                   "embedded MP3 source is substantially smaller than float PCM");
+        }
+
         P original;
         setup (original);
         const auto originalStems = std::atomic_load (&original.stemSet);
@@ -1544,11 +2819,14 @@ struct CueSamplerStateTests
         auto restoredStems = std::atomic_load (&reopened.stemSet);
         check (restoredStems != nullptr, "restore stems without cache, original file, or model");
         if (restoredStems == nullptr) return;
-        check (equal (originalStems->source->buffer, restoredStems->source->buffer), "source restores bit-exactly including overshoots");
-        check (equal (originalStems->drums, restoredStems->drums)
-            && equal (originalStems->bass, restoredStems->bass)
-            && equal (originalStems->vocals, restoredStems->vocals), "all stems restore bit-exactly");
-        check (equal (originalMix->buffer, reopened.getLoadedSample()->buffer), "saved mute mix restores bit-exactly");
+        check (correlation (originalStems->source->buffer, restoredStems->source->buffer) > 0.95,
+               "source restores from compact MP3 without timing drift");
+        check (correlation (originalStems->drums, restoredStems->drums) > 0.95
+            && correlation (originalStems->bass, restoredStems->bass) > 0.95
+            && correlation (originalStems->vocals, restoredStems->vocals) > 0.95,
+               "all stems restore from compact MP3 without timing drift");
+        check (correlation (originalMix->buffer, reopened.getLoadedSample()->buffer) > 0.90,
+               "saved mute mix restores from compact MP3");
         check (reopened.getMuteDrums() && reopened.getMuteVocals() && ! reopened.getMuteBass(), "saved mute buttons restored");
         check (reopened.getChopBarsCount() == 2 && reopened.getMidiOctaveOffset() == 1, "bars and octave restored");
         const auto chops = reopened.getChopState();
@@ -1566,7 +2844,8 @@ struct CueSamplerStateTests
         check (reopened.playbackSamplePosition.load() == 12345, "idle audio callback keeps restored playhead");
         reopened.setMuteDrums (false); reopened.setMuteVocals (false);
         check (waitFor ([&] { return reopened.appliedStemMask.load() == 0; }), "unmute after reopen completes");
-        check (equal (originalStems->source->buffer, reopened.getLoadedSample()->buffer), "unmuting restores original without double subtraction");
+        check (correlation (originalStems->source->buffer, reopened.getLoadedSample()->buffer) > 0.95,
+               "unmuting restores the MP3 source without double subtraction");
 
         // Real BARS rebuild: retain a marker in the later child of a split.
         reopened.setChopBarsCount (1);
@@ -1609,7 +2888,8 @@ struct CueSamplerStateTests
         reopened.setStateInformation (legacyState.getData(), (int) legacyState.getSize());
         check (waitFor ([&] { return restored (reopened); }), "legacy cache-only project restores without model");
         check (std::atomic_load (&reopened.stemSet) != nullptr
-               && equal (originalMix->buffer, reopened.getLoadedSample()->buffer), "legacy mute mix restored");
+               && correlation (originalMix->buffer, reopened.getLoadedSample()->buffer) > 0.90,
+               "legacy mute mix restored");
         juce::MemoryBlock upgraded;
         reopened.getStateInformation (upgraded);
         cuesampler::StemCache::clear();
@@ -1728,13 +3008,15 @@ struct CueSamplerStateTests
                 check (equal (actualStems->source->buffer, original.getLoadedSample()->buffer), "blocked cache cannot interfere with unmuted audio");
                 reopened.setStateInformation (actualSaved.getData(), (int) actualSaved.getSize());
                 check (waitFor ([&] { return restored (reopened); }), "real separation project reopens without cache/model");
-                check (equal (actualMix->buffer, reopened.getLoadedSample()->buffer), "real separated mix restores bit-exactly");
+                check (correlation (actualMix->buffer, reopened.getLoadedSample()->buffer) > 0.90,
+                       "real separated mix restores from compact MP3");
             }
             cacheGate->signal();
             check (waitFor ([&] { return original.stemCacheWriteThreadPool.getNumJobs() == 0; }), "optional cache writing finishes after release");
             cuesampler::StemCache::Entry cached;
             check (actualStems != nullptr && cuesampler::StemCache::load (actualStems->cacheKey, cached)
-                   && equal (cached.drums, actualStems->drums), "deferred cache write retains exact stems");
+                   && correlation (cached.drums, actualStems->drums) > 0.90,
+                   "deferred cache write retains aligned MP3 stems");
         }
     }
 };
@@ -1753,10 +3035,17 @@ int main (int argc, char** argv)
     const auto filter = argc > 2 ? juce::String (argv[2]) : juce::String();
     const bool full = filter.isEmpty() || filter == "--separate";
     if (filter == "--ui-benchmark") CueSamplerStateTests::runUiBenchmark();
+    if (filter == "--sample-import") CueSamplerStateTests::runSampleImport (scratch);
+    if (filter == "--import-benchmark") CueSamplerStateTests::runImportBenchmark (scratch);
+    if (full || filter == "--octave-banking") CueSamplerStateTests::runOctaveBanking (scratch);
+    if (full || filter == "--favorites-audio") CueSamplerStateTests::runFavoritesAudio();
+    if (full || filter == "--waveform-zoom") CueSamplerStateTests::runWaveformZoom (scratch);
     if (full || filter == "--performance-ui") CueSamplerStateTests::runPerformanceUi (scratch);
     if (full || filter == "--cue-recall") CueSamplerStateTests::runCueRecall();
     if (full || filter == "--manual-chops") CueSamplerStateTests::runManualChops (scratch);
     if (full || filter == "--waveform-colour") CueSamplerStateTests::runWaveformColour (scratch);
+    if (filter == "--mp3-exports")
+        CueSamplerStateTests::runExports (scratch);
     if (full || filter == "--state-only")
     {
         if (filter != "--state-only")

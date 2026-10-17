@@ -1,6 +1,8 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "WaveformColourAnalysis.h"
+#include "MidiNoteNames.h"
+#include "FlOctaveShortcut.h"
 
 #include <array>
 #include <bitset>
@@ -19,19 +21,14 @@ namespace
 {
 // One continuous chassis: content spans the full design width inside a
 // slim 10px margin (the CUERACK kMargin), no side rails.
-// Note 36 reads "C2", matching GlassKeyboard's setOctaveForMiddleC(4) and the
-// chop mapping root. Lived inside TransportSectionComponent until the waveform
-// painter needed to label chops with the key that plays them.
+// Use the same absolute note labels on keys, chops and Favorites as FL Studio.
 inline juce::String midiNoteName (int noteNumber)
 {
-    static const char* const names[12] = { "C", "C#", "D", "D#", "E", "F",
-                                           "F#", "G", "G#", "A", "A#", "B" };
-    const int octave = noteNumber / 12 - 1;
-    return juce::String (names[((noteNumber % 12) + 12) % 12]) + juce::String (octave);
+    return cuesampler::midiNoteName (noteNumber);
 }
 
 constexpr int editorWidth = 1266;
-constexpr int editorHeight = 660; // chassis + keyboard
+constexpr int editorHeight = 692; // chassis + keyboard rail and piano
 constexpr float minEditorScale = 0.85f;
 constexpr float maxEditorScale = 1.5f;
 constexpr float defaultWaveformVerticalScale = 0.75f;
@@ -324,6 +321,14 @@ float getEffectiveZoomLevel (float zoomControlValue) noexcept
         return juce::jmap (clampedZoom, 0.0f, zoomResponseMidpoint, 0.0f, zoomMappedMidpoint);
 
     return juce::jmap (clampedZoom, zoomResponseMidpoint, 1.0f, zoomMappedMidpoint, 1.0f);
+}
+
+float getZoomControlValue (float effectiveZoom) noexcept
+{
+    const auto clampedZoom = juce::jlimit (0.0f, 1.0f, effectiveZoom);
+    return clampedZoom <= zoomMappedMidpoint
+        ? juce::jmap (clampedZoom, 0.0f, zoomMappedMidpoint, 0.0f, zoomResponseMidpoint)
+        : juce::jmap (clampedZoom, zoomMappedMidpoint, 1.0f, zoomResponseMidpoint, 1.0f);
 }
 
 juce::String formatSampleTime (double seconds)
@@ -704,17 +709,30 @@ private:
 static void showSampleLoadError (AudioPluginAudioProcessor::SampleLoadResult result,
                                  juce::Component* associatedComponent)
 {
-    if (result != AudioPluginAudioProcessor::SampleLoadResult::fileTooLong)
+    if (result == AudioPluginAudioProcessor::SampleLoadResult::loaded)
         return;
 
+    const bool tooLong = result == AudioPluginAudioProcessor::SampleLoadResult::fileTooLong;
     juce::AlertWindow::showMessageBoxAsync (
         juce::AlertWindow::WarningIcon,
-        "Sample Too Long",
-        "CUE SAMPLER supports audio files up to "
+        tooLong ? "Sample Too Long" : "Unable to Load Sample",
+        tooLong ? "CUE SAMPLER supports audio files up to "
             + juce::String (AudioPluginAudioProcessor::maximumLoadedSampleMinutes)
-            + " minutes. This file is longer and was not loaded.",
+            + " minutes. This file is longer and was not loaded."
+            : "This audio file could not be loaded. Choose another WAV, AIFF, MP3, FLAC or OGG file. Your current sample has been kept.",
         "OK",
         associatedComponent);
+}
+
+static void importSampleAsync (AudioPluginAudioProcessor& processor, const juce::File& file,
+                               juce::Component* component)
+{
+    processor.loadAudioFileAsync (file, [safe = juce::Component::SafePointer<juce::Component> (component)]
+                                      (AudioPluginAudioProcessor::SampleLoadResult result)
+    {
+        if (safe != nullptr)
+            showSampleLoadError (result, safe.getComponent());
+    });
 }
 
 // --- Tactile keycaps ---------------------------------------------------------
@@ -1467,7 +1485,7 @@ public:
         addAndMakeVisible (sustainKnob);
         addAndMakeVisible (releaseKnob);
 
-        configureButton (exportButton, "SAVE WAV...", textPrimary.withAlpha (0.92f));
+        configureButton (exportButton, "SAVE MP3...", textPrimary.withAlpha (0.92f));
         exportButton.getProperties().set ("cueStyle", "flatAction");
         exportButton.setTooltip ("Save this chop with its ADSR envelope baked into the audio.");
         exportButton.onClick = [this]
@@ -1550,24 +1568,53 @@ private:
 };
 
 // On-screen MIDI keyboard along the bottom strip: lights up with the notes
-// driving the chops (host MIDI or clicks — clicked keys are injected into the
-// processor's MIDI stream, so they trigger chops too). Pressed-key overlays
-// track the accent so HALF TIME / WARP recolour them with the rest of the UI.
+// driving the chops. OCT navigates absolute notes without remapping chops.
+// Note geometry and mouse/MIDI handling stay with JUCE; only the key surfaces
+// are custom. Availability, selection and playback have separate indicators.
 class GlassKeyboard final : public juce::MidiKeyboardComponent
 {
 public:
     explicit GlassKeyboard (juce::MidiKeyboardState& state)
         : juce::MidiKeyboardComponent (state, juce::MidiKeyboardComponent::horizontalKeyboard)
     {
-        setOctaveForMiddleC (4); // note 36 reads "C2", matching the chop mapping
-        setAvailableRange (24, 107); // C1..B7
+        setOctaveForMiddleC (cuesampler::midiMiddleCOctave);
         setScrollButtonsVisible (false);
-        // CUERACK ivory: cream naturals, warm near-black sharps, dark ink text.
-        setColour (juce::MidiKeyboardComponent::whiteNoteColourId, juce::Colour (0xfff2e7da));
-        setColour (juce::MidiKeyboardComponent::blackNoteColourId, juce::Colour (0xff171009));
-        setColour (juce::MidiKeyboardComponent::keySeparatorLineColourId, juce::Colour (0xff171009).withAlpha (0.35f));
-        setColour (juce::MidiKeyboardComponent::shadowColourId, juce::Colour (0xff171009).withAlpha (0.35f));
-        setColour (juce::MidiKeyboardComponent::textLabelColourId, juce::Colour (0xff746757));
+        setOctaveView (cuesampler::defaultKeyboardStartNote);
+        setBlackNoteWidthProportion (0.56f);
+        setBlackNoteLengthProportion (0.60f);
+        // Draw the actual key surfaces below. A transparent JUCE background
+        // leaves a recessed well after G10 rather than extending the ivory.
+        setColour (juce::MidiKeyboardComponent::whiteNoteColourId, juce::Colours::transparentBlack);
+        setColour (juce::MidiKeyboardComponent::keySeparatorLineColourId, juce::Colours::transparentBlack);
+        setColour (juce::MidiKeyboardComponent::shadowColourId, juce::Colours::transparentBlack);
+    }
+
+    void setOctaveView (int startNote, int noteCount = 24, bool banked = false, int channel = 1)
+    {
+        startNote = juce::jlimit (0, 120, startNote);
+        noteCount = juce::jlimit (24, 32, noteCount);
+        if (startNote == viewStartNote && noteCount == viewNoteCount && banked == bankMode
+            && channel == getMidiChannel()) return;
+        // Release held mouse keys before changing the viewport. Computer
+        // typing belongs to the DAW; CUE has no computer-key note mappings.
+        clearKeyMappings();
+        setMidiChannel (channel);
+        bankMode = banked;
+        viewStartNote = startNote;
+        viewNoteCount = noteCount;
+        setAvailableRange (startNote, juce::jmin (127, startNote + noteCount - 1));
+        setLowestVisibleKey (startNote);
+    }
+
+    void resized() override
+    {
+        int whites = 0;
+        // Keep the same key density in the final partial octaves. Five white
+        // keys at C10 must not expand to fill the entire instrument width.
+        for (int note = viewStartNote; note < viewStartNote + viewNoteCount; ++note)
+            if (! juce::MidiMessage::isMidiNoteBlack (note)) ++whites;
+        if (getWidth() > 0 && whites > 0) setKeyWidth ((float) getWidth() / (float) whites);
+        juce::MidiKeyboardComponent::resized();
     }
 
     // Resolve selection, playable keys and favorites from one immutable map.
@@ -1580,7 +1627,7 @@ public:
         if (state != nullptr)
             for (int note = 0; note < 128; ++note)
             {
-                const int index = state->midiMap.noteToChopIndex[(size_t) note];
+                const int index = state->midiMap.channelNoteToChopIndex[(size_t) (getMidiChannel() - 1)][(size_t) note];
                 if (index < 0 || (size_t) index >= state->chops.size())
                     continue;
                 const auto& chop = state->chops[(size_t) index];
@@ -1598,45 +1645,75 @@ public:
         repaint();
     }
 
+
+    void refreshHostNotes (const std::bitset<128>& notes)
+    {
+        if (hostNotes == notes) return;
+        hostNotes = notes;
+        repaint();
+    }
+
     void paint (juce::Graphics& g) override
     {
-        // Refreshed per paint so mode changes recolour the overlays. setColour
-        // is a no-op (no repaint loop) when the value is unchanged.
-        setColour (juce::MidiKeyboardComponent::keyDownOverlayColourId, accentOrange.withAlpha (0.8f));
-        setColour (juce::MidiKeyboardComponent::mouseOverKeyOverlayColourId, accentOrange.withAlpha (0.28f));
+        g.fillAll (panelInnerDark);
         juce::MidiKeyboardComponent::paint (g);
+        g.setColour (darkInk.withAlpha (0.45f));
+        const auto width = juce::jmin ((float) getWidth(), getRectangleForKey (getRangeEnd()).getRight());
+        g.drawRoundedRectangle (0.5f, 0.5f, juce::jmax (0.0f, width - 1.0f),
+                                (float) getHeight() - 1.0f, 2.0f, 1.0f);
     }
 
     void drawWhiteNote (int midiNoteNumber, juce::Graphics& g, juce::Rectangle<float> area,
-                        bool isDown, bool isOver, juce::Colour lineColour, juce::Colour textColour) override
+                        bool isDown, bool isOver, juce::Colour, juce::Colour) override
     {
-        const bool lit = isDown || midiNoteNumber == highlightedNote;
+        const bool playing = isDown || hostNotes.test ((size_t) midiNoteNumber);
         const bool favorite = isFavorite (midiNoteNumber);
-        if (favorite)
-        {
-            g.setColour (juce::Colour (0xffff2db1).withAlpha (lit ? 0.85f : isOver ? 0.65f : 0.45f));
-            g.fillRect (area.reduced (0.5f, 0.0f));
-        }
-        // Draw labels and separators above the tint; a favorite stays pink
-        // while selected/pressed, instead of changing to the mode accent.
-        juce::MidiKeyboardComponent::drawWhiteNote (midiNoteNumber, g, area, lit && ! favorite,
-                                                    isOver && ! favorite, lineColour, textColour);
-        paintMappedWash (g, area, midiNoteNumber, lit, 0.22f);
+        const auto accent = favorite ? juce::Colour (0xffff2db1) : accentOrange;
+        const auto body = area.reduced (0.5f, 0.0f).withTrimmedBottom (1.0f);
+        auto top = juce::Colour (0xfff6f0e6);
+        auto bottom = juce::Colour (0xffe5ddcf);
+        const bool selected = midiNoteNumber == highlightedNote;
+        if (playing) { top = accent.brighter (0.28f); bottom = accent; }
+        else if (selected) { top = top.interpolatedWith (accent, 0.42f); bottom = bottom.interpolatedWith (accent, 0.62f); }
+        else if (favorite) { top = top.interpolatedWith (accent, 0.12f); bottom = bottom.interpolatedWith (accent, 0.22f); }
+        else if (isOver) { top = top.brighter (0.04f); bottom = bottom.brighter (0.05f); }
+        g.setGradientFill ({ top, body.getTopLeft(), bottom, body.getBottomLeft(), false });
+        g.fillRoundedRectangle (body, 2.0f);
+        g.setColour (darkInk.withAlpha (0.16f));
+        g.drawHorizontalLine (juce::roundToInt (body.getBottom() - 1.0f), body.getX() + 1.0f, body.getRight() - 1.0f);
+        paintNoteIndicator (g, body, midiNoteNumber, playing, false);
+
+        auto text = getWhiteNoteText (midiNoteNumber);
+        if (midiNoteNumber == 127) text = midiNoteName (midiNoteNumber);
+        g.setColour (playing || selected ? darkInk : juce::Colour (0xff746757));
+        g.setFont (monoFont (9.0f));
+        g.drawText (text, body.withHeight (14.0f).withY (body.getBottom() - 20.0f),
+                    juce::Justification::centred, false);
     }
 
     void drawBlackNote (int midiNoteNumber, juce::Graphics& g, juce::Rectangle<float> area,
-                        bool isDown, bool isOver, juce::Colour noteFillColour) override
+                        bool isDown, bool isOver, juce::Colour) override
     {
-        const bool lit = isDown || midiNoteNumber == highlightedNote;
+        const bool playing = isDown || hostNotes.test ((size_t) midiNoteNumber);
         const bool favorite = isFavorite (midiNoteNumber);
-        if (favorite)
-            noteFillColour = noteFillColour.interpolatedWith (juce::Colour (0xffff2db1),
-                                                              lit ? 0.95f : isOver ? 0.85f : 0.7f);
-        juce::MidiKeyboardComponent::drawBlackNote (midiNoteNumber, g, area, lit && ! favorite,
-                                                    isOver && ! favorite, noteFillColour);
-        // Sharps start from near-black, so the same alpha that reads clearly on
-        // cream would be invisible here.
-        paintMappedWash (g, area, midiNoteNumber, lit, 0.42f);
+        const auto accent = favorite ? juce::Colour (0xffff2db1) : accentOrange;
+        const auto body = area.reduced (0.5f, 0.0f).withTrimmedBottom (1.0f);
+        auto top = juce::Colour (0xff35312e);
+        auto bottom = juce::Colour (0xff1b1816);
+        const bool selected = midiNoteNumber == highlightedNote;
+        if (playing) { top = accent.brighter (0.28f); bottom = accent; }
+        else if (selected) { top = top.interpolatedWith (accent, 0.72f); bottom = bottom.interpolatedWith (accent, 0.52f); }
+        else if (favorite) { top = top.interpolatedWith (accent, 0.25f); bottom = bottom.interpolatedWith (accent, 0.18f); }
+        else if (isOver) { top = top.brighter (0.12f); bottom = bottom.brighter (0.10f); }
+        // A narrow drop edge and top highlight give the sharp depth without
+        // JUCE's large, bright rectangular bevel.
+        g.setColour (darkInk.withAlpha (0.28f));
+        g.fillRoundedRectangle (body.translated (1.0f, 1.5f), 2.0f);
+        g.setGradientFill ({ top, body.getTopLeft(), bottom, body.getBottomLeft(), false });
+        g.fillRoundedRectangle (body, 2.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.10f));
+        g.drawHorizontalLine (1, body.getX() + 2.0f, body.getRight() - 2.0f);
+        paintNoteIndicator (g, body, midiNoteNumber, playing, true);
     }
 
 private:
@@ -1645,25 +1722,33 @@ private:
         return note >= 0 && note < 128 && favoriteNotes.test ((size_t) note);
     }
 
-    // Three tiers have to stay tellable apart at a glance:
-    //   unmapped      — untouched cream / near-black
-    //   mapped, silent— this wash
-    //   sounding      — the full-strength keyDownOverlay the base class paints
-    // The wash is skipped while a key is lit so it can never dull the loudest
-    // state, which is the one the eye should catch first.
-    void paintMappedWash (juce::Graphics& g, juce::Rectangle<float> area,
-                          int midiNoteNumber, bool lit, float alpha) const
+    void paintNoteIndicator (juce::Graphics& g, juce::Rectangle<float> body,
+                             int note, bool playing, bool black) const
     {
-        if (lit || isFavorite (midiNoteNumber) || midiNoteNumber < 0 || midiNoteNumber > 127)
-            return;
-        if (! mappedNotes.test ((size_t) midiNoteNumber))
-            return;
-
-        g.setColour (accentOrange.withAlpha (alpha));
-        g.fillRect (area.reduced (0.5f, 0.0f));
+        const bool selected = note == highlightedNote;
+        const bool favorite = isFavorite (note);
+        const auto accent = favorite ? juce::Colour (0xffff2db1) : accentOrange;
+        if (selected || playing)
+        {
+            g.setColour (playing ? juce::Colour (0xfffff1da) : accent);
+            g.drawRoundedRectangle (body.reduced (1.25f), 2.0f, playing ? 2.5f : 2.0f);
+        }
+        if (playing || selected || favorite || mappedNotes.test ((size_t) note))
+        {
+            const auto width = juce::jmin (body.getWidth() - 6.0f, playing || selected ? 18.0f : 8.0f);
+            const auto colour = playing || selected || favorite ? accent
+                : juce::Colour (black ? 0xff7e756b : 0xffafa394);
+            g.setColour (playing ? darkInk : colour);
+            g.fillRoundedRectangle (body.getCentreX() - width * 0.5f,
+                                    body.getBottom() - 6.0f, width, playing || selected ? 4.0f : 2.0f, 1.0f);
+        }
     }
 
     int highlightedNote = -1;
+    int viewStartNote = -1;
+    int viewNoteCount = 24;
+    bool bankMode = false;
+    std::bitset<128> hostNotes;
     std::bitset<128> mappedNotes;
     std::bitset<128> favoriteNotes;
 };
@@ -1919,8 +2004,8 @@ private:
                 { "1.  Drag an audio file onto the waveform, or press LOAD SAMPLE." },
                 { "2.  CUE detects the BPM and key, then slices the sample into chops." },
                 { "3.  Click any chop on the waveform to select and preview it." },
-                { "4.  Chops play over MIDI - C2 = chop 1, D2 = chop 2, and so on." },
-                { "5.  BARS sets chop size (1 / 2 / 4 / 8); OCT -/+ moves the mapping." },
+                { "4.  New samples start at C2: chop 1 = C2, chop 2 = C#2." },
+                { "5.  BARS sets chop size (1 / 2 / 4 / 8); OCT -/+ shows lower/higher keys." },
                 { "6.  GATE holds and loops a chop; ONE SHOT plays it through once." },
                 { "7.  TEMPO trim nudges the grid when chops feel early or late." },
             }},
@@ -2412,6 +2497,129 @@ private:
     juce::Colour wordmarkColour { 0xfff2e7da };
 };
 
+// Covers the waveform (including Favorites) only while an import is pending.
+// The transport and both replacement paths remain available throughout loading.
+class SampleImportOverlayComponent final : public juce::Component,
+                                          public juce::FileDragAndDropTarget,
+                                          private juce::Timer
+{
+public:
+    explicit SampleImportOverlayComponent (AudioPluginAudioProcessor& p) : processor (p)
+    {
+        setName ("Sample import progress");
+        configureButton (replaceButton, "CHOOSE ANOTHER SAMPLE", accentOrange);
+        replaceButton.getProperties().set ("cueStyle", "flatAction");
+        replaceButton.setTooltip ("Choose a different file to replace the pending sample.");
+        replaceButton.onClick = [this] { if (onChooseSample) onChooseSample(); };
+        addAndMakeVisible (replaceButton);
+        refresh();
+        startTimerHz (60);
+    }
+
+    std::function<void()> onChooseSample;
+
+    void refresh()
+    {
+        auto current = processor.getSampleImportStatus();
+        if (current != status)
+        {
+            status = std::move (current);
+            displayedProgress = 0.0f;
+            dragOver = false;
+            setVisible (status != nullptr);
+            if (status != nullptr) toFront (false);
+        }
+        if (status != nullptr)
+        {
+            const float target = status->progress.load (std::memory_order_acquire);
+            if (target >= 0.0f)
+                displayedProgress += (target - displayedProgress) * 0.18f;
+            repaint();
+        }
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        if (status == nullptr) return;
+        fillGlassRounded (g, *this, getLocalBounds().toFloat().reduced (1.0f), mediumCorner);
+        const auto screen = getLocalBounds().toFloat().reduced (22.0f);
+        g.setColour (blackPanel);
+        g.fillRoundedRectangle (screen, 3.0f);
+        g.setColour (dragOver ? accentOrange : borderMid);
+        g.drawRoundedRectangle (screen, 3.0f, dragOver ? 2.0f : 1.0f);
+
+        const float cx = screen.getCentreX(), cy = screen.getCentreY();
+        const float phase = (float) std::fmod (juce::Time::getMillisecondCounterHiRes() / 1100.0, 1.0);
+        const float progress = status->progress.load (std::memory_order_acquire);
+        juce::Path spinner;
+        spinner.addCentredArc (cx - 116.0f, cy - 73.0f, 9.0f, 9.0f, 0.0f,
+                              phase * juce::MathConstants<float>::twoPi,
+                              phase * juce::MathConstants<float>::twoPi + 4.6f, true);
+        g.setColour (accentOrange);
+        g.strokePath (spinner, juce::PathStrokeType (2.5f, juce::PathStrokeType::curved,
+                                                  juce::PathStrokeType::rounded));
+        g.setFont (heavyFont (15.0f));
+        g.drawText ("LOADING SAMPLE", juce::Rectangle<float> (cx - 96.0f, cy - 85.0f, 220.0f, 24.0f),
+                    juce::Justification::centredLeft);
+        g.setColour (textPrimary);
+        g.setFont (monoFont (14.0f));
+        g.drawText (status->fileName, screen.reduced (30.0f, 0.0f).withY (cy - 47.0f).withHeight (24.0f),
+                    juce::Justification::centred, true);
+
+        const auto bar = juce::Rectangle<float> (cx - 160.0f, cy - 10.0f, 320.0f, 4.0f);
+        g.setColour (borderMid);
+        g.fillRoundedRectangle (bar, 2.0f);
+        g.setColour (accentOrange);
+        if (progress >= 0.0f)
+            g.fillRoundedRectangle (bar.withWidth (juce::jmax (4.0f, bar.getWidth() * displayedProgress)), 2.0f);
+        else
+        {
+            // Indeterminate snapshot read, followed by real decoding progress.
+            const float x = bar.getX() + (bar.getWidth() - 64.0f) * (0.5f - 0.5f * std::cos (phase * juce::MathConstants<float>::twoPi));
+            g.fillRoundedRectangle (bar.withX (x).withWidth (64.0f), 2.0f);
+        }
+        g.setColour (textPrimary.withAlpha (0.65f));
+        g.setFont (monoFont (10.5f));
+        g.drawText (progress < 0.0f ? "READING AUDIO" : "PREPARING AUDIO",
+                    juce::Rectangle<float> (cx - 160.0f, cy + 2.0f, 320.0f, 18.0f), juce::Justification::centred);
+        g.drawText ("Or drop a different audio file here to replace it.",
+                    screen.reduced (12.0f, 0.0f).withY (cy + 84.0f).withHeight (20.0f), juce::Justification::centred);
+    }
+
+    void resized() override
+    {
+        replaceButton.setBounds (getWidth() / 2 - 112, getHeight() / 2 + 40, 224, 34);
+    }
+
+    bool isInterestedInFileDrag (const juce::StringArray& files) override
+    {
+        for (const auto& path : files)
+            if (juce::File (path).hasFileExtension ("wav;aif;aiff;mp3;flac;ogg")) return true;
+        return false;
+    }
+    void fileDragEnter (const juce::StringArray&, int, int) override { dragOver = true; repaint(); }
+    void fileDragExit (const juce::StringArray&) override { dragOver = false; repaint(); }
+    void filesDropped (const juce::StringArray& files, int, int) override
+    {
+        dragOver = false;
+        for (const auto& path : files)
+            if (juce::File (path).hasFileExtension ("wav;aif;aiff;mp3;flac;ogg"))
+            {
+                importSampleAsync (processor, juce::File (path), this);
+                refresh();
+                break;
+            }
+    }
+
+private:
+    void timerCallback() override { refresh(); }
+    AudioPluginAudioProcessor& processor;
+    std::shared_ptr<const AudioPluginAudioProcessor::SampleImportStatus> status;
+    SmoothHoverButton replaceButton;
+    float displayedProgress = 0.0f;
+    bool dragOver = false;
+};
+
 class WaveformDisplayComponent final : public juce::Component,
                                         public juce::ChangeListener,
                                         public juce::FileDragAndDropTarget,
@@ -2455,10 +2663,11 @@ public:
         };
         addAndMakeVisible (waveformColourButton);
         refreshWaveformColourMode();
-        setTooltip ("Click a chop to preview it. Use DRAG AUDIO to export, or ADSR to adjust its envelope and save a WAV.  "
+        setTooltip ("Click a chop to preview it. Use DRAG AUDIO to export, or ADSR to adjust its envelope and save an MP3.  "
                     "Double-click to toggle favourite (pink highlight).  "
                     "Drag a selected chop edge to change only that chop's start or end.  "
                     "Shift-drag a selected chop edge to resize the grid and update tempo.  "
+                    "Scroll vertically or pinch to zoom; scroll horizontally to pan. Use the ZOOM knob for horizontal zoom.  "
                     "Drag an audio file here to load it.");
         processor.sampleChangeBroadcaster.addChangeListener (this);
         processor.editChangeBroadcaster.addChangeListener (this);
@@ -2652,8 +2861,11 @@ public:
             processor.cancelManualChopCapture();
             edgeDragChopId = -1;
             isHoldingToPlay = false;
-            targetZoomLevel = zoomLevel = 0.07f;
-            targetScrollPosition = scrollPosition = 0.0f;
+            // The processor owns the saved viewport (and defaults for new
+            // samples). Keep it aligned with the knob when load notifications
+            // arrive after the editor has already restored its controls.
+            targetZoomLevel = zoomLevel = processor.getWaveformZoom();
+            targetScrollPosition = scrollPosition = processor.getWaveformScroll();
             targetWaveformVerticalScale = waveformVerticalScale = defaultWaveformVerticalScale;
             updatePeakCache();
             rebuildWaveformPath();
@@ -2685,7 +2897,7 @@ public:
     juce::String getTooltip() override
     {
         if (adsrButtonHovered)
-            return "Adjust this chop's envelope, or save it as a WAV file.";
+            return "Adjust this chop's envelope, or save it as an MP3 file.";
         if (exportButtonHovered)
             return "Drag this chop's audio into your DAW. No hold required. Click to prepare it first.";
         return juce::SettableTooltipClient::getTooltip();
@@ -2723,7 +2935,7 @@ public:
     {
         isDragOver = false;
         if (! files.isEmpty())
-            showSampleLoadError (processor.loadAudioFile (juce::File (files[0])), this);
+            importSampleAsync (processor, juce::File (files[0]), this);
     }
 
     void mouseMove (const juce::MouseEvent& event) override
@@ -3693,51 +3905,37 @@ public:
 
     void mouseWheelMove (const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) override
     {
-        if (! isPositionInsideDisplay (event.position))
+        if (! isPositionInsideDisplay (event.position)
+            || ! std::isfinite (wheel.deltaX) || ! std::isfinite (wheel.deltaY))
             return;
 
-        if (wheel.deltaY != 0.0f)
+        // Laptop trackpads often report both axes. Ignore the minor axis of
+        // smooth scrolling so horizontal pans don't also change magnification.
+        // Ctrl-wheel (including trackpads that translate pinch to Ctrl-wheel)
+        // remains a zoom gesture even when a horizontal delta accompanies it.
+        const bool zoomGesture = event.mods.isCtrlDown()
+                              || ! wheel.isSmooth
+                              || std::abs (wheel.deltaY) >= std::abs (wheel.deltaX);
+        if (zoomGesture && wheel.deltaY != 0.0f)
+            zoomAroundPosition (targetZoomLevel + wheel.deltaY * 0.08f, event.position.x);
+
+        if (! event.mods.isCtrlDown() && (! wheel.isSmooth || ! zoomGesture) && wheel.deltaX != 0.0f)
         {
-            const float newZoom = juce::jlimit (0.0f, 1.0f, zoomLevel + wheel.deltaY * 0.08f);
-
-            const auto sampleData = processor.getLoadedSample();
-            if (sampleData != nullptr && sampleData->buffer.getNumSamples() > 0)
-            {
-                const int   numSamples    = sampleData->buffer.getNumSamples();
-                const auto  displayBounds = getDisplayBounds();
-                const double relPos       = juce::jlimit (0.0, 1.0,
-                                                (double) (event.position.x - displayBounds.getX())
-                                                / (double) displayBounds.getWidth());
-                const double cursorSample = sampleForDisplayPosition (event.position.x);
-
-                const float effectiveZoom = getEffectiveZoomLevel (newZoom);
-                const int   newVisible    = juce::jmax (32, (int) ((float) numSamples / std::pow (10000.0f, effectiveZoom)));
-                const int   newMaxOffset  = juce::jmax (1, numSamples - newVisible);
-                const double newOffset    = cursorSample - relPos * (double) juce::jmax (1, newVisible - 1);
-                const float newScroll     = juce::jlimit (0.0f, 1.0f, (float) (newOffset / (double) newMaxOffset));
-
-                setZoom (newZoom);
-                setScroll (newScroll);
-                // Handled smoothly by timerCallback
-
-                if (onZoomChanged)   onZoomChanged   (newZoom);
-                if (onScrollChanged) onScrollChanged (newScroll);
-            }
-            else
-            {
-                setZoom (newZoom);
-                if (onZoomChanged)
-                    onZoomChanged (newZoom);
-            }
-        }
-
-        if (wheel.deltaX != 0.0f)
-        {
-            const float newScroll = juce::jlimit (0.0f, 1.0f, scrollPosition - wheel.deltaX * 0.02f);
+            const float newScroll = juce::jlimit (0.0f, 1.0f, targetScrollPosition - wheel.deltaX * 0.02f);
             setScroll (newScroll);
             if (onScrollChanged)
                 onScrollChanged (newScroll);
         }
+    }
+
+    void mouseMagnify (const juce::MouseEvent& event, float scaleFactor) override
+    {
+        // macOS sends trackpad pinch separately from wheel/scroll events.
+        if (! isPositionInsideDisplay (event.position) || ! std::isfinite (scaleFactor) || scaleFactor <= 0.0f)
+            return;
+        const float effective = getEffectiveZoomLevel (targetZoomLevel)
+                              + std::log10 (scaleFactor) / 4.0f;
+        zoomAroundPosition (getZoomControlValue (effective), event.position.x);
     }
 
     void paint (juce::Graphics& g) override
@@ -3946,7 +4144,7 @@ public:
     {
         rebuildWaveformPath();
 
-        // Top-right corner of the display: two 28x28 buttons.
+        // Top-right: display mode, then waveform height.
         const auto display = getDisplayBounds().toNearestInt();
         constexpr int btnSize = 28;
         constexpr int btnGap  = 4;
@@ -4004,9 +4202,7 @@ public:
         const double span = juce::jlimit (1.0, (double) total,
             juce::jmax (32.0, (double) (chop->endSample - chop->startSample) * 1.25));
         const float effective = juce::jlimit (0.0f, 1.0f, (float) (std::log10 ((double) total / span) / 4.0));
-        zoomLevel = targetZoomLevel = effective <= zoomMappedMidpoint
-            ? juce::jmap (effective, 0.0f, zoomMappedMidpoint, 0.0f, zoomResponseMidpoint)
-            : juce::jmap (effective, zoomMappedMidpoint, 1.0f, zoomResponseMidpoint, 1.0f);
+        zoomLevel = targetZoomLevel = getZoomControlValue (effective);
         const int visible = getVisibleRange (total).visibleSamples;
         const double offset = ((double) chop->startSample + chop->endSample - visible) * 0.5;
         scrollPosition = targetScrollPosition = total > visible
@@ -4080,6 +4276,36 @@ private:
         targetWaveformVerticalScale = next;
         if (! isShowing())
             waveformVerticalScale = targetWaveformVerticalScale;
+    }
+
+    void zoomAroundPosition (float requestedZoom, float displayX)
+    {
+        if (! std::isfinite (requestedZoom)) return;
+        const float newZoom = juce::jlimit (0.0f, 1.0f, requestedZoom);
+        if (newZoom == targetZoomLevel) return;
+
+        const auto sample = processor.getLoadedSample();
+        if (sample != nullptr && sample->buffer.getNumSamples() > 0)
+        {
+            const int total = sample->buffer.getNumSamples();
+            const auto display = getDisplayBounds();
+            const double proportion = juce::jlimit (0.0, 1.0,
+                (double) (displayX - display.getX()) / juce::jmax (1.0, (double) display.getWidth()));
+            // Accumulate against the requested viewport, not the lagging
+            // animation, so rapid trackpad events retain every step.
+            const auto previous = getVisibleRange (total, targetZoomLevel, targetScrollPosition);
+            const auto next = getVisibleRange (total, newZoom, 0.0f);
+            const int maxOffset = total - next.visibleSamples;
+            const double anchor = (double) targetScrollPosition * (total - previous.visibleSamples)
+                                + proportion * previous.visibleSamples;
+            const double offset = anchor - proportion * next.visibleSamples;
+            const float newScroll = maxOffset > 0
+                ? juce::jlimit (0.0f, 1.0f, (float) (offset / maxOffset)) : 0.0f;
+            setScroll (newScroll);
+            if (onScrollChanged) onScrollChanged (newScroll);
+        }
+        setZoom (newZoom);
+        if (onZoomChanged) onZoomChanged (newZoom);
     }
 
     static void showExportError (const juce::String& message)
@@ -4182,7 +4408,7 @@ private:
         {
             exportDragFired = false;
             readyExportFile = retained; // retry or Save As; no successful host reference yet
-            showExportError ("The drag could not start. Try DRAG AUDIO again, or choose ADSR then Save WAV.");
+            showExportError ("The drag could not start. Try DRAG AUDIO again, or choose ADSR then Save MP3.");
         }
         setMouseCursor (juce::MouseCursor::NormalCursor);
         repaint();
@@ -4257,7 +4483,7 @@ private:
         constexpr float w = 206.0f;
         constexpr float h = 28.0f;
         const float leftLimit  = display.getX() + 6.0f;
-        const float rightLimit = display.getRight() - 70.0f; // keep clear of +/- buttons
+        const float rightLimit = (float) waveformColourButton.getX() - 6.0f;
 
         // In manual mode the delete badge sits immediately right of the pill.
         // Centre the pair as one group so the badge cannot be pushed into the
@@ -4378,7 +4604,7 @@ private:
         auto suggested = juce::File::getSpecialLocation (juce::File::userDesktopDirectory)
                              .getChildFile (tempFile.getFileName());
         chopExportChooser = std::make_unique<juce::FileChooser> (
-            "Export Chop As", suggested, "*.wav");
+            "Export Chop As", suggested, "*.mp3");
         const auto flags = juce::FileBrowserComponent::saveMode
                          | juce::FileBrowserComponent::canSelectFiles
                          | juce::FileBrowserComponent::warnAboutOverwriting;
@@ -4718,11 +4944,16 @@ private:
 
     VisibleRange getVisibleRange (int numSamples) const noexcept
     {
-        const float effectiveZoomLevel = getEffectiveZoomLevel (zoomLevel);
+        return getVisibleRange (numSamples, zoomLevel, scrollPosition);
+    }
+
+    static VisibleRange getVisibleRange (int numSamples, float zoom, float scroll) noexcept
+    {
+        const float effectiveZoomLevel = getEffectiveZoomLevel (zoom);
         const float zoomFactor = std::pow (10000.0f, effectiveZoomLevel);
         const int visibleSamples = juce::jmin (numSamples, juce::jmax (32, (int) ((float) numSamples / zoomFactor)));
         const int maxOffset = juce::jmax (0, numSamples - visibleSamples);
-        const int sampleOffset = (int) (scrollPosition * (float) maxOffset);
+        const int sampleOffset = (int) (scroll * (float) maxOffset);
         return { sampleOffset, visibleSamples };
     }
 
@@ -5228,7 +5459,9 @@ private:
                     if (mappedNote >= 0)
                     {
                         g.setColour (inkColour);
-                        g.drawText (midiNoteName (mappedNote), noteArea.toNearestInt(),
+                        const int channel = chopState->midiMap.channelForChopIndex[idx];
+                        const auto label = midiNoteName (mappedNote) + (chopState->midiMap.channelBanks ? "/" + juce::String (channel) : "");
+                        g.drawText (label, noteArea.toNearestInt(),
                                     juce::Justification::centredRight, false);
                     }
                     else
@@ -5833,21 +6066,28 @@ private:
                                  float y2,
                                  juce::Colour colour,
                                  float thickness,
-                                 bool dottedInManualMode)
+                                 bool isBarGuide)
         {
             // Manual chopping uses only the subdued orange bar guides; the
             // blue beat/subdivision grid adds visual noise while placing ends.
-            if (manualChopMode && ! dottedInManualMode)
+            if (manualChopMode && ! isBarGuide)
                 return;
 
             const juce::Line<float> line (x, y1, x, y2);
-            if (manualChopMode && dottedInManualMode)
+            if (isBarGuide)
             {
-                constexpr float dashPattern[] { 2.5f, 4.0f };
-                g.setColour (juce::Colours::black.withAlpha (0.28f));
-                g.drawDashedLine (line, dashPattern, 2, thickness + 1.2f);
-                g.setColour (colour);
-                g.drawDashedLine (line, dashPattern, 2, thickness);
+                // Round dots in both automatic and manual modes. Keep the
+                // shadow dotted too so the waveform shows through the gaps.
+                constexpr float dotSpacing = 6.0f;
+                const float diameter = thickness + 0.5f;
+                for (float y = y1; y + diameter <= y2; y += dotSpacing)
+                {
+                    g.setColour (juce::Colours::black.withAlpha (0.28f));
+                    g.fillEllipse (x - diameter * 0.5f - 0.6f, y - 0.6f,
+                                   diameter + 1.2f, diameter + 1.2f);
+                    g.setColour (colour);
+                    g.fillEllipse (x - diameter * 0.5f, y, diameter, diameter);
+                }
                 return;
             }
 
@@ -5860,6 +6100,10 @@ private:
         const bool isLightMode = (currentTheme == Theme::light);
         const auto gridColour = isLightMode ? juce::Colour (0xff4a3f35) : juce::Colour (0xff8fd9ff);
         const auto barColour  = isLightMode ? juce::Colour (0xffb83e00) : juce::Colour (0xffff6900);
+        const auto isBarTime = [anchor, barPeriod, beatPeriod] (double t)
+        {
+            return std::abs (std::remainder (t - anchor, barPeriod)) < beatPeriod * 1.0e-6;
+        };
 
         // 16th-note lines — fade in above zoom 0.60
         {
@@ -5873,7 +6117,7 @@ private:
                 for (; t <= visibleEndSec; t += period)
                 {
                     const auto sample = t * sr;
-                    if (sample < visibleStart || sample > visibleEnd) continue;
+                    if (sample < visibleStart || sample > visibleEnd || isBarTime (t)) continue;
                     const auto x = displayXForSamplePosition (sample, visibleRange, displayBounds);
                     drawGridLine (x, displayBounds.getY() + 16.0f, displayBounds.getBottom() - 16.0f,
                                   gridColour.withAlpha (0.52f * alpha), 0.9f, false);
@@ -5893,7 +6137,7 @@ private:
                 for (; t <= visibleEndSec; t += period)
                 {
                     const auto sample = t * sr;
-                    if (sample < visibleStart || sample > visibleEnd) continue;
+                    if (sample < visibleStart || sample > visibleEnd || isBarTime (t)) continue;
                     const auto x = displayXForSamplePosition (sample, visibleRange, displayBounds);
                     drawGridLine (x, displayBounds.getY() + 12.0f, displayBounds.getBottom() - 12.0f,
                                   gridColour.withAlpha (0.62f * alpha), 1.0f, false);
@@ -5909,7 +6153,7 @@ private:
             for (; t <= visibleEndSec; t += beatPeriod)
             {
                 const auto sample = t * sr;
-                if (sample < visibleStart || sample > visibleEnd) continue;
+                if (sample < visibleStart || sample > visibleEnd || isBarTime (t)) continue;
                 const auto x = displayXForSamplePosition (sample, visibleRange, displayBounds);
                 drawGridLine (x,
                               displayBounds.getY() + 8.0f,
@@ -6566,6 +6810,11 @@ public:
     }
     ~FavoritesViewComponent() override { stopTimer(); grid.releaseNote(); }
 
+    void visibilityChanged() override
+    {
+        if (! isShowing()) grid.releaseNote();
+    }
+
     std::function<void(int)> onEditChop;
 
     void refresh()
@@ -6602,7 +6851,12 @@ public:
         g.drawText ("FAVORITES  /  " + juce::String (count), 24, 10, 220, 24, juce::Justification::centredLeft);
         g.setColour (textMuted);
         g.setFont (monoFont (10));
-        g.drawText (count > 92 ? "FIRST 92 FAVORITES HAVE MIDI KEYS (C2–G9)" : "FAVORITE ORDER  /  MIDI FROM C2",
+        const int midiCapacity = juce::jmax (0, 128 - processor.getMidiRootNote()) * (processor.isMidiBankModeEnabled() ? 16 : 1);
+        const auto midiStatus = count > midiCapacity
+            ? "FIRST " + juce::String (midiCapacity) + " FAVORITES HAVE MIDI KEYS ("
+                + midiNoteName (processor.getMidiRootNote()) + "–G10)"
+            : "FAVORITE ORDER  /  MIDI FROM " + midiNoteName (processor.getMidiRootNote());
+        g.drawText (midiStatus,
                     250, 10, juce::jmax (0, getWidth() - 410), 24, juce::Justification::centredRight);
         if (count == 0)
         {
@@ -6640,11 +6894,11 @@ private:
             const int gap = juce::jmin (4, juce::jmin (width, height) / 8);
             return juce::Rectangle<int> (x, y, width, height).reduced (gap);
         }
-        int pressedNote = -1;
+        bool previewHeld = false;
         void releaseNote()
         {
-            if (pressedNote >= 0) owner.processor.keyboardState.noteOff (1, pressedNote, 0);
-            pressedNote = -1;
+            if (previewHeld) owner.processor.releaseChopPreview();
+            previewHeld = false;
         }
         void paint (juce::Graphics& g) override
         {
@@ -6668,7 +6922,9 @@ private:
                 auto content = tile.reduced (padding);
                 const int labelHeight = juce::jmin (32, juce::jmax (12, content.getHeight() / 3));
                 g.setFont (monoFont (juce::jlimit (10.0f, 22.0f, (float) labelHeight * 0.75f)));
-                g.drawText (note >= 0 ? midiNoteName (note) : "NO MIDI", content.removeFromTop (labelHeight), juce::Justification::centredLeft);
+                const auto midiLabel = note >= 0 ? midiNoteName (note) + (state->midiMap.channelBanks
+                    ? "/" + juce::String (state->midiMap.channelForChopIndex[(size_t) index]) : "") : "NO MIDI";
+                g.drawText (midiLabel, content.removeFromTop (labelHeight), juce::Justification::centredLeft);
                 if (tile.getHeight() >= 64 && tile.getWidth() >= 90)
                 {
                     g.setColour (textMuted);
@@ -6698,8 +6954,11 @@ private:
             if (id < 0) return;
             owner.processor.selectChopById (id);
             owner.refreshEditButton();
-            pressedNote = owner.processor.getMidiNoteForChopId (id);
-            if (pressedNote >= 0) owner.processor.keyboardState.noteOn (1, pressedNote, 1.0f);
+            // Match waveform audition: mouse playback must not depend on the
+            // temporary MIDI map or the host processing injected UI notes.
+            // This also lets tiles beyond the 92-note map audition normally.
+            previewHeld = true;
+            owner.processor.startChopPreview();
         }
         void mouseUp (const juce::MouseEvent&) override { releaseNote(); }
         // Double-clicks audition through mouseDown/mouseUp like any other pad
@@ -6743,9 +7002,9 @@ public:
     // Shared left-bank geometry. The heading sits in the caption strip so
     // the full row width is available to the buttons.
     static constexpr int sideMargin          = 34;
-    static constexpr int chopToolButtonWidth = 160;
+    static constexpr int chopToolButtonWidth = 120;
     static constexpr int chopToolButtonGap   = 12;
-    static constexpr int barsToolButtonWidth = 144;  // four 36px segments
+    static constexpr int barsToolButtonWidth = 112;  // four 28px segments
     static constexpr int barsToOctGap        = 12;
     static constexpr int octStepWidth        = 36;
     static constexpr int octGroupWidth       = octStepWidth * 2;
@@ -6757,7 +7016,7 @@ public:
     static constexpr int chopToolsX()  { return sideMargin; }
     static constexpr int barsX()       { return chopToolsX() + chopToolButtonWidth + chopToolButtonGap; }
     static constexpr int octGroupX()   { return barsX() + barsToolButtonWidth + barsToOctGap; }
-    // Everything the mapping status line sits under: CHOP MANUALLY | BARS | OCT.
+    // Mapping readout sits under the chop and octave controls.
     static constexpr int mappingGroupWidth() { return octGroupX() + octGroupWidth - chopToolsX(); }
 
     explicit TransportSectionComponent (AudioPluginAudioProcessor& p)
@@ -6942,37 +7201,23 @@ public:
         // The faces are glyphs now (the "OCT" caption above the pair carries the
         // name), and the group is narrow, so the words would not have fit.
         //
-        // DIRECTION IS DELIBERATE — DO NOT "FIX" IT.
-        //
-        // "-" raises the root and "+" lowers it, which looks backwards until you
-        // think in terms of the key under your finger rather than the root note.
-        // Chop 1 sits AT the root and the rest run upward from there, so lowering
-        // the root slides the whole mapping DOWN the keyboard — and any key you
-        // are already holding then lands on a LATER chop, i.e. further forward in
-        // the song. Pressing "-" must move you BACK through the song, so "-" has
-        // to raise the root.
-        //
-        // These buttons navigate the chop layout; they are not a transpose. An
-        // earlier comment here recorded only that the functions were "reversed"
-        // without saying why, which is precisely what got the wiring inverted
-        // once already.
+        // OCT navigates the keyboard: + shows the next higher octave, while
+        // every absolute MIDI note retains its chop assignment.
         configureButton (octDownButton, "-", textPrimary.withAlpha (0.85f));
         configureButton (octUpButton, "+", textPrimary.withAlpha (0.85f));
+        octDownButton.setComponentID ("octave-down");
+        octUpButton.setComponentID ("octave-up");
         octDownButton.getProperties().set ("cueStyle", "segment");
         octUpButton.getProperties().set ("cueStyle", "segment");
-        octDownButton.setTooltip ("Step the chop mapping back one octave: the keys you are playing move to earlier chops in the song. (ROOT rises, because chop 1 sits on the root.)");
-        octUpButton.setTooltip ("Step the chop mapping forward one octave: the keys you are playing move to later chops in the song. (ROOT falls, because chop 1 sits on the root.)");
+        octDownButton.setTooltip ("Show the previous keyboard octave. MIDI notes and chop assignments stay fixed.");
+        octUpButton.setTooltip ("Show the next keyboard octave: C0, C1, C2... MIDI notes and chop assignments stay fixed.");
         octDownButton.onClick = [this]
         {
-            processor.setMidiOctaveOffset (processor.getMidiOctaveOffset() + 1);
-            updateOctaveControls();
-            repaint();
+            stepKeyboardOctave (-1);
         };
         octUpButton.onClick = [this]
         {
-            processor.setMidiOctaveOffset (processor.getMidiOctaveOffset() - 1);
-            updateOctaveControls();
-            repaint();
+            stepKeyboardOctave (1);
         };
         addAndMakeVisible (octDownButton);
         addAndMakeVisible (octUpButton);
@@ -7079,7 +7324,7 @@ public:
             g.drawText ("BARS",
                         juce::Rectangle<int> (barsX(), captionY, barsToolButtonWidth, toolCaptionH),
                         juce::Justification::centred, false);
-            g.drawText ("OCT",
+            g.drawText ("OCT " + midiNoteName (processor.getKeyboardStartNote()),
                         juce::Rectangle<int> (octGroupX(), captionY, octGroupWidth, toolCaptionH),
                         juce::Justification::centred, false);
         }
@@ -7087,8 +7332,7 @@ public:
         g.setColour (glassTextMuted.withAlpha (0.85f));
         g.setFont (monoFont (8.5f).withExtraKerningFactor (0.06f));
         {
-            // Centred under the whole mapping group — CHOP MANUALLY | BARS | OCT
-            // — since the ROOT readout is what the octave buttons change.
+            // Centred under the whole keyboard/chop mapping group.
             g.drawText (getMidiMappingText(),
                         juce::Rectangle<int> (chopToolsX(),
                                               getChopPanelBounds().getBottom() - 13,
@@ -7130,10 +7374,7 @@ public:
             barsSegments[i].setBounds (barsX() + (int) i * segmentW, toolButtonY,
                                        segmentW, toolButtonH);
 
-        // The octave shift moves the same note map the BARS segments and the
-        // ROOT readout describe, so it belongs with them rather than orphaned
-        // against the far right edge, where it sat as two 20px slivers. Full
-        // tool-row height puts it on equal footing with its neighbours.
+        // OCT navigates the absolute keyboard range C0-C10.
         octDownButton.setBounds (octGroupX(), toolButtonY, octStepWidth, toolButtonH);
         octUpButton.setBounds   (octGroupX() + octStepWidth, toolButtonY, octStepWidth, toolButtonH);
 
@@ -7234,6 +7475,8 @@ public:
     std::function<void()> onModeThemeChanged;
     std::function<void (bool)> onWarpToggled;
     std::function<void (bool)> onManualChopToggled;
+    std::function<void()> onKeyboardOctaveChanged;
+    int getKeyboardVisibleNoteCount() const noexcept { return 32; }
 
 private:
     void timerCallback() override
@@ -7246,6 +7489,9 @@ private:
 
     void updateDisplays()
     {
+        const bool importing = processor.getSampleImportStatus() != nullptr;
+        loadButton.setButtonText (importing ? "CHOOSE ANOTHER" : processor.getLoadedSample() != nullptr
+                                                            ? "REPLACE SAMPLE" : "LOAD SAMPLE");
         refreshBarsSegments();
         const bool editingWaveform = ! processor.isFavoritesViewEnabled();
         manualChopButton.setEnabled (editingWaveform);
@@ -7542,38 +7788,61 @@ private:
 
     juce::String getMidiMappingText() const
     {
-        if (processor.isFavoritesViewEnabled()) return "FAVORITES  |  C2 UPWARD  |  ORDER ADDED";
-        if (processor.isManualChopModeActive())
+        if (controlsFlTypingOctave)
         {
-            const int unreachable = processor.getUnreachableChopCount();
-            if (unreachable > 0)
-                return "MANUAL  |  " + juce::String (unreachable) + " UNASSIGNED  |  PAD REUSE REASSIGNS THE NOTE";
-            return "ADD: CLICK START / END  |  EDIT: CLICK TO AUDITION";
+            if (lastFlOctaveResult == cuesampler::FlOctaveShortcutResult::keysHeld) return "FL OCT: RELEASE KEYS";
+            if (lastFlOctaveResult == cuesampler::FlOctaveShortcutResult::inactiveHost) return "FL OCT: FOCUS FL";
+            if (lastFlOctaveResult == cuesampler::FlOctaveShortcutResult::unavailableWindow) return "FL OCT: CLOSE DIALOG";
+            if (lastFlOctaveResult == cuesampler::FlOctaveShortcutResult::failed) return "FL OCT: REQUEST FAILED";
+            if (processor.getKeyboardStartNote() > 72 || processor.getKeyboardStartNote() < 24)
+                return "SCREEN KEYS " + midiNoteName (processor.getKeyboardStartNote());
+            return "FL TYPING C2 - C6";
         }
-
-        // Every chop now carries its own key name on its header tab, so this
-        // line no longer has to recite the mapping — and reciting it was how it
-        // came to be wrong twice. It reports the root and, when pinned chops
-        // and the positional map collide, how many chops nothing can reach.
-        // That last case used to be completely silent.
-        const int root = processor.getMidiRootNote();
-        const int unreachable = processor.getUnreachableChopCount();
-
-        if (unreachable > 0)
-            return "ROOT " + midiNoteName (root) + "  |  " + juce::String (unreachable)
-                 + (unreachable == 1 ? " CHOP UNREACHABLE" : " CHOPS UNREACHABLE");
-
-        return "ROOT " + midiNoteName (root) + "  |  KEY SHOWN ON EACH CHOP";
+        return "MIDI " + midiNoteName (processor.getMidiRootNote()) + " - G10";
     }
 
     void updateOctaveControls()
     {
-        // Each button greys out at the limit IT can reach. "-" raises the offset
-        // (see the direction note where these are wired up), so it stops at the
-        // maximum; "+" lowers it and stops at the minimum.
-        octDownButton.setEnabled (! processor.isFavoritesViewEnabled() && processor.getMidiOctaveOffset() < AudioPluginAudioProcessor::midiOctaveOffsetMax);
-        octUpButton.setEnabled   (processor.getMidiOctaveOffset() > AudioPluginAudioProcessor::midiOctaveOffsetMin);
+        const int start = processor.getKeyboardStartNote();
+        if (controlsFlTypingOctave)
+        {
+            octDownButton.setEnabled (start > juce::jmin (24, processor.getMidiRootNote() / 12 * 12));
+            octUpButton.setEnabled (start < 120);
+            octDownButton.setTooltip (start > 84 || start <= 24
+                ? "Show the previous CueSampler screen-keyboard octave. Incoming MIDI keeps its original pitch."
+                : "Lower FL Studio's typing-keyboard octave and show the matching keys. Standard Piano layout, C2-C6. Release typing keys before changing octave.");
+            octUpButton.setTooltip (start >= 72 || start < 12
+                ? "Show higher CueSampler screen keys through C10. Above C6, click these keys to play; FL's typing octave stays unchanged."
+                : "Raise FL Studio's typing-keyboard octave and show the matching keys. Standard Piano layout, C2-C6. Release typing keys before changing octave.");
+            return;
+        }
+        octDownButton.setEnabled (start > 0);
+        octUpButton.setEnabled (start < 120);
+        octDownButton.setTooltip (start == 0 ? "C0: lowest MIDI octave."
+            : "Show the previous keyboard octave. CUE and DAW notes keep the same pitch.");
+        octUpButton.setTooltip (start == 120 ? "C10: highest MIDI octave."
+            : "Show the next keyboard octave. CUE and DAW notes keep the same pitch.");
     }
+
+    void stepKeyboardOctave (int direction)
+    {
+        const auto changeView = [this] (int nextNote)
+        {
+            processor.setMidiOctaveOffset (nextNote / 12);
+            if (onKeyboardOctaveChanged) onKeyboardOctaveChanged();
+        };
+        if (controlsFlTypingOctave)
+            lastFlOctaveResult = cuesampler::stepFlTypingOctave (processor.getKeyboardStartNote(), direction,
+                [] (int note) { return cuesampler::postFlOctaveShortcut (note); }, changeView,
+                juce::jmin (24, processor.getMidiRootNote() / 12 * 12));
+        else
+            changeView (juce::jlimit (0, 120, processor.getKeyboardStartNote() + direction * 12));
+        updateOctaveControls();
+        repaint();
+    }
+
+    const bool controlsFlTypingOctave = cuesampler::isFlOctaveShortcutAvailable();
+    std::optional<cuesampler::FlOctaveShortcutResult> lastFlOctaveResult;
 
     juce::Rectangle<int> getChopPanelBounds() const
     {
@@ -7649,7 +7918,7 @@ public:
 
         zoomKnob.getSlider().setValue (0.0, juce::dontSendNotification);
         zoomKnob.getSlider().setMouseDragSensitivity (preciseMiniKnobDragSensitivity);
-        zoomKnob.getSlider().setTooltip ("ZOOM: zoom into the waveform for detail. Use SCROLL to pan when zoomed in.");
+        zoomKnob.getSlider().setTooltip ("ZOOM: zoom into the waveform for detail. Double-click to reset to the full sample. Scroll vertically or pinch over the waveform to zoom; use SCROLL or horizontal scrolling to pan.");
         zoomKnob.captureCurrentValueAsDefault();
 
         scrollKnob.getSlider().setValue (0.0, juce::dontSendNotification);
@@ -8242,6 +8511,7 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     });
 
     transportSectionComponent->onModeThemeChanged = [this] { applyThemeToUi(); };
+    transportSectionComponent->onKeyboardOctaveChanged = [this] { syncMidiKeyboard(); };
     transportSectionComponent->onManualChopToggled = [this] (bool active)
     {
         waveformDisplayComponent->setManualChopMode (active);
@@ -8354,11 +8624,14 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
         contentComponent.addAndMakeVisible (*component);
 
     midiKeyboardComponent = std::make_unique<cue::GlassKeyboard> (processorRef.keyboardState);
-    midiKeyboardComponent->refreshChops (processorRef.getChopState());
+    syncMidiKeyboard();
     contentComponent.addAndMakeVisible (*midiKeyboardComponent);
 
     favoritesViewComponent = std::make_unique<cue::FavoritesViewComponent> (processorRef, *waveformDisplayComponent);
     contentComponent.addChildComponent (*favoritesViewComponent);
+    sampleImportOverlayComponent = std::make_unique<cue::SampleImportOverlayComponent> (processorRef);
+    sampleImportOverlayComponent->onChooseSample = [this] { loadSampleFromFile(); };
+    contentComponent.addChildComponent (*sampleImportOverlayComponent);
     favoritesViewComponent->onEditChop = [this] (int chopId)
     {
         processorRef.setFavoritesViewEnabled (false);
@@ -8368,7 +8641,7 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     cue::configureButton (favoritesButton, "FAVORITES", juce::Colour (0xffff2db1));
     favoritesButton.getProperties().set ("cueStyle", "segment");
     favoritesButton.getProperties().set ("cueAccent", (int) juce::Colour (0xffff2db1).getARGB());
-    favoritesButton.setTooltip ("Show favorite chops in the order you added them, mapped from C2. Switch off to restore the full waveform and original MIDI mapping.");
+    favoritesButton.setTooltip ("Show favorite chops in the order you added them, starting at the sample's fixed MIDI root (C2 for new imports). Switch off to restore the original mapping.");
     favoritesButton.onClick = [this]
     {
         processorRef.setFavoritesViewEnabled (! processorRef.isFavoritesViewEnabled());
@@ -8479,6 +8752,7 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     addChildComponent (*initialLoadOverlayComponent); // shown asynchronously for a fresh instance
 
     setOpaque (true);
+    setWantsKeyboardFocus (true);
     // Keep the window on the chassis aspect ratio. The UI deliberately scales
     // uniformly, so allowing height-only growth would leave an unused strip
     // below the keyboard instead of enlarging the controls.
@@ -8505,7 +8779,8 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     juce::MessageManager::callAsync ([safeThis]
     {
         if (auto* editor = safeThis.getComponent();
-            editor != nullptr && editor->processorRef.claimInitialLoadSamplePrompt())
+            editor != nullptr && editor->processorRef.getSampleImportStatus() == nullptr
+            && editor->processorRef.claimInitialLoadSamplePrompt())
         {
             editor->initialLoadOverlayComponent->setBounds (editor->getLocalBounds());
             editor->initialLoadOverlayComponent->setVisible (true);
@@ -8523,6 +8798,26 @@ AudioPluginAudioProcessorEditor::~AudioPluginAudioProcessorEditor()
     setLookAndFeel (nullptr);
     uiSettingsFile->saveIfNeeded();
     uiSettingsFile.reset();
+}
+
+void AudioPluginAudioProcessorEditor::syncMidiKeyboard()
+{
+    const int channel = processorRef.getKeyboardMidiBank();
+    const int base = processorRef.getKeyboardStartNote();
+    const bool octaveChanged = lastKeyboardBase != base;
+    lastKeyboardBase = base;
+    if (octaveChanged)
+        repaint (juce::Rectangle<float> (18.0f, 588.0f, 270.0f, 24.0f)
+                     .transformedBy (juce::AffineTransform::scale (getUiScale())).getSmallestIntegerContainer());
+    if (midiKeyboardComponent != nullptr)
+    {
+        midiKeyboardComponent->setOctaveView (base, transportSectionComponent->getKeyboardVisibleNoteCount(),
+                                             processorRef.isMidiBankModeEnabled(), channel);
+        const int channelMask = processorRef.isMidiBankModeEnabled() ? 1 << (channel - 1) : 0xffff;
+        if (midiKeyboardComponent->getMidiChannelsToDisplay() != channelMask)
+            midiKeyboardComponent->setMidiChannelsToDisplay (channelMask);
+        midiKeyboardComponent->refreshChops (processorRef.getChopState());
+    }
 }
 
 void AudioPluginAudioProcessorEditor::refreshFavoritesView()
@@ -8555,6 +8850,29 @@ void AudioPluginAudioProcessorEditor::timerCallback()
 
     if (! cue::shouldRunRealtimeUi (*this))
         return;
+
+    if (cuesampler::isFlOctaveShortcutAvailable())
+    {
+        const auto event = processorRef.getLatestHostMidiKeyEvent();
+        if (event != lastObservedHostMidiKeyEvent)
+        {
+            lastObservedHostMidiKeyEvent = event;
+            const int channel = (int) ((event >> 7) & 15u) + 1;
+            if (event != 0 && (! processorRef.isMidiBankModeEnabled() || channel == processorRef.getKeyboardMidiBank()))
+            {
+                const int current = processorRef.getKeyboardStartNote();
+                const int view = cuesampler::flTypingViewForNote (current, (int) (event & 127u));
+                if (view != current)
+                {
+                    processorRef.setMidiOctaveOffset (view / 12);
+                    syncMidiKeyboard();
+                }
+            }
+        }
+    }
+
+    if (midiKeyboardComponent != nullptr)
+        midiKeyboardComponent->refreshHostNotes (processorRef.getHeldHostMidiNotes());
 
     // Feed the CUE orb from the sampler output and transport state.
     if (cueOrbComponent != nullptr)
@@ -8609,11 +8927,16 @@ void AudioPluginAudioProcessorEditor::loadSampleFromFile()
 
     auto flags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
 
-    fileChooser->launchAsync (flags, [this] (const juce::FileChooser& fc)
+    fileChooser->launchAsync (flags, [safe = juce::Component::SafePointer<AudioPluginAudioProcessorEditor> (this)]
+                                   (const juce::FileChooser& fc)
     {
+        if (safe == nullptr) return;
         auto file = fc.getResult();
         if (file.existsAsFile())
-            cue::showSampleLoadError (processorRef.loadAudioFile (file), this);
+        {
+            cue::importSampleAsync (safe->processorRef, file, safe.getComponent());
+            safe->sampleImportOverlayComponent->refresh();
+        }
     });
 }
 
@@ -8673,7 +8996,9 @@ void AudioPluginAudioProcessorEditor::changeListenerCallback (juce::ChangeBroadc
         // Refresh favorite colours and playable/selected notes after edits,
         // restore, Undo, layer swaps and octave changes.
         if (editor->midiKeyboardComponent != nullptr)
-            editor->midiKeyboardComponent->refreshChops (processor.getChopState());
+        {
+            editor->syncMidiKeyboard();
+        }
     });
 }
 
@@ -8703,10 +9028,20 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
 
     // Chassis plate for the on-screen MIDI keyboard along the bottom strip.
     {
-        auto keyboardPanel = juce::Rectangle<float> (10.0f, 584.0f, fluidW - 20.0f, 68.0f);
+        auto keyboardPanel = juce::Rectangle<float> (10.0f, 584.0f, fluidW - 20.0f, 100.0f);
         juce::Path panelPath;
         panelPath.addRoundedRectangle (keyboardPanel, cue::mediumCorner);
         cue::fillGlassPath (g, panelPath, keyboardPanel);
+        g.setColour (cue::textMuted);
+        g.setFont (cue::monoFont (9.5f));
+        g.drawText ("KEYBOARD", juce::Rectangle<int> (20, 588, 84, 24), juce::Justification::centredLeft, false);
+        const int base = processorRef.getKeyboardStartNote();
+        const auto range = cuesampler::midiNoteName (base) + "  " + juce::String::charToString (0x2013) + "  "
+                         + cuesampler::midiNoteName (juce::jmin (127, base + 31));
+        g.setColour (cue::textFaint);
+        g.drawText (range, juce::Rectangle<int> (112, 588, 150, 24), juce::Justification::centredLeft, false);
+        g.setColour (cue::blackPanel);
+        g.fillRoundedRectangle (juce::Rectangle<float> (17.0f, 615.0f, fluidW - 34.0f, 66.0f), 2.0f);
     }
 
     // Section title: Syne brand face in the CUERACK accent-title voice.
@@ -8762,14 +9097,14 @@ void AudioPluginAudioProcessorEditor::resized()
     favoritesButton.setBounds (140, 82, 116, 22);
     waveformDisplayComponent->setBounds (10, 106, coreW, 316);
     favoritesViewComponent->setBounds (10, 106, coreW, 316);
+    sampleImportOverlayComponent->setBounds (10, 106, coreW, 316);
     transportSectionComponent->setBounds (10, 428, coreW, 148);
     waveformFooterComponent->setBounds (10, 428, coreW, 72);
     helpOverlayComponent->setBounds (10, 106, coreW, 470);
 
     if (midiKeyboardComponent != nullptr)
     {
-        midiKeyboardComponent->setKeyWidth ((float) (fluidW - 36) / 49.0f); // 49 white keys, C1..B7
-        midiKeyboardComponent->setBounds (18, 590, fluidW - 36, 56);
+        midiKeyboardComponent->setBounds (18, 616, fluidW - 36, 64);
     }
 
     // Update banner: centred strip near the top, drawn over the content. Sized

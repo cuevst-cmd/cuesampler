@@ -1,9 +1,11 @@
 #include "StemCache.h"
 #include "StemProcessingSettings.h"
+#include "Mp3AudioCodec.h"
 
 #include <juce_cryptography/juce_cryptography.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cmath>
 #include <limits>
@@ -21,13 +23,9 @@ namespace
 // Container magic + version. A version bump orphans every existing entry
 // instead of risking a misread of an older layout.
 constexpr char kMagic[4]   = { 'C', 'S', 'T', 'M' };
-constexpr juce::uint32 kContainerVersion = 2;
+constexpr juce::uint32 kContainerVersion = 3;
 
 constexpr const char* kEntryExtension = ".cuestems";
-
-// Integer audio clips floating-point overshoots and changes subtraction on
-// recall. Version 2 preserves every float, including peaks beyond full scale.
-constexpr int kStemBitsPerSample = 32;
 
 // Serializing a cache write against a concurrent prune keeps a store from
 // being deleted by the trim it just triggered.
@@ -94,32 +92,10 @@ private:
     juce::int64 position = 0;
 };
 
-bool encodeStem (const juce::AudioBuffer<float>& buffer, double sampleRate, juce::MemoryBlock& out)
+bool encodeStem (const juce::AudioBuffer<float>& buffer, double sampleRate,
+                 juce::MemoryBlock& out, Mp3AudioCodec::EncodedInfo& info)
 {
-    out.reset();
-
-    const auto numChannels = buffer.getNumChannels();
-    const auto numSamples  = buffer.getNumSamples();
-    if (numChannels <= 0 || numSamples <= 0 || sampleRate <= 0.0)
-        return false;
-
-    juce::WavAudioFormat wav;
-    std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::MemoryOutputStream> (out, false);
-    const auto options = juce::AudioFormatWriterOptions()
-                             .withSampleRate (sampleRate)
-                             .withNumChannels (numChannels)
-                             .withBitsPerSample (kStemBitsPerSample)
-                             .withSampleFormat (juce::AudioFormatWriterOptions::SampleFormat::floatingPoint);
-
-    auto writer = wav.createWriterFor (stream, options);
-    if (writer == nullptr)
-        return false;
-
-    if (! writer->writeFromAudioSampleBuffer (buffer, 0, numSamples))
-        return false;
-
-    writer.reset(); // flushes and closes the stream before we inspect 'out'
-    return out.getSize() > 0;
+    return Mp3AudioCodec::encode (buffer, sampleRate, out, &info);
 }
 
 // Decodes one stem, which must describe exactly the shape the container header
@@ -127,25 +103,29 @@ bool encodeStem (const juce::AudioBuffer<float>& buffer, double sampleRate, juce
 // us into an enormous buffer.
 bool decodeStem (const juce::MemoryBlock& data,
                  int expectedChannels,
-                 int expectedSamples, double expectedRate, bool legacy,
+                 int expectedSamples, double expectedRate, juce::uint32 version,
                  juce::AudioBuffer<float>& out)
 {
     if (data.getSize() == 0 || expectedChannels <= 0 || expectedSamples <= 0)
         return false;
 
+    if (version == 3)
+        return Mp3AudioCodec::decode (data, expectedRate, expectedChannels, expectedSamples, out);
+
     juce::FlacAudioFormat flac;
     juce::WavAudioFormat wav;
-    juce::AudioFormat& format = legacy ? static_cast<juce::AudioFormat&> (flac)
-                                      : static_cast<juce::AudioFormat&> (wav);
     // A float WAV must contain at least this many PCM bytes. Reject forged
     // dimensions before allocation, even when its header claims to match.
-    if (! legacy && (juce::uint64) expectedChannels * (juce::uint64) expectedSamples * 4 > data.getSize())
+    if (version == 2 && (juce::uint64) expectedChannels * (juce::uint64) expectedSamples * 4 > data.getSize())
         return false;
-    auto reader = std::unique_ptr<juce::AudioFormatReader> (
-        format.createReaderFor (new juce::MemoryInputStream (data, false), true));
-
-    if (reader == nullptr
-        || (int) reader->numChannels != expectedChannels
+    std::unique_ptr<juce::AudioFormatReader> reader;
+    if (version == 1)
+        reader.reset (flac.createReaderFor (new juce::MemoryInputStream (data, false), true));
+    else if (version == 2)
+        reader.reset (wav.createReaderFor (new juce::MemoryInputStream (data, false), true));
+    if (reader == nullptr)
+        return false;
+    if ((int) reader->numChannels != expectedChannels
         || reader->lengthInSamples != (juce::int64) expectedSamples
         || reader->sampleRate != expectedRate)
         return false;
@@ -257,7 +237,7 @@ bool StemCache::decode (const juce::MemoryBlock& data, Entry& result)
     if (input.read (magic, 4) != 4 || std::memcmp (magic, kMagic, 4) != 0)
         return false;
     const auto version = (juce::uint32) input.readInt();
-    if (version != 1 && version != kContainerVersion)
+    if (version < 1 || version > kContainerVersion)
         return false;
     const auto sampleRate = input.readDouble();
     const auto numChannels = input.readInt();
@@ -278,7 +258,7 @@ bool StemCache::decode (const juce::MemoryBlock& data, Entry& result)
             return false;
         juce::MemoryBlock encoded ((size_t) byteLength);
         if (input.read (encoded.getData(), (int) byteLength) != byteLength
-            || ! decodeStem (encoded, numChannels, numSamples, sampleRate, version == 1, *target))
+            || ! decodeStem (encoded, numChannels, numSamples, sampleRate, version, *target))
             return false;
     }
     if (! input.isExhausted())
@@ -300,17 +280,31 @@ bool StemCache::encode (const Entry& entry, juce::MemoryBlock& result)
         if (stem->getNumChannels() != channels || stem->getNumSamples() != samples)
             return false;
 
+    std::array<juce::MemoryBlock, 3> encodedStems;
+    std::array<Mp3AudioCodec::EncodedInfo, 3> encodedInfo;
+    int index = 0;
+    for (const auto* stem : { &entry.drums, &entry.bass, &entry.vocals })
+    {
+        if (! encodeStem (*stem, entry.sampleRate, encodedStems[(size_t) index], encodedInfo[(size_t) index]))
+            return false;
+        ++index;
+    }
+
+    const auto& shape = encodedInfo.front();
+    if (shape.channels < 1 || shape.channels > 2 || shape.samples <= 0 || shape.samples > std::numeric_limits<int>::max())
+        return false;
+    for (const auto& info : encodedInfo)
+        if (info.channels != shape.channels || info.samples != shape.samples || info.sampleRate != shape.sampleRate)
+            return false;
+
     juce::MemoryOutputStream output (result, false);
     output.write (kMagic, 4);
     output.writeInt ((int) kContainerVersion);
-    output.writeDouble (entry.sampleRate);
-    output.writeInt (channels);
-    output.writeInt (samples);
-    for (const auto* stem : { &entry.drums, &entry.bass, &entry.vocals })
+    output.writeDouble (shape.sampleRate);
+    output.writeInt (shape.channels);
+    output.writeInt ((int) shape.samples);
+    for (const auto& encoded : encodedStems)
     {
-        juce::MemoryBlock encoded;
-        if (! encodeStem (*stem, entry.sampleRate, encoded))
-            return false;
         output.writeInt64 ((juce::int64) encoded.getSize());
         output.write (encoded.getData(), encoded.getSize());
     }
