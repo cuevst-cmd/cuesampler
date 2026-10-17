@@ -2429,7 +2429,7 @@ public:
         // Orb placement: 14px gap + 56px body + 10px version gap.
         g.setColour (textMuted);
         g.setFont (monoFont (9.0f));
-        g.drawText ("v" + juce::String (CUE_VERSION_STRING),
+        g.drawText ("v" + juce::String (CUE_VERSION_DISPLAY),
                     juce::Rectangle<int> ((int) std::round (logoX + lockupW + 80.0f), 24,
                                           70, 16),
                     juce::Justification::centredLeft, false);

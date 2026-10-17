@@ -6,7 +6,13 @@ cmake_minimum_required(VERSION 3.22)
 # `project()` command. `project()` sets up some helpful variables that describe source/binary
 # directories, and the current project version. This is a standard CMake command.
 
-project(CueSampler VERSION 1.1.0)
+project(CueSampler VERSION 1.10.0)
+# Keep host/update metadata fully qualified; show the requested short release
+# label for a zero-patch release (for example, 1.10 rather than 1.10.0).
+set(CUE_VERSION_DISPLAY "${PROJECT_VERSION}")
+if(PROJECT_VERSION_PATCH EQUAL 0)
+    set(CUE_VERSION_DISPLAY "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}")
+endif()
 include(FetchContent)
 find_package(Git REQUIRED)
 
@@ -276,7 +282,8 @@ target_compile_definitions(CueSampler
         JUCE_VST3_CAN_REPLACE_VST2=0
         # Running version for the in-app update checker (compared against the
         # newest GitHub Release). Single source of truth: project(... VERSION).
-        CUE_VERSION_STRING="${PROJECT_VERSION}")
+        CUE_VERSION_STRING="${PROJECT_VERSION}"
+        CUE_VERSION_DISPLAY="${CUE_VERSION_DISPLAY}")
 
 # If your target needs extra binary assets, you can add them here. The first argument is the name of
 # a new static library target that will include all the binary resources. There is an optional
