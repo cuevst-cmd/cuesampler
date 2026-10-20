@@ -1309,6 +1309,27 @@ struct CueSamplerStateTests
             const int index = state->midiMap.channelNoteToChopIndex[(size_t) (channel - 1)][(size_t) note];
             return index >= 0 && (size_t) index < state->chops.size() ? state->chops[(size_t) index].id : -1;
         };
+        const auto windowIsContiguous = [] (const P& processor)
+        {
+            const auto state = processor.getChopState();
+            std::vector<const P::ChopDefinition*> order;
+            for (const auto& chop : state->chops) order.push_back (&chop);
+            std::sort (order.begin(), order.end(), [] (const auto* a, const auto* b)
+            {
+                if (a->startSample != b->startSample) return a->startSample < b->startSample;
+                if (a->endSample != b->endSample) return a->endSample < b->endSample;
+                return a->id < b->id;
+            });
+            bool contiguous = state->midiWindowStart >= 0
+                && state->midiWindowStart <= juce::jmax (0, (int) order.size() - 56);
+            for (int slot = 0; slot < 56; ++slot)
+            {
+                const int ordinal = state->midiWindowStart + slot;
+                const int expected = ordinal >= 0 && ordinal < (int) order.size() ? order[(size_t) ordinal]->id : -1;
+                contiguous &= state->midiWindowChopIds[(size_t) slot] == expected;
+            }
+            return contiguous;
+        };
         P p; setup (p);
         const auto source = p.getLoadedSample();
         for (const int count : { 0, 1, 55, 56, 57, 220 })
@@ -1436,6 +1457,70 @@ struct CueSamplerStateTests
         check (recalled.getMidiNoteForChopId (idFor (0)) == 84 && recalled.getMidiNoteForChopId (idFor (1)) == -1,
                "opting out of performance mapping restores the original explicit and unassigned legacy notes");
 
+        // Compress grid time so 1/2/4/8 bars yield 512/256/128/64 chops in
+        // the existing eight-second source. This exercises full windows at
+        // every bars setting without a multi-minute audio fixture.
+        const auto fastGridAnalysis = []
+        {
+            auto analysis = std::make_shared<P::TempoAnalysisData>();
+            analysis->estimatedBpm = 15360; analysis->beatPeriodSeconds = 0.00390625;
+            analysis->analysisEndSeconds = 8;
+            return analysis;
+        };
+        {
+            P bars; setup (bars); bars.chopBarsCount.store (1);
+            const auto analysis = fastGridAnalysis(); std::atomic_store (&bars.tempoAnalysis, analysis);
+            bars.publishChopState (std::make_shared<P::ChopState>()); bars.buildChopsFromAnalysis (*analysis);
+            bars.setMidiPerformanceMode (Mode::Window); bars.setMidiWindowStart (200);
+            for (const int nextBars : { 8, 4, 2, 1, 4, 8, 1, 2, 8 })
+            {
+                if (bars.getMidiWindowStart() == 0) bars.setMidiWindowStart (20);
+                bars.setChopBarsCount (nextBars);
+                const auto after = bars.getChopState();
+                bool midiMatches = bars.getMappedMidiNotes().count() == 56 && idAt (bars, 47) == -1 && idAt (bars, 104) == -1;
+                for (int slot = 0; slot < 56; ++slot)
+                    midiMatches &= idAt (bars, 48 + slot) == after->chops[(size_t) slot].id;
+                check (bars.getChopBarsCount() == nextBars && (int) after->chops.size() == 512 / nextBars
+                       && bars.getMidiWindowStart() == 0 && windowIsContiguous (bars) && midiMatches,
+                       "switching 1/2/4/8 bars starts the full consecutive C4-G8 Window again at chop 1");
+            }
+            const auto beforeUndo = bars.getChopState();
+            bars.setChopBarsCount (1); bars.undoLastEdit();
+            check (bars.getChopBarsCount() == 8 && bars.getChopState()->midiWindowChopIds == beforeUndo->midiWindowChopIds
+                   && windowIsContiguous (bars), "one Undo restores the bars setting and its exact prior Window bindings");
+            bars.setMidiMappingLocked (true);
+            const auto locked = bars.getChopState(); bars.setChopBarsCount (1);
+            check (bars.getChopBarsCount() == 8 && bars.getChopState() == locked, "MIDI Lock blocks bar changes without touching Window notes");
+            juce::MemoryBlock savedBars; bars.getStateInformation (savedBars);
+            P restoredBars; restoredBars.setStateInformation (savedBars.getData(), (int) savedBars.getSize());
+            check (waitFor ([&] { return restored (restoredBars); }) && restoredBars.getChopBarsCount() == 8
+                   && restoredBars.isMidiMappingLocked() && restoredBars.getMidiPerformanceMode() == Mode::Window
+                   && restoredBars.getChopState()->midiWindowChopIds == locked->midiWindowChopIds && windowIsContiguous (restoredBars),
+                   "project recall retains the rebuilt contiguous Window, bars and MIDI Lock");
+        }
+        {
+            P overflow; setup (overflow); overflow.chopBarsCount.store (1);
+            const auto analysis = fastGridAnalysis(); std::atomic_store (&overflow.tempoAnalysis, analysis);
+            overflow.publishChopState (std::make_shared<P::ChopState>()); overflow.buildChopsFromAnalysis (*analysis);
+            overflow.setMidiPerformanceMode (Mode::Window); overflow.setMidiWindowStart (56);
+            const auto initial = overflow.getChopState();
+            for (int ordinal = 0; ordinal < 57; ++ordinal)
+            {
+                overflow.selectChopById (initial->chops[(size_t) ordinal].id); overflow.toggleSelectedChopFavorite();
+            }
+            overflow.setChopBarsCount (8);
+            const auto merged = overflow.getChopState();
+            const auto overflowChild = std::find_if (merged->chops.begin(), merged->chops.end(),
+                [] (const auto& c) { return c.startSample == 7000 && c.endSample == 8000; });
+            check (overflowChild != merged->chops.end() && overflowChild->favorite && overflowChild->favoriteOrder == 57
+                   && merged->favoriteMidiHighWater == 56 && windowIsContiguous (overflow),
+                   "Window rebuilding cannot steal the descendant or bookmark of an overflow favorite");
+            overflow.setMidiPerformanceMode (Mode::Favorites);
+            check (overflowChild != merged->chops.end() && overflow.getMidiNoteForChopId (overflowChild->id) == -1
+                   && overflow.getChopState()->favoriteMidiHighWater == 56,
+                   "an overflow bookmark remains unassigned after regrid instead of taking an existing Favorite slot");
+        }
+
         {
             P regrid; setup (regrid); regrid.chopBarsCount.store (1);
             auto original = std::make_shared<P::ChopState>();
@@ -1458,16 +1543,16 @@ struct CueSamplerStateTests
             const auto firstChild = std::find_if (split->chops.begin(), split->chops.end(),
                 [splitFirst] (const auto& c) { return c.id == splitFirst; });
             check (firstChild != split->chops.end() && firstChild->startSample == 8000 && firstChild->endSample == 16000
-                   && splitFirst != splitSecond && split->midiWindowChopIds[0] == splitFirst
+                   && splitFirst != splitSecond && windowIsContiguous (regrid)
                    && firstChild->favorite && firstChild->favoriteOrder == 1 && split->favoriteChopIndices.size() == 2
                    && split->favoriteMidiOwnerIds[2] == 303 && idAt (regrid, 50) == -1,
-                   "split regrid follows the owner's cue once, shares Window identity and retains deleted-owner gaps");
+                   "split regrid preserves Favorite cue ownership and gaps while rebuilding the inactive Window consecutively");
             analysis.estimatedBpm = 60; analysis.beatPeriodSeconds = 1.0;
             regrid.buildChopsFromAnalysis (analysis);
             const auto merged = regrid.getChopState();
             check (idAt (regrid, 48) >= 0 && idAt (regrid, 49) == -1 && idAt (regrid, 50) == -1
                    && merged->favoriteMidiOwnerIds[1] == splitSecond && merged->favoriteMidiOwnerIds[2] == 303
-                   && merged->midiWindowChopIds[0] == idAt (regrid, 48) && regrid.getMappedMidiNotes().count() == 1
+                   && windowIsContiguous (regrid) && regrid.getMappedMidiNotes().count() == 1
                    && merged->favoriteChopIndices.size() == 1,
                    "merge regrid gives one descendant to the first slot and preserves unresolved owners without duplicate notes");
             analysis.estimatedBpm = 240; analysis.beatPeriodSeconds = 0.25;
@@ -1475,6 +1560,10 @@ struct CueSamplerStateTests
             check (regrid.getChopState()->favoriteMidiOwnerIds[1] == splitSecond
                    && regrid.getChopState()->favoriteMidiOwnerIds[2] == 303 && idAt (regrid, 49) == -1 && idAt (regrid, 50) == -1,
                    "later regrids cannot assign unrelated nearby audio to unresolved reservations");
+            regrid.setMidiPerformanceMode (Mode::Window);
+            check (windowIsContiguous (regrid) && regrid.getMappedMidiNotes().count() == regrid.getChopState()->chops.size()
+                   && idAt (regrid, 48) == regrid.getChopState()->chops[0].id,
+                   "returning from Favorites activates the freshly rebuilt consecutive Window rather than scattered old descendants");
         }
 
         P ui; std::atomic_store (&ui.loadedSample, std::const_pointer_cast<P::LoadedSampleData> (source));

@@ -431,8 +431,9 @@ bool samePerformanceLayout (const PerformanceState& a, const PerformanceState& b
 void transferPerformanceOwners (const PerformanceState& old, PerformanceState& next)
 {
     copyPerformanceLayout (old, next);
-    // Build one shared one-to-one correspondence for Window and Favorites,
-    // including inactive favorite reservations. No nearest-audio fallback.
+    // Preserve Favorites one-to-one, including inactive reservations. Window
+    // is rebuilt independently below: preserving its individual old owners
+    // scatters a split grid and leaves silent slots after a merge.
     std::vector<std::pair<int, int>> replacements;
     std::vector<bool> claimed (next.chops.size(), false);
     const auto transfer = [&] (int oldId)
@@ -469,9 +470,10 @@ void transferPerformanceOwners (const PerformanceState& old, PerformanceState& n
         return replacement;
     };
     // Favorite slots have deterministic priority on merges, in recorded-note
-    // order. Window owners then use the remaining descendants.
+    // order. Preserve the old transfer behavior for legacy saved layouts.
     for (auto& id : next.favoriteMidiOwnerIds) id = transfer (id);
-    for (auto& id : next.midiWindowChopIds) id = transfer (id);
+    if (! isPerformanceMode (old.midiPerformanceMode))
+        for (auto& id : next.midiWindowChopIds) id = transfer (id);
     if (isPerformanceMode (old.midiPerformanceMode))
     {
         // Grid settings inheritance is intentionally many-to-one, but a
@@ -498,6 +500,10 @@ void transferPerformanceOwners (const PerformanceState& old, PerformanceState& n
                     break;
                 }
         }
+        // An intentional global regrid starts Window at chop 1, including the
+        // dormant Window while Favorites is active. Window must not claim
+        // descendants before overflow favorite bookmarks have transferred.
+        commitPerformanceWindow (next, 0);
     }
 }
 

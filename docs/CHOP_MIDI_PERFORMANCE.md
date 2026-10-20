@@ -71,6 +71,13 @@ actual assigned pads, even if they are no longer consecutive. Moving the Window
 again explicitly selects a fresh consecutive range and replaces those bindings.
 Keep the slot bindings on unlock; unlocking alone must not apply a new range.
 
+An explicit global regrid (including 1 / 2 / 4 / 8 bars per chop) creates a new
+set of chops. Reset Window to a consecutive range starting at chop 1 and C4.
+Do this even while Favorites controls MIDI, so returning to Window
+finds a usable range. Window slots do not compete with Favorites for descendants.
+One Undo restores both the old grid and its exact assignments. MIDI Lock blocks
+the regrid. Ordinary chop edits and project recall retain their saved bindings.
+
 The outline represents the full laptop range across FL OCT settings. A separate,
 subtle indication may show the smaller range reachable at the current octave;
 do not imply that 56 notes can all be played from one unchanged typing octave.
@@ -142,11 +149,12 @@ and legacy Favorites mapping. Opening an old project must not opt it into the
 new layout or change its recorded notes. New Window / Favorites modes override
 the derived map without destroying those legacy assignments.
 
-Regridding currently creates new chop IDs and can duplicate favorite metadata
-across split children. Transfer performance slots separately, one-to-one: a
-split follows the old cue point; a merge keeps one deterministic owner and
-leaves other slots empty. Never fill an unresolved slot with unrelated nearby
-audio. Ordinary boundary / cue edits intentionally change that chop's sound.
+Regridding creates new chop IDs. Transfer Favorites reservations and bookmarks
+one-to-one: a split follows the old cue point; a merge keeps one deterministic
+owner and leaves other favorite slots empty. Never fill an unresolved favorite
+slot with unrelated nearby audio or duplicate a favorite across split children.
+Rebuild Window independently as described above. Ordinary boundary / cue edits
+intentionally change that chop's sound.
 
 ## Validation before installation
 
@@ -158,6 +166,8 @@ audio. Ordinary boundary / cue edits intentionally change that chop's sound.
 - Lock behavior, one-step drag undo, both chop layers and save / reopen.
 - Legacy root / explicit-note / channel-bank / Favorites project recall.
 - Split / merge ownership without duplicate or unrelated slot assignments.
+- Repeated 1 / 2 / 4 / 8 bar changes keep Window consecutive, including a moved
+  range resetting to chop 1, fewer than 56 chops, inactive Window, Undo and recall.
 - Pad outlines, drag hit targets and readable numbers in both themes at the
   existing plugin height.
 - Exactly two selector options, safe double-tap favorite edits, persistent pink

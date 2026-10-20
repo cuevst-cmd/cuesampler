@@ -22,6 +22,13 @@ The user performs the FL Studio portion; automated checks do not control the DAW
 - [ ] Drag the Window handle in the pad header. The cyan range previews whole
       chops, without audition or MIDI remapping. Release to commit. One Undo
       restores the previous assignments. The final range reaches the last chop.
+- [ ] Switch repeatedly between 1 / 2 / 4 / 8 bars. Window maps consecutive pads
+      from C4 with no holes or every-eighth-pad pattern. A moved Window resets to
+      chop 1, covering the first 56 chops or all available chops when fewer exist.
+      One Undo restores the old bars and exact map; save/reopen retains the result.
+- [ ] Repeat bar changes while Favorites is active. Favorites retains its
+      cue-following slots and reserved gaps; returning to Window shows a consecutive
+      range. MIDI Lock blocks bar changes in either mode.
 - [ ] Favorite chops 1 and 200 in that order. Open Favorites and choose USE FOR
       MIDI: C4 plays chop 1 and C#4 plays chop 200. Record the pattern in FL.
 - [ ] Return to the waveform and audition outside pads. The recorded Favorites

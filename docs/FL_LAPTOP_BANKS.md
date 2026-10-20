@@ -12,6 +12,11 @@ animate on the UI thread and settle when idle. Drag the Window handle in the pad
 to preview another consecutive range; release to commit it. This changes which
 chops existing MIDI notes play. One Undo restores the previous map.
 
+Changing **1 / 2 / 4 / 8 bars** resets Window to a consecutive range starting at
+chop 1 and C4. Shorter samples map every available chop.
+This also refreshes the stored Window while Favorites is active; Favorites keeps
+its separate fixed slots and gaps. One Undo restores the old bars and map.
+
 In FL Studio on macOS, **FL OCT -/+** controls the Standard Piano typing octave
 within C2-C6. Release typing keys before changing OCT. A blocked request leaves
 the octave unchanged. The installed Piano layout spans 32 chromatic notes;
