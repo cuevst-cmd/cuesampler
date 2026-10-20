@@ -22,7 +22,8 @@ class StemRackComponent;
 class StartKnobComponent;
 class UpdateBannerComponent;
 class InitialLoadOverlayComponent;
-class GlassKeyboard;
+class ChopPadGridComponent;
+class ChopMidiControlsComponent;
 }
 
 //==============================================================================
@@ -56,8 +57,8 @@ private:
     void toggleTheme();
     void applyThemeToUi();
     void refreshFavoritesView();
-    void syncMidiKeyboard();
-    int lastKeyboardBase = 0;
+    void syncChopPads();
+    int getPadPanelHeight() const noexcept;
     uint32_t lastObservedHostMidiKeyEvent = 0;
     AudioPluginAudioProcessor& processorRef;
     std::unique_ptr<juce::PropertiesFile> uiSettingsFile;
@@ -78,7 +79,8 @@ private:
     std::unique_ptr<cue::WarpHelpOverlayComponent> warpHelpOverlayComponent;
     std::unique_ptr<cue::UpdateBannerComponent> updateBannerComponent;
     std::unique_ptr<cue::InitialLoadOverlayComponent> initialLoadOverlayComponent;
-    std::unique_ptr<cue::GlassKeyboard> midiKeyboardComponent;
+    std::unique_ptr<cue::ChopPadGridComponent> chopPadGridComponent;
+    std::unique_ptr<cue::ChopMidiControlsComponent> chopMidiControlsComponent;
     std::unique_ptr<cue::VisualizerOrb> cueOrbComponent;
     std::unique_ptr<juce::FileChooser> fileChooser;
 

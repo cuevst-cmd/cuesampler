@@ -100,6 +100,10 @@ public:
 
     using ChopWarpMarker = cuesampler::ChopWarpMarker;
 
+    enum class MidiPerformanceMode : int { Legacy = 0, Window, Favorites, LegacyFavorites };
+    static constexpr int performanceMidiRoot = 48; // FL C4, available immediately at FL's default typing octave.
+    static constexpr int performanceMidiCapacity = 56; // C4 through G8, within the current laptop octave range.
+
     struct ChopDefinition
     {
         int id = 0;
@@ -160,6 +164,22 @@ public:
         int selectedChopId = -1;
         int nextChopId = 1;
         std::vector<ChopDefinition> chops;
+        MidiPerformanceMode midiPerformanceMode = MidiPerformanceMode::Legacy;
+        bool midiMappingLocked = false;
+        int midiWindowStart = 0;
+        bool midiWindowInitialized = false;
+        std::array<int, performanceMidiCapacity> midiWindowChopIds = []
+        {
+            std::array<int, performanceMidiCapacity> ids; ids.fill (-1); return ids;
+        }();
+        // Reservations survive unfavoriting/deletion. A missing owner leaves a
+        // silent slot; additions append at the high-water mark instead of filling gaps.
+        std::array<int, performanceMidiCapacity> favoriteMidiOwnerIds = []
+        {
+            std::array<int, performanceMidiCapacity> ids; ids.fill (-1); return ids;
+        }();
+        int favoriteMidiHighWater = 0;
+        bool favoriteMidiSlotsInitialized = false;
         // Derived, never edited by hand, never serialized. Rebuilt by
         // publishChopState() on the way in — that is the only correct way to
         // install a new chop set.
@@ -230,6 +250,9 @@ public:
     // Mouse auditions retrigger the selected chop and latch its playback mode.
     // Releasing the mouse leaves a One Shot running to its boundary.
     void startChopPreview() noexcept;
+    // Direct pad auditions resolve a stable chop ID without changing selection
+    // or depending on MIDI availability / Favorites filtering. Invalid IDs do not start playback.
+    void startChopPreview (int chopId) noexcept;
     void releaseChopPreview() noexcept;
     void pausePlayback() noexcept;
     void stopPlayback() noexcept;
@@ -275,6 +298,14 @@ public:
     int getKeyboardMidiBank() const noexcept { return keyboardMidiBank.load (std::memory_order_acquire); }
     int getMidiBankCount() const noexcept;
     int getAvailableMidiBankCount() const noexcept; // UI ranges; legacy channel aliases remain intact
+    MidiPerformanceMode getMidiPerformanceMode() const noexcept;
+    bool isMidiMappingLocked() const noexcept;
+    int getMidiWindowStart() const noexcept;
+    bool setMidiPerformanceMode (MidiPerformanceMode mode);
+    // Explicit UI range commits can also adopt Window mode atomically in one undo step.
+    bool setMidiWindowStart (int ordinalZeroBased, bool activateWindow = false);
+    void setMidiMappingLocked (bool locked);
+    bool resetFavoriteMidiLayout(); // explicit, undoable repack; unavailable while locked
 
     // Every on-screen note that will trigger something, for lighting the
     // keyboard. Bit n set == note n plays a chop.
@@ -315,6 +346,8 @@ public:
 
     bool isPlaying() const noexcept;
     double getPlaybackSamplePosition() const noexcept;
+    // Audio-thread observation; -1 while stopped or playing without a chop binding.
+    int getPlayingChopId() const noexcept;
     int getLastTriggeredChopId() const noexcept;
     uint64_t getChopTriggerRevision() const noexcept;
     float getOutputMeterLevel() const noexcept;
@@ -891,7 +924,7 @@ private:
     double lastWarmHostRate    = 0.0;
     std::shared_ptr<const VoicePitchEngineSet> pitchEngineSet;
 
-    void startPlaybackInternal (bool mousePreview) noexcept;
+    void startPlaybackInternal (bool mousePreview, int targetChopId = -1) noexcept;
 
     enum class TransportCommand : int
     {
@@ -974,6 +1007,7 @@ private:
     std::atomic<double> hostSampleRate { 44100.0 };
     std::atomic<double> playbackSamplePosition { 0.0 };
     std::atomic<bool> playbackActive { false };
+    std::atomic<int> activePlaybackChopId { -1 };
     std::atomic<int> lastTriggeredChopId { -1 };
     std::atomic<uint64_t> chopTriggerRevision { 0 };
     std::atomic<float> outputMeterLevel { 0.0f };

@@ -10,6 +10,7 @@
 #include "WaveformColourAnalysis.h"
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <juce_audio_utils/juce_audio_utils.h>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -81,6 +82,13 @@ juce::Component* findType (juce::Component& parent, const juce::String& name)
     if (juce::String (typeid (parent).name()).contains (name)) return &parent;
     for (auto* child : parent.getChildren())
         if (auto* found = findType (*child, name)) return found;
+    return nullptr;
+}
+juce::Component* findComponentId (juce::Component& parent, const juce::String& id)
+{
+    if (parent.getComponentID() == id) return &parent;
+    for (auto* child : parent.getChildren())
+        if (auto* found = findComponentId (*child, id)) return found;
     return nullptr;
 }
 }
@@ -803,6 +811,7 @@ struct CueSamplerStateTests
         layout->nextChopId = 3; layout->selectedChopId = 1;
         p.publishChopState (layout);
         p.setFavoritesViewEnabled (true);
+        p.setMidiPerformanceMode (P::MidiPerformanceMode::LegacyFavorites);
         std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
         // The console harness has no NSApplication event loop for the GL orb.
         if (auto* orb = findType (*editor, "VisualizerOrb")) orb->setVisible (false);
@@ -878,6 +887,7 @@ struct CueSamplerStateTests
         navigation->chops = { early, late, plain };
         navigation->nextChopId = 101; navigation->selectedChopId = 73;
         p.publishChopState (navigation);
+        p.setMidiPerformanceMode (P::MidiPerformanceMode::LegacyFavorites);
         p.editChangeBroadcaster.sendChangeMessage();
         auto* editFavorite = findButton (*editor, "EDIT CHOP");
         check (editFavorite != nullptr && editFavorite->isVisible() && editFavorite->isEnabled(),
@@ -900,8 +910,8 @@ struct CueSamplerStateTests
                "Edit Chop immediately frames both edges of an offscreen favorite");
         check (p.getChopState()->favoriteChopIndices == std::vector<int> { 1, 0 }
                && std::abs (p.getChopState()->chops[1].getCueNormalized() - 0.3) < 0.0001
-               && p.getMidiNoteForChopId (73) == 84,
-               "Edit Chop preserves favorites and cue values and restores the normal MIDI mapping");
+               && p.getMidiNoteForChopId (73) == 48,
+               "Edit Chop preserves favorites, cue values and the independently selected MIDI mapping");
         for (int i = 0; i < 10; ++i) pump();
         check (p.getChopState()->selectedChopId == 73,
                "a previous pad trigger cannot redirect the editing selection");
@@ -912,8 +922,8 @@ struct CueSamplerStateTests
         p.setFavoritesViewEnabled (true);
         check (waitFor ([&] { return view->isVisible(); }), "favorites can be reopened after editing");
         p.selectChopById (100);
-        check (p.getChopState()->selectedChopId == 73 && editFavorite->isEnabled(),
-               "Favorites keeps Edit Chop attached to its valid fallback selection");
+        check (waitFor ([&] { return ! editFavorite->isEnabled(); }) && p.getChopState()->selectedChopId == 100,
+               "Favorites preserves an outside selection and disables Edit Chop for that nonfavorite");
         p.selectChopById (10);
         check (waitFor ([&] { return editFavorite->isEnabled(); }), "Edit Chop follows selection changes");
         p.publishChopState (std::make_shared<P::ChopState>());
@@ -965,6 +975,7 @@ struct CueSamplerStateTests
         for (auto mode : { P::ChopPlaybackMode::Gate, P::ChopPlaybackMode::OneShot })
         {
             p.setChopPlaybackMode (mode);
+            p.setMidiPerformanceMode (P::MidiPerformanceMode::Legacy);
             button->onClick();
             const auto currentState = p.getChopState();
             const auto& hostMap = currentState->midiMap.noteToChopIndex;
@@ -972,8 +983,9 @@ struct CueSamplerStateTests
             midi.addEvent (juce::MidiMessage::noteOn (1, heldNote, (juce::uint8) 100), 0);
             render();
             button->onClick();
+            p.setMidiPerformanceMode (P::MidiPerformanceMode::LegacyFavorites);
             check (render() > 0.001f && p.voice.activeChopId == 1,
-                   "entering Favorites preserves the sounding MIDI chop despite remapping");
+                   "explicit Favorites MIDI activation preserves the already sounding chop");
             midi.addEvent (juce::MidiMessage::noteOff (1, heldNote), 0);
             for (int block = 0; block < 20; ++block) render();
             check (mode == P::ChopPlaybackMode::OneShot ? p.isPlaying() : ! p.isPlaying(),
@@ -1051,7 +1063,7 @@ struct CueSamplerStateTests
                 output.release();
                 check (writer->writeFromAudioSampleBuffer (signal, 0, rate), "write WAV import fixture");
                 delete writer;
-                // A replacement sample starts a fresh C2 layout, even after
+                // A replacement sample starts a fresh C4 Window, even after
                 // opening a project that retained its historical C4 mapping.
                 p.recordedMidiRoot.store (48); p.setMidiBankModeEnabled (false); p.setMidiOctaveOffset (7);
                 std::cout << "IMPORT " << rate << " Hz / " << channels << " channels" << std::endl;
@@ -1059,9 +1071,10 @@ struct CueSamplerStateTests
                 for (int i = 0; i < 10; ++i) pump();
                 check (p.getLoadedSample() != nullptr && p.getLoadedSample()->buffer.getNumSamples() == rate,
                        "import publishes the complete source for UI and playback");
-                check (p.getMidiRootNote() == 24 && p.getKeyboardStartNote() == 24 && p.isMidiBankModeEnabled()
-                       && p.getKeyboardMidiBank() == 1,
-                       "new import resets old project mapping to C2 with automatic full-range MIDI banks");
+                check (p.getMidiRootNote() == 24 && p.getKeyboardStartNote() == 48
+                       && p.getMidiPerformanceMode() == P::MidiPerformanceMode::Window
+                       && p.getChopState()->midiMap.rootNote == 48 && p.getKeyboardMidiBank() == 1,
+                       "new import starts a C4 Window independently of retained legacy root settings");
                 juce::AudioBuffer<float> audio (2, 128);
                 juce::MidiBuffer midi;
                 p.startPlayback(); p.processBlock (audio, midi);
@@ -1106,9 +1119,10 @@ struct CueSamplerStateTests
         check (waitFor ([&] { return completed; }), "async import completes on the message thread");
         check (! supersededCompleted && p.getLoadedSample()->sourceFile.getFileName() == "import-48000-2.wav",
                "latest import wins over a superseded request");
-        check (p.getMidiRootNote() == 24 && p.getKeyboardStartNote() == 24 && p.isMidiBankModeEnabled()
-               && p.getKeyboardMidiBank() == 1,
-               "successful async replacement starts at C2 with automatic MIDI ranges");
+        check (p.getMidiRootNote() == 24 && p.getKeyboardStartNote() == 48
+               && p.getMidiPerformanceMode() == P::MidiPerformanceMode::Window
+               && p.getChopState()->midiMap.rootNote == 48 && p.getKeyboardMidiBank() == 1,
+               "successful async replacement starts a C4 Window");
         check (p.getSampleImportStatus() == nullptr, "successful import clears its loading state");
 
         // Drop a replacement onto the actual loading panel, including an
@@ -1193,9 +1207,10 @@ struct CueSamplerStateTests
         p.loadAudioFileAsync (removable, {});
         check (waitFor ([&] { return p.getSampleImportStatus() == nullptr; }),
                "sample is ready while persistence compression is blocked");
-        check (p.getMidiRootNote() == 24 && p.getKeyboardStartNote() == 24 && p.isMidiBankModeEnabled()
-               && p.getKeyboardMidiBank() == 1,
-               "replacement after legacy project recall resets the layout to C2");
+        check (p.getMidiRootNote() == 24 && p.getKeyboardStartNote() == 48
+               && p.getMidiPerformanceMode() == P::MidiPerformanceMode::Window
+               && p.getChopState()->midiMap.rootNote == 48 && p.getKeyboardMidiBank() == 1,
+               "replacement after legacy project recall starts a fresh C4 Window");
         const auto fastSample = std::atomic_load (&p.loadedSample);
         const auto snapshot = fastSample->getSerializedStateData();
         check (snapshot.getBinaryData() != nullptr
@@ -1269,6 +1284,591 @@ struct CueSamplerStateTests
         std::cout << "IMPORT BENCHMARK 30s / 48kHz / stereo WAV: median before=" << before[1]
                   << " ms, ready before compression=" << after[1] << " ms, speedup="
                   << before[1] / after[1] << "x (decode/persistence preparation only)" << std::endl;
+    }
+
+    static void runMidiPerformance (const juce::File& scratch)
+    {
+        using Mode = P::MidiPerformanceMode;
+        const auto idFor = [] (int ordinal) { return 10000 - ordinal * 7; };
+        const auto makeSong = [&] (int count)
+        {
+            auto state = std::make_shared<P::ChopState>();
+            for (int ordinal = count - 1; ordinal >= 0; --ordinal)
+            {
+                P::ChopDefinition chop;
+                chop.id = idFor (ordinal); chop.startSample = ordinal * 256; chop.endSample = (ordinal + 1) * 256;
+                chop.assignedMidiNote = ordinal == 0 ? 84 : -2;
+                state->chops.push_back (chop);
+            }
+            state->selectedChopId = count > 0 ? idFor (0) : -1; state->nextChopId = 10001;
+            return state;
+        };
+        const auto idAt = [] (const P& processor, int note, int channel = 1)
+        {
+            const auto state = processor.getChopState();
+            const int index = state->midiMap.channelNoteToChopIndex[(size_t) (channel - 1)][(size_t) note];
+            return index >= 0 && (size_t) index < state->chops.size() ? state->chops[(size_t) index].id : -1;
+        };
+        P p; setup (p);
+        const auto source = p.getLoadedSample();
+        for (const int count : { 0, 1, 55, 56, 57, 220 })
+        {
+            p.publishChopState (makeSong (count)); p.setMidiPerformanceMode (Mode::Window);
+            p.setMidiWindowStart (99999);
+            const int start = juce::jmax (0, count - 56);
+            bool exact = p.getMidiWindowStart() == start;
+            for (int slot = 0; slot < 56; ++slot)
+                exact &= idAt (p, 48 + slot) == (start + slot < count ? idFor (start + slot) : -1);
+            check (exact, "C4-G8 Window clamps and maps chronological sparse IDs at every capacity boundary");
+            check (p.getMappedMidiNotes().count() == (size_t) juce::jmin (56, count),
+                   "Window never spills beyond the 56 laptop notes");
+        }
+
+        p.publishChopState (makeSong (220)); p.setMidiPerformanceMode (Mode::Window);
+        auto edited = std::make_shared<P::ChopState> (*p.getChopState());
+        auto moved = std::find_if (edited->chops.begin(), edited->chops.end(), [&] (const auto& c) { return c.id == idFor (0); });
+        moved->startSample = 60000; moved->endSample = 61000;
+        P::ChopDefinition inserted; inserted.id = 20000; inserted.startSample = 1; inserted.endSample = 128;
+        edited->chops.insert (edited->chops.begin() + 3, inserted); p.publishChopState (edited);
+        bool stable = true;
+        for (int slot = 0; slot < 56; ++slot) stable &= idAt (p, 48 + slot) == idFor (slot);
+        check (stable, "inserting or moving chop boundaries cannot give committed Window notes to other chops");
+        p.setMidiWindowStart (1);
+        check (idAt (p, 48) == idFor (1), "an explicit Window commit selects a fresh chronological range");
+
+        p.publishChopState (makeSong (220)); p.setMidiPerformanceMode (Mode::Window); p.setMidiWindowStart (99999);
+        check (p.getMidiWindowStart() == 164 && idAt (p, 48) == idFor (164) && idAt (p, 103) == idFor (219),
+               "final Window reaches the song's last chop without a partial hidden range");
+        p.setMidiWindowStart (10); p.undoLastEdit();
+        check (p.getMidiWindowStart() == 164 && idAt (p, 48) == idFor (164), "one Window commit has one undoable stable map");
+
+        const auto favorite = [&] (int ordinal) { p.selectChopById (idFor (ordinal)); p.toggleSelectedChopFavorite(); };
+        favorite (0); favorite (199); p.setMidiPerformanceMode (Mode::Favorites);
+        check (idAt (p, 48) == idFor (0) && idAt (p, 49) == idFor (199),
+               "distant Favorites receive C4 and C-sharp4 in addition order");
+        p.setFavoritesViewEnabled (true); p.setFavoritesViewEnabled (false); p.selectChopById (idFor (100));
+        check (p.getMidiPerformanceMode() == Mode::Favorites && idAt (p, 48) == idFor (0) && idAt (p, 49) == idFor (199),
+               "browsing either view and selecting an outside pad preserves the active Favorites MIDI set");
+        favorite (0);
+        check (idAt (p, 48) == -1 && idAt (p, 49) == idFor (199), "unfavoriting reserves its empty MIDI slot and preserves surviving notes");
+        favorite (36);
+        check (idAt (p, 48) == -1 && idAt (p, 50) == idFor (36), "new Favorites append after reservations instead of filling gaps");
+        const auto reservedOwners = p.getChopState()->favoriteMidiOwnerIds;
+        p.setMidiMappingLocked (true);
+        check (! p.resetFavoriteMidiLayout() && p.getChopState()->favoriteMidiOwnerIds == reservedOwners,
+               "MIDI Lock rejects an explicit Favorites layout reset");
+        p.setMidiMappingLocked (false);
+        check (p.resetFavoriteMidiLayout() && idAt (p, 48) == idFor (199) && idAt (p, 49) == idFor (36)
+               && p.getChopState()->favoriteMidiHighWater == 2,
+               "explicit Favorites reset reclaims gaps in addition order");
+        p.undoLastEdit();
+        check (p.getChopState()->favoriteMidiOwnerIds == reservedOwners && idAt (p, 48) == -1
+               && idAt (p, 49) == idFor (199) && idAt (p, 50) == idFor (36),
+               "one Undo restores the exact pre-reset reservation and MIDI notes");
+        favorite (0);
+        check (idAt (p, 48) == idFor (0) && idAt (p, 49) == idFor (199) && idAt (p, 50) == idFor (36),
+               "re-adding a favorite restores its reserved note");
+        p.selectChopById (idFor (199)); p.removeSelectedChop();
+        check (idAt (p, 49) == -1 && p.getChopState()->favoriteMidiOwnerIds[1] == idFor (199),
+               "deleting a favorite preserves its unresolved reservation owner");
+        p.undoLastEdit();
+        check (idAt (p, 49) == idFor (199), "Undo restores a deleted owner to its exact reserved note");
+        for (int ordinal = 1; ordinal <= 60; ++ordinal) if (ordinal != 36) favorite (ordinal);
+        bool singleChannel = true;
+        for (const int channel : p.getChopState()->midiMap.channelForChopIndex) singleChannel &= channel <= 1;
+        check (p.getMappedMidiNotes().count() == 56 && p.getMidiNoteForChopId (idFor (60)) == -1 && singleChannel,
+               "excess Favorites stay mouse-playable without automatic channel overflow or slot reuse");
+
+        p.setMidiMappingLocked (true);
+        const int savedBars = p.getChopBarsCount();
+        const auto lockedIds = p.getChopState()->favoriteMidiOwnerIds;
+        const bool modeRejected = ! p.setMidiPerformanceMode (Mode::Window);
+        const bool windowRejected = ! p.setMidiWindowStart (0);
+        p.setManualChopModeActive (true); p.setChopBarsCount (savedBars + 1); p.clearAllChops();
+        p.selectChopById (idFor (199)); p.removeSelectedChop(); p.toggleSelectedChopFavorite();
+        check (modeRejected && windowRejected && p.getMidiPerformanceMode() == Mode::Favorites
+               && ! p.isManualChopModeActive() && p.getChopBarsCount() == savedBars && p.getChopState()->chops.size() == 220
+               && p.getChopState()->favoriteMidiOwnerIds == lockedIds && idAt (p, 49) == idFor (199),
+               "MIDI Lock rejects map, Window, layer, regrid and assigned-member deletion or removal");
+        p.setSelectedChopGainDecibels (-6.0f);
+        const auto soundState = p.getChopState();
+        const auto sound = std::find_if (soundState->chops.begin(), soundState->chops.end(), [&] (const auto& c) { return c.id == idFor (199); });
+        check (sound != soundState->chops.end() && std::abs (sound->gainDecibels + 6.0f) < 0.001f,
+               "MIDI Lock permits sound edits to the assigned chop");
+        p.setMidiMappingLocked (false);
+        check (p.getChopState()->favoriteMidiOwnerIds == lockedIds && idAt (p, 49) == idFor (199), "unlocking alone preserves every committed binding");
+
+        p.prepareToPlay (8000, 64);
+        juce::AudioBuffer<float> audio (2, 64); juce::MidiBuffer midi;
+        const auto render = [&] { p.processBlock (audio, midi); midi.clear(); };
+        p.setMidiPerformanceMode (Mode::Window); p.setMidiWindowStart (0); p.setChopPlaybackMode (P::ChopPlaybackMode::Gate);
+        midi.addEvent (juce::MidiMessage::noteOn (3, 48, (juce::uint8) 100), 0); render();
+        const int heldId = p.getPlayingChopId();
+        p.setMidiWindowStart (164); render();
+        check (heldId == idFor (0) && p.getPlayingChopId() == heldId && idAt (p, 48) == idFor (164),
+               "committing a new Window changes future notes while the original Gate keeps its chop ID");
+        midi.addEvent (juce::MidiMessage::noteOff (2, 48), 0); render();
+        check (p.heldMidiNote.load() == 48, "another MIDI channel cannot release the pre-commit Gate");
+        midi.addEvent (juce::MidiMessage::noteOff (3, 48), 0); render(); for (int block = 0; block < 10; ++block) render();
+        check (! p.isPlaying(), "the original channel and note release a Gate after the map changes");
+        p.setMidiWindowStart (0); p.setChopPlaybackMode (P::ChopPlaybackMode::OneShot);
+        midi.addEvent (juce::MidiMessage::noteOn (1, 48, (juce::uint8) 100), 0); render();
+        p.setMidiWindowStart (164); midi.addEvent (juce::MidiMessage::noteOff (1, 48), 0); render();
+        check (p.getPlayingChopId() == idFor (0), "One Shot ignores note-off and keeps its original chop through a Window change");
+        for (int block = 0; block < 10; ++block) render();
+        check (! p.isPlaying(), "the original One Shot still ends at its own boundary");
+
+        p.setMidiPerformanceMode (Mode::Favorites);
+        const auto automaticOwners = p.getChopState()->favoriteMidiOwnerIds;
+        p.setManualChopModeActive (true); p.setMidiPerformanceMode (Mode::Window);
+        check (idAt (p, 48) == 8, "manual layer creates an independent performance layout");
+        p.setMidiMappingLocked (true);
+        juce::MemoryBlock saved; p.getStateInformation (saved);
+        P recalled; recalled.setStateInformation (saved.getData(), (int) saved.getSize());
+        check (waitFor ([&] { return restored (recalled); }) && recalled.isManualChopModeActive()
+               && recalled.isMidiMappingLocked() && recalled.getMidiPerformanceMode() == Mode::Window && idAt (recalled, 48) == 8,
+               "project recall restores the active manual layer's map and MIDI Lock");
+        recalled.setMidiMappingLocked (false); recalled.setManualChopModeActive (false);
+        check (recalled.getMidiPerformanceMode() == Mode::Favorites && recalled.getMidiWindowStart() == 164
+               && recalled.getChopState()->favoriteMidiOwnerIds == automaticOwners && idAt (recalled, 49) == idFor (199),
+               "project recall retains the inactive layer's Window, Favorites reservations and chosen mode");
+        recalled.setMidiPerformanceMode (Mode::Legacy);
+        check (recalled.getMidiNoteForChopId (idFor (0)) == 84 && recalled.getMidiNoteForChopId (idFor (1)) == -1,
+               "opting out of performance mapping restores the original explicit and unassigned legacy notes");
+
+        {
+            P regrid; setup (regrid); regrid.chopBarsCount.store (1);
+            auto original = std::make_shared<P::ChopState>();
+            for (const auto fixture : { std::array<int, 4> { 101, 0, 16000, 12000 },
+                                       { 202, 16000, 32000, 0 }, { 303, 56000, 64000, 0 } })
+            {
+                P::ChopDefinition chop;
+                chop.id = fixture[0]; chop.startSample = fixture[1]; chop.endSample = fixture[2];
+                chop.cueOffsetSamples = fixture[3]; chop.favorite = true; chop.favoriteOrder = (int64_t) original->chops.size() + 1;
+                original->chops.push_back (chop);
+            }
+            original->selectedChopId = 101; original->nextChopId = 304;
+            regrid.publishChopState (original); regrid.setMidiPerformanceMode (Mode::Window);
+            regrid.setMidiPerformanceMode (Mode::Favorites); regrid.selectChopById (303); regrid.removeSelectedChop();
+            P::TempoAnalysisData analysis;
+            analysis.estimatedBpm = 240; analysis.beatPeriodSeconds = 0.25; analysis.analysisEndSeconds = 8;
+            regrid.buildChopsFromAnalysis (analysis);
+            const auto split = regrid.getChopState();
+            const int splitFirst = idAt (regrid, 48), splitSecond = idAt (regrid, 49);
+            const auto firstChild = std::find_if (split->chops.begin(), split->chops.end(),
+                [splitFirst] (const auto& c) { return c.id == splitFirst; });
+            check (firstChild != split->chops.end() && firstChild->startSample == 8000 && firstChild->endSample == 16000
+                   && splitFirst != splitSecond && split->midiWindowChopIds[0] == splitFirst
+                   && firstChild->favorite && firstChild->favoriteOrder == 1 && split->favoriteChopIndices.size() == 2
+                   && split->favoriteMidiOwnerIds[2] == 303 && idAt (regrid, 50) == -1,
+                   "split regrid follows the owner's cue once, shares Window identity and retains deleted-owner gaps");
+            analysis.estimatedBpm = 60; analysis.beatPeriodSeconds = 1.0;
+            regrid.buildChopsFromAnalysis (analysis);
+            const auto merged = regrid.getChopState();
+            check (idAt (regrid, 48) >= 0 && idAt (regrid, 49) == -1 && idAt (regrid, 50) == -1
+                   && merged->favoriteMidiOwnerIds[1] == splitSecond && merged->favoriteMidiOwnerIds[2] == 303
+                   && merged->midiWindowChopIds[0] == idAt (regrid, 48) && regrid.getMappedMidiNotes().count() == 1
+                   && merged->favoriteChopIndices.size() == 1,
+                   "merge regrid gives one descendant to the first slot and preserves unresolved owners without duplicate notes");
+            analysis.estimatedBpm = 240; analysis.beatPeriodSeconds = 0.25;
+            regrid.buildChopsFromAnalysis (analysis);
+            check (regrid.getChopState()->favoriteMidiOwnerIds[1] == splitSecond
+                   && regrid.getChopState()->favoriteMidiOwnerIds[2] == 303 && idAt (regrid, 49) == -1 && idAt (regrid, 50) == -1,
+                   "later regrids cannot assign unrelated nearby audio to unresolved reservations");
+        }
+
+        P ui; std::atomic_store (&ui.loadedSample, std::const_pointer_cast<P::LoadedSampleData> (source));
+        ui.publishChopState (makeSong (220)); ui.setMidiPerformanceMode (Mode::Window);
+        std::unique_ptr<juce::AudioProcessorEditor> editor (ui.createEditor());
+        if (auto* orb = findType (*editor, "VisualizerOrb")) orb->setVisible (false);
+        editor->addToDesktop (juce::ComponentPeer::windowIsTemporary); editor->setVisible (true);
+        auto* pads = findComponentId (*editor, "chop-pads");
+        auto* modes = dynamic_cast<juce::ComboBox*> (findComponentId (*editor, "midi-map-mode"));
+        auto* lock = dynamic_cast<juce::Button*> (findComponentId (*editor, "midi-map-lock"));
+        auto* handle = findComponentId (*editor, "midi-window-handle");
+        check (pads != nullptr && modes != nullptr && lock != nullptr && handle != nullptr, "performance mode, Lock and dedicated Window handle are present");
+        if (pads == nullptr || modes == nullptr || lock == nullptr || handle == nullptr) return;
+        check (modes->getNumItems() == 2 && modes->getItemText (0).equalsIgnoreCase ("Window")
+               && modes->getItemText (1).equalsIgnoreCase ("Favorites"),
+               "MIDI selector exposes only Window and Favorites");
+        check (waitFor ([&] { return modes->getSelectedId() == 1 && (int) pads->getProperties()["midiMappedPadCount"] == 56; }),
+               "Window UI identifies all 56 mapped pads without hiding the other chops");
+        lock->onClick();
+        check (ui.isMidiMappingLocked() && lock->getToggleState() && ! modes->isEnabled() && ! handle->isEnabled(),
+               "MIDI Lock visibly disables map selection and Window dragging");
+        lock->onClick();
+        const int columns = juce::jmax (1, (int) pads->getProperties()["padColumns"]);
+        const auto point = handle->getLocalBounds().toFloat().getCentre();
+        const auto eventAt = [&] (juce::Point<float> position)
+        {
+            const auto now = juce::Time::getCurrentTime();
+            return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), position,
+                juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier), 1, 0, 0, 0, 0,
+                handle, handle, now, point, now, 1, false);
+        };
+        const auto dragged = point.translated (3.0f * (float) pads->getWidth() / (float) columns, 0.0f);
+        handle->mouseDown (eventAt (point)); handle->mouseDrag (eventAt (dragged));
+        check (ui.getMidiWindowStart() == 0 && (int) pads->getProperties()["midiWindowPreviewStart"] == 3 && ! ui.isPlaying(),
+               "Window dragging previews whole chops without remapping MIDI or auditioning");
+        handle->mouseUp (eventAt (dragged));
+        check (ui.getMidiWindowStart() == 3 && idAt (ui, 48) == idFor (3), "releasing the handle commits the previewed Window");
+        ui.undoLastEdit();
+        check (ui.getMidiWindowStart() == 0 && idAt (ui, 48) == idFor (0), "one Undo restores the complete pre-drag Window");
+        ui.setMidiPerformanceMode (Mode::Legacy);
+        check (waitFor ([&] { return modes->getSelectedId() == 1 && handle->isEnabled()
+            && (int) pads->getProperties()["midiMappedPadCount"] == 1; })
+               && idAt (ui, 84) == idFor (0) && idAt (ui, 48) == -1,
+               "an older saved map displays Window while retaining its exact original MIDI assignments");
+        handle->mouseDown (eventAt (point));
+        check (ui.getMidiPerformanceMode() == Mode::Legacy && idAt (ui, 84) == idFor (0) && idAt (ui, 48) == -1,
+               "pressing the saved-map Window handle does not migrate MIDI before release");
+        handle->mouseUp (eventAt (point));
+        check (ui.getMidiPerformanceMode() == Mode::Window && idAt (ui, 48) == idFor (0),
+               "releasing the Window handle explicitly activates its performance map");
+        ui.undoLastEdit();
+        check (ui.getMidiPerformanceMode() == Mode::Legacy && idAt (ui, 84) == idFor (0) && idAt (ui, 48) == -1,
+               "one Undo restores both the old saved mode and its original MIDI assignments");
+        ui.setMidiPerformanceMode (Mode::Window);
+        modes->setSelectedId (2, juce::sendNotificationSync);
+        check (ui.getMidiPerformanceMode() == Mode::Favorites && ! handle->isEnabled(), "explicit mode selector changes MIDI source and disables the inactive Window handle");
+        for (const int ordinal : { 0, 199 }) { ui.selectChopById (idFor (ordinal)); ui.toggleSelectedChopFavorite(); }
+        juce::Button* theme = nullptr;
+        std::function<void (juce::Component&)> findTheme = [&] (juce::Component& component)
+        {
+            if (auto* button = dynamic_cast<juce::Button*> (&component);
+                button != nullptr && button->getTooltip() == "Switch between light and dark themes.") theme = button;
+            for (auto* child : component.getChildren()) findTheme (*child);
+        };
+        findTheme (*editor);
+        const auto previousTheme = theme != nullptr ? theme->getButtonText() : juce::String();
+        for (const int modeId : { 1, 2 })
+        {
+            modes->setSelectedId (modeId, juce::sendNotificationSync);
+            for (const auto* themeName : { "dark", "light" })
+            {
+                if (theme != nullptr && theme->onClick && theme->getButtonText() != juce::String (themeName).toUpperCase()) theme->onClick();
+                check (waitFor ([&] { return (int) pads->getProperties()["padFavoriteCount"] == 2
+                    && (int) pads->getProperties()["padAnimatingCount"] == 0; }),
+                       "distant favorite pad highlights settle in either MIDI mode and theme");
+                const auto padImage = pads->createComponentSnapshot (pads->getLocalBounds());
+                const int padColumns = juce::jmax (1, (int) pads->getProperties()["padColumns"]);
+                const int padRows = juce::jmax (1, (int) pads->getProperties()["padRows"]);
+                bool filledPink = true;
+                for (const int ordinal : { 0, 199 })
+                {
+                    const int x = juce::roundToInt (((float) (ordinal % padColumns) + 0.25f) * pads->getWidth() / padColumns);
+                    const int y = juce::roundToInt (((float) (ordinal / padColumns) + 0.25f) * pads->getHeight() / padRows);
+                    const auto colour = padImage.getPixelAt (x, y);
+                    filledPink &= colour.getRed() > colour.getGreen() + 20 && colour.getBlue() > colour.getGreen() + 15;
+                }
+                check (filledPink, "favorite pads use a pink face rather than only a colored border");
+                juce::FileOutputStream snapshot (scratch.getParentDirectory().getChildFile (
+                    "midi-performance-" + juce::String (modeId == 1 ? "window-" : "favorites-") + themeName + ".png"));
+                snapshot.setPosition (0); snapshot.truncate();
+                juce::PNGImageFormat().writeImageToStream (editor->createComponentSnapshot (editor->getLocalBounds()), snapshot);
+            }
+        }
+        if (theme != nullptr && theme->onClick && theme->getButtonText() != previousTheme) theme->onClick();
+        modes->setSelectedId (1, juce::sendNotificationSync);
+        handle->mouseDown (eventAt (point)); handle->mouseDrag (eventAt (dragged));
+        editor.reset();
+        for (int tick = 0; tick < 10; ++tick) pump();
+        check (ui.getMidiWindowStart() == 0 && ! ui.isPlaying() && ! ui.mousePreviewHeld.load(),
+               "closing during a Window drag cancels its preview without committing or leaving an audition held");
+    }
+
+    static void runChopPads (const juce::File& scratch)
+    {
+        P p;
+        auto source = std::make_shared<P::LoadedSampleData>();
+        source->sampleRate = 8000;
+        source->fileName = "chronological pad fixture";
+        source->buffer.setSize (2, 512 * 1024);
+        for (int channel = 0; channel < 2; ++channel)
+            for (int sample = 0; sample < source->buffer.getNumSamples(); ++sample)
+                source->buffer.setSample (channel, sample, 0.2f * std::sin ((float) sample * 0.05f));
+        std::atomic_store (&p.loadedSample, source);
+
+        // Storage order, IDs, MIDI notes and favorite order all differ from
+        // source time. Equal starts additionally exercise the end/ID tie break.
+        auto layout = std::make_shared<P::ChopState>();
+        for (const auto fixture : { std::array<int, 4> { 71, 3072, 4096, 72 },
+                                   { 9, 1024, 2048, 36 }, { 50, 0, 512, -2 },
+                                   { 22, 0, 1024, 60 }, { 4, 0, 512, 84 } })
+        {
+            P::ChopDefinition chop;
+            chop.id = fixture[0]; chop.startSample = fixture[1]; chop.endSample = fixture[2];
+            chop.assignedMidiNote = fixture[3]; chop.cueOffsetSamples = 32;
+            chop.releaseMilliseconds = 5.0f;
+            chop.favorite = chop.id == 9; chop.favoriteOrder = chop.favorite ? 1 : -1;
+            layout->chops.push_back (chop);
+        }
+        layout->selectedChopId = 9; layout->nextChopId = 72;
+        p.publishChopState (layout);
+        const auto originalMap = p.getChopState()->midiMap.channelNoteToChopIndex;
+        p.prepareToPlay (8000, 64);
+        juce::AudioBuffer<float> audio (2, 64); juce::MidiBuffer midi;
+        const auto render = [&] (int blocks = 1)
+        {
+            for (int block = 0; block < blocks; ++block) { midi.clear(); p.processBlock (audio, midi); }
+        };
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+        if (auto* orb = findType (*editor, "VisualizerOrb")) orb->setVisible (false);
+        editor->addToDesktop (juce::ComponentPeer::windowIsTemporary);
+        editor->setVisible (true);
+        auto* pads = findComponentId (*editor, "chop-pads");
+        check (pads != nullptr && findType (*editor, "GlassKeyboard") == nullptr,
+               "chronological pads replace the visual piano keyboard");
+        if (pads == nullptr) return;
+        const auto refreshCount = [&] (int count)
+        {
+            p.notifyEditStateChanged();
+            return waitFor ([&] { return (int) pads->getProperties()["padCount"] == count; });
+        };
+        check (refreshCount (5), "pad grid exposes every chop independently of MIDI assignments");
+        const auto cell = [&] (int index)
+        {
+            const int columns = juce::jmax (1, (int) pads->getProperties()["padColumns"]);
+            const int rows = juce::jmax (1, (int) pads->getProperties()["padRows"]);
+            const float width = (float) pads->getWidth() / (float) columns;
+            const float height = (float) pads->getHeight() / (float) rows;
+            return juce::Rectangle<float> ((float) (index % columns) * width,
+                                          (float) (index / columns) * height, width, height);
+        };
+        const auto eventAt = [&] (juce::Point<float> point, int clicks = 1)
+        {
+            const auto now = juce::Time::getCurrentTime();
+            return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), point,
+                juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier), 1, 0, 0, 0, 0,
+                pads, pads, now, point, now, clicks, false);
+        };
+        const auto press = [&] (int index) { pads->mouseDown (eventAt (cell (index).getCentre())); };
+        const auto release = [&] (int index) { pads->mouseUp (eventAt (cell (index).getCentre())); };
+        const auto stop = [&] { p.stopPlayback(); render(); };
+
+        bool chronological = true;
+        int index = 0;
+        for (const int id : { 4, 50, 22, 9, 71 })
+        {
+            press (index); render();
+            chronological &= p.getLastTriggeredChopId() == id && p.getChopState()->selectedChopId == id
+                && p.getPlayingChopId() == id && p.voice.playbackTriggeredByMouse
+                && audio.getMagnitude (0, 64) > 0.001f;
+            release (index++); render (10);
+        }
+        check (chronological, "pad hits follow start/end/ID order through the final chop");
+        check (p.getChopState()->midiMap.channelNoteToChopIndex == originalMap
+               && p.getMidiNoteForChopId (50) == -1,
+               "clicking chronological pads preserves explicit and unmapped MIDI assignments");
+
+        stop();
+        check (p.getPlayingChopId() == -1 && p.getLastTriggeredChopId() == 71,
+               "Stop clears the playing pad while retaining the historical trigger");
+        // Start in the unchopped tail so this pad-identity check is independent
+        // of the transport's per-chop envelope processing at source time zero.
+        p.clearSelectedChop(); p.setPlaybackSamplePosition (8192); render(); p.startPlayback(); render();
+        check (p.isPlaying() && p.getPlayingChopId() == -1 && p.getLastTriggeredChopId() == 71,
+               "whole-sample transport does not illuminate the last auditioned pad");
+        stop();
+        midi.addEvent (juce::MidiMessage::noteOn (1, 36, (juce::uint8) 100), 0);
+        p.processBlock (audio, midi); midi.clear();
+        check (p.getPlayingChopId() == 9, "host MIDI publishes the exact sounding pad ID");
+        midi.addEvent (juce::MidiMessage::noteOff (1, 36), 0);
+        p.processBlock (audio, midi); midi.clear(); render (10);
+        press (1); render(); p.setPlaybackSamplePosition (4096); render();
+        check (p.getPlayingChopId() == -1 && p.getLastTriggeredChopId() == 50,
+               "seeking clears the playing pad binding without erasing trigger history");
+        release (1); stop();
+        p.selectChopById (9); p.armManualChopCapture (0);
+        for (const int invalidId : { -1, 99999 })
+        {
+            p.startChopPreview (invalidId); render();
+            check (p.manualChopCaptureArmed.load() && ! p.isPlaying() && p.getPlayingChopId() == -1
+                   && p.getLastTriggeredChopId() == 50 && p.getChopState()->selectedChopId == 9,
+                   "invalid pad preview IDs preserve armed manual capture and cannot audition another chop");
+        }
+        p.cancelManualChopCapture();
+
+        p.setChopPlaybackMode (P::ChopPlaybackMode::OneShot);
+        press (1); release (1); render();
+        check (p.voice.playbackActive && p.voice.activeChopId == 50 && p.voice.chopOneShot
+               && p.voice.playbackSamplePosition >= 32 && p.voice.playbackSamplePosition < 128,
+               "quick unmapped One Shot pad click survives release and begins at its cue");
+        render (20);
+        check (! p.voice.playbackActive, "One Shot pad finishes at its chop end");
+        press (1); render (20);
+        check (! p.voice.playbackActive, "holding a One Shot pad does not loop");
+        release (1);
+        p.setChopPlaybackMode (P::ChopPlaybackMode::Gate);
+        press (1); release (1); render (20);
+        check (! p.voice.playbackActive && ! p.mousePreviewHeld.load(),
+               "quick Gate pad click cannot strand a held voice");
+        press (1); render (30);
+        check (p.voice.playbackActive && ! p.voice.chopOneShot && p.voice.activeChopId == 50
+               && p.voice.playbackSamplePosition >= 32 && p.voice.playbackSamplePosition < 512,
+               "held Gate pad loops only its target chop");
+        p.setChopPlaybackMode (P::ChopPlaybackMode::OneShot);
+        release (1); render (20);
+        check (! p.voice.playbackActive, "pad release respects the Gate mode latched at mouse-down");
+
+        p.setMidiPerformanceMode (P::MidiPerformanceMode::Favorites);
+        const auto favoritesMap = p.getChopState()->midiMap.channelNoteToChopIndex;
+        p.setFavoritesViewEnabled (true);
+        check (refreshCount (5) && pads->isShowing(), "Favorites retains all chronological pads");
+        p.setChopPlaybackMode (P::ChopPlaybackMode::Gate);
+        press (1); render();
+        check (p.voice.activeChopId == 50 && p.getChopState()->selectedChopId == 50
+               && ! p.isFavoritesViewEnabled() && p.getMidiNoteForChopId (50) == -1
+               && p.getMidiPerformanceMode() == P::MidiPerformanceMode::Favorites
+               && p.getChopState()->midiMap.channelNoteToChopIndex == favoritesMap,
+               "an outside pad opens its waveform and auditions directly without changing Favorites MIDI");
+        release (1); render (20);
+
+        const auto isFavorite = [&] (int id)
+        {
+            const auto state = p.getChopState();
+            const auto found = std::find_if (state->chops.begin(), state->chops.end(), [id] (const auto& chop) { return chop.id == id; });
+            return found != state->chops.end() && found->favorite;
+        };
+        press (2); release (2); render (20);
+        check (! isFavorite (22) && p.getChopState()->favoriteChopIndices.size() == 1,
+               "a single pad click auditions without changing Favorites");
+        pads->mouseExit (eventAt (cell (2).getCentre()));
+        check (waitFor ([&] { return (int) pads->getProperties()["padAnimatingCount"] == 0; }), "pad highlights settle after audition");
+        pads->mouseMove (eventAt (cell (2).getCentre()));
+        check (waitFor ([&] { return (int) pads->getProperties()["padAnimatingCount"] > 0; }), "hovering a pad starts a smooth highlight transition");
+        check (waitFor ([&] { return (int) pads->getProperties()["padAnimatingCount"] == 0; }), "hover highlight animation settles without changing playback");
+        pads->mouseExit (eventAt (cell (2).getCentre()));
+
+        press (1); release (1); render (20);
+        const auto doubleTap = eventAt (cell (1).getCentre(), 2);
+        pads->mouseDown (doubleTap); render();
+        check (p.getPlayingChopId() == 50 && p.mousePreviewHeld.load(), "the second pad press still auditions its exact Gate chop");
+        // JUCE dispatches mouseDoubleClick after the second mouseUp, carrying
+        // the old left-button modifiers on both callbacks.
+        pads->mouseUp (doubleTap);
+        check (! isFavorite (50) && ! p.mousePreviewHeld.load(), "the second mouse-up releases Gate without toggling Favorites before JUCE's double-click callback");
+        const auto beforeFavoriteToggle = p.getChopTriggerRevision();
+        pads->mouseDoubleClick (doubleTap);
+        check (p.getChopTriggerRevision() == beforeFavoriteToggle, "double-tap favorite callback does not retrigger the sounding chop");
+        render (20);
+        check (isFavorite (50) && isFavorite (9) && ! isFavorite (22) && p.getChopState()->favoriteChopIndices.size() == 2
+               && p.getMidiPerformanceMode() == P::MidiPerformanceMode::Favorites && p.getMidiNoteForChopId (9) == 48
+               && p.getMidiNoteForChopId (50) == 49,
+               "double-tapping a chronological source pad favorites its exact sparse ID and appends without remapping neighbors");
+        check (! p.isPlaying() && ! p.mousePreviewHeld.load(), "mouse-up releases Gate playback after a pad double-tap");
+        const auto doubleClickPad = [&] (int slot)
+        {
+            press (slot); release (slot); render (20);
+            const auto secondPress = eventAt (cell (slot).getCentre(), 2);
+            pads->mouseDown (secondPress); pads->mouseUp (secondPress); pads->mouseDoubleClick (secondPress); render (20);
+        };
+        p.setMidiMappingLocked (true);
+        doubleClickPad (1);
+        check (isFavorite (50) && p.getMidiNoteForChopId (50) == 49, "MIDI Lock protects an assigned favorite from pad double-tap removal");
+        p.setMidiMappingLocked (false);
+        doubleClickPad (1);
+        check (! isFavorite (50) && isFavorite (9) && p.getMidiNoteForChopId (9) == 48
+               && p.getMidiNoteForChopId (50) == -1 && p.getChopState()->favoriteMidiOwnerIds[1] == 50,
+               "double-tapping again removes only that favorite and preserves its MIDI reservation");
+        press (0); release (0); render (20);
+        const auto neighborPress = eventAt (cell (1).getCentre(), 2);
+        pads->mouseDown (neighborPress); pads->mouseUp (neighborPress); pads->mouseDoubleClick (neighborPress); render (20);
+        check (! isFavorite (4) && ! isFavorite (50) && isFavorite (9) && p.getChopState()->favoriteChopIndices.size() == 1,
+               "rapid clicks on neighboring pads do not toggle Favorites when JUCE reports a double-click");
+
+        stop();
+        const int previousSelection = p.getChopState()->selectedChopId;
+        const auto beforeGap = p.getChopState();
+        const auto gap = eventAt ({ 0.0f, cell (0).getCentreY() });
+        pads->mouseDown (gap); pads->mouseUp (gap); pads->mouseDoubleClick (gap); render();
+        check (! p.voice.playbackActive && p.getChopState() == beforeGap,
+               "pad edge gutter clicks cannot select, trigger or favorite chops");
+        if ((int) pads->getProperties()["padColumns"] > 1)
+        {
+            const auto between = eventAt ({ cell (0).getRight(), cell (0).getCentreY() });
+            pads->mouseDown (between); pads->mouseUp (between); render();
+            check (! p.voice.playbackActive && p.getChopState()->selectedChopId == previousSelection,
+                   "gaps between pads do not trigger either neighbor");
+        }
+
+        auto* theme = static_cast<juce::Button*> (nullptr);
+        std::function<void (juce::Component&)> findTheme = [&] (juce::Component& component)
+        {
+            if (auto* button = dynamic_cast<juce::Button*> (&component);
+                button != nullptr && button->getTooltip() == "Switch between light and dark themes.") theme = button;
+            for (auto* child : component.getChildren()) findTheme (*child);
+        };
+        findTheme (*editor);
+        const auto originalSize = juce::Point<int> (editor->getWidth(), editor->getHeight());
+        const auto originalTheme = theme != nullptr ? theme->getButtonText() : juce::String();
+        for (const int count : { 16, 64, 220, 512 })
+        {
+            auto song = std::make_shared<P::ChopState>();
+            // Reverse storage order exposes accidental positional playback as
+            // well as layouts that only show the current MIDI bank.
+            for (int ordinal = count - 1; ordinal >= 0; --ordinal)
+            {
+                P::ChopDefinition chop;
+                chop.id = ordinal + 1; chop.startSample = ordinal * 1024; chop.endSample = (ordinal + 1) * 1024;
+                chop.assignedMidiNote = -2;
+                song->chops.push_back (chop);
+            }
+            song->selectedChopId = 1; song->nextChopId = count + 1;
+            p.publishChopState (song);
+            check (refreshCount (count), "pad count grows to include the complete song");
+            for (const float scale : { 1.0f, 0.85f })
+            {
+                editor->setSize (juce::roundToInt ((float) originalSize.x * scale),
+                                 juce::roundToInt ((float) originalSize.y * scale));
+                const int columns = (int) pads->getProperties()["padColumns"];
+                const int rows = (int) pads->getProperties()["padRows"];
+                bool allInside = columns > 0 && rows > 0 && columns * rows >= count;
+                for (int pad = 0; pad < count; ++pad)
+                    allInside &= pads->getLocalBounds().toFloat().contains (cell (pad).getCentre());
+                check (allInside && pads->isShowing()
+                       && editor->getLocalBounds().contains (editor->getLocalArea (pads, pads->getLocalBounds())),
+                       "every pad fits inside the grid at normal and minimum editor sizes");
+                press (count - 1); render();
+                check (p.voice.activeChopId == count && p.getChopState()->selectedChopId == count,
+                       "the final unmapped pad remains playable after resizing");
+                release (count - 1); render (20);
+                if (columns * rows > count)
+                {
+                    const auto blank = eventAt (cell (count).getCentre());
+                    pads->mouseDown (blank); pads->mouseUp (blank); render();
+                    check (! p.voice.playbackActive && p.getChopState()->selectedChopId == count,
+                           "unused final-row space does not trigger the last chop");
+                    const auto beforeDoubleTap = p.getChopState();
+                    pads->mouseDoubleClick (eventAt (cell (count).getCentre(), 2));
+                    check (p.getChopState() == beforeDoubleTap && ! p.isPlaying(),
+                           "double-tapping an empty grid cell does not favorite a neighboring chop");
+                }
+            }
+            editor->setSize (originalSize.x, originalSize.y);
+            if (theme != nullptr && theme->onClick)
+                for (const auto* themeName : { "dark", "light" })
+                {
+                    if (theme->getButtonText() != juce::String (themeName).toUpperCase()) theme->onClick();
+                    pump();
+                    juce::FileOutputStream image (scratch.getParentDirectory().getChildFile (
+                        "chop-pads-" + juce::String (count) + "-" + themeName + ".png"));
+                    image.setPosition (0); image.truncate();
+                    juce::PNGImageFormat().writeImageToStream (editor->createComponentSnapshot (editor->getLocalBounds()), image);
+                }
+        }
+        if (theme != nullptr && theme->onClick && theme->getButtonText() != originalTheme) theme->onClick();
+
+        p.publishChopState (std::make_shared<P::ChopState>());
+        check (refreshCount (0), "empty sample state clears all pads");
+        stop();
+        const auto emptyClick = eventAt (pads->getLocalBounds().toFloat().getCentre());
+        pads->mouseDown (emptyClick); pads->mouseUp (emptyClick); pads->mouseDoubleClick (emptyClick); render();
+        check (! p.voice.playbackActive && ! p.mousePreviewHeld.load(), "empty pad grid clicks do not start transport playback");
+
+        p.publishChopState (layout); refreshCount (5);
+        press (1); render(); editor.reset(); render (20);
+        check (! p.voice.playbackActive && ! p.mousePreviewHeld.load(), "closing the editor releases a held pad Gate");
     }
 
     static void runOctaveBanking (const juce::File& scratch)
@@ -1536,12 +2136,14 @@ struct CueSamplerStateTests
         find (*editor);
         check (chopRange == nullptr,
                "CHOPS slider is absent from the editor");
-        auto* keys = dynamic_cast<juce::MidiKeyboardComponent*> (findType (*editor, "GlassKeyboard"));
-        check (plus != nullptr && minus != nullptr && keys != nullptr, "OCT buttons and keyboard are present");
-        if (plus == nullptr || minus == nullptr || keys == nullptr) return;
+        auto* pads = findComponentId (*editor, "chop-pads");
+        check (plus != nullptr && minus != nullptr && pads != nullptr, "FL octave controls and chronological chop pads are available");
+        if (plus == nullptr || minus == nullptr || pads == nullptr) return;
+        check (! plus->isShowing() && ! minus->isShowing() && pads->isShowing(),
+               "non-FL hosts show every chop pad and hide FL-only octave controls");
         check (flLink == nullptr, "FL LINK button is absent from the testing build");
-        check (! keys->keyPressed (juce::KeyPress ('z', 0, 0))
-               && ! keys->keyPressed (juce::KeyPress ('a', 0, 0)),
+        check (! pads->keyPressed (juce::KeyPress ('z', 0, 0))
+               && ! pads->keyPressed (juce::KeyPress ('a', 0, 0)),
                "CUE leaves laptop piano keys to the DAW");
         {
             juce::FileOutputStream image (scratch.getParentDirectory().getChildFile ("fl-octave-controls.png"));
@@ -1549,8 +2151,8 @@ struct CueSamplerStateTests
             auto* controls = plus->getParentComponent();
             juce::PNGImageFormat().writeImageToStream (controls->createComponentSnapshot (controls->getLocalBounds()), image);
         }
-        check (keys->getOctaveForMiddleC() == 5 && keys->getWhiteNoteText (0) == "C0"
-               && keys->getLowestVisibleKey() == 0, "screen keyboard starts at FL Studio C0");
+        check (waitFor ([&] { return (int) pads->getProperties()["padCount"] == 128; })
+               && p.getKeyboardStartNote() == 0, "all 128 pads are visible with the original FL C0 MIDI mapping");
         if (theme != nullptr && theme->onClick)
         {
             // Visual QA artifacts use the real component tree. Restore both
@@ -1577,27 +2179,27 @@ struct CueSamplerStateTests
             {
                 if (theme->getButtonText() != juce::String (themeName).toUpperCase()) theme->onClick();
                 editor->setSize (restore.size.x, restore.size.y);
-                const auto keyBounds = editor->getLocalArea (keys, keys->getLocalBounds());
-                const float scale = (float) keyBounds.getHeight() / (float) keys->getHeight();
-                const auto footerBounds = keyBounds.toFloat().expanded (8.0f * scale, 4.0f * scale)
-                    .withTop ((float) keyBounds.getY() - 32.0f * scale)
-                    .withBottom ((float) keyBounds.getBottom() + 6.0f * scale)
+                const auto padBounds = editor->getLocalArea (pads, pads->getLocalBounds());
+                const float scale = (float) padBounds.getHeight() / (float) pads->getHeight();
+                const auto footerBounds = padBounds.toFloat().expanded (8.0f * scale, 4.0f * scale)
+                    .withTop ((float) padBounds.getY() - 32.0f * scale)
+                    .withBottom ((float) padBounds.getBottom() + 6.0f * scale)
                     .getSmallestIntegerContainer().getIntersection (editor->getLocalBounds());
-                writeSnapshot ("keyboard-footer-" + juce::String (themeName) + ".png", footerBounds);
-                writeSnapshot ("keyboard-ui-" + juce::String (themeName) + ".png", editor->getLocalBounds());
+                writeSnapshot ("pads-footer-" + juce::String (themeName) + ".png", footerBounds);
+                writeSnapshot ("pads-ui-" + juce::String (themeName) + ".png", editor->getLocalBounds());
                 editor->setSize (juce::roundToInt ((float) restore.size.x * 0.85f),
                                  juce::roundToInt ((float) restore.size.y * 0.85f));
-                writeSnapshot ("keyboard-ui-minimum-" + juce::String (themeName) + ".png", editor->getLocalBounds());
+                writeSnapshot ("pads-ui-minimum-" + juce::String (themeName) + ".png", editor->getLocalBounds());
             }
         }
-        plus->triggerClick();
-        check (waitFor ([&] { return keys->getLowestVisibleKey() == 12; }), "OCT + shows C1");
-        plus->triggerClick();
-        check (waitFor ([&] { return keys->getLowestVisibleKey() == 24; }), "second OCT + shows C2");
+        plus->onClick();
+        check (waitFor ([&] { return p.getKeyboardStartNote() == 12; }), "OCT + selects FL C1");
+        plus->onClick();
+        check (waitFor ([&] { return p.getKeyboardStartNote() == 24; }), "second OCT + selects FL C2");
         {
-            juce::FileOutputStream image (scratch.getParentDirectory().getChildFile ("octave-keyboard.png"));
+            juce::FileOutputStream image (scratch.getParentDirectory().getChildFile ("octave-pads.png"));
             image.setPosition (0); image.truncate();
-            juce::PNGImageFormat().writeImageToStream (keys->createComponentSnapshot (keys->getLocalBounds()), image);
+            juce::PNGImageFormat().writeImageToStream (pads->createComponentSnapshot (pads->getLocalBounds()), image);
         }
         check (p.getChopState() == original, "OCT navigation never republishes or remaps chops");
         juce::AudioBuffer<float> audio (2, 64); juce::MidiBuffer midi;
@@ -1622,7 +2224,7 @@ struct CueSamplerStateTests
         midi.addEvent (juce::MidiMessage::noteOn (1, 72, (juce::uint8) 100), 0); render();
         check (p.getLatestHostMidiKeyEvent() != observedC6 && (p.getLatestHostMidiKeyEvent() & 2047u) == 72,
                "repeated host notes receive a fresh UI observation");
-        check (p.getKeyboardStartNote() == 0 && keys->getLowestVisibleKey() == 0
+        check (p.getKeyboardStartNote() == 0 && (int) pads->getProperties()["padCount"] == 128
                && p.getLastTriggeredChopId() == 73,
                "viewing C0 cannot reinterpret incoming FL C6 as C0");
         midi.addEvent (juce::MidiMessage::noteOff (1, 72), 0); render();
@@ -1692,13 +2294,12 @@ struct CueSamplerStateTests
         check (p.getLastTriggeredChopId() == 1, "DAW C0 still plays chop 1 after OCT changes");
         midi.addEvent (juce::MidiMessage::noteOn (1, 12, (juce::uint8) 100), 0); render();
         check (p.getLastTriggeredChopId() == 13, "DAW C1 always plays its fixed C1 chop");
-        // Exercise the same keyboard-state listener used by native mouse keys.
-        // Native pointer hit testing depends on desktop window occlusion and is
-        // left to the host UI smoke check, not the console audio harness.
-        const int visibleNote = keys->getRangeStart();
+        // The keyboard-state listener remains available to local MIDI input;
+        // direct pad mouse playback is covered independently in runChopPads.
+        const int visibleNote = p.getKeyboardStartNote();
         p.keyboardState.noteOn (1, visibleNote, 1.0f); render();
         check (visibleNote == 24 && p.getLastTriggeredChopId() == 25,
-               "screen keyboard C2 MIDI plays its fixed C2 chop");
+               "local C2 MIDI plays its fixed C2 chop");
         p.keyboardState.noteOff (1, visibleNote, 0.0f); render();
         midi.addEvent (juce::MidiMessage::noteOn (1, 0, (juce::uint8) 100), 0); render();
         minus->onClick();
@@ -1776,14 +2377,8 @@ struct CueSamplerStateTests
         for (int i = 0; i < 300; ++i) p.enqueueOnScreenMidi (1, 84, 1.0f);
         render();
         check (p.onScreenMidiFifo.getNumReady() == 0 && ! p.voice.playbackActive, "screen MIDI queue overflow cannot strand a held voice");
-        keys->setAvailableRange (96, 127);
-        check (keys->getRectangleForKey (127).getRight() <= (float) keys->getWidth() + 1.0f,
-               "extended last keyboard view fits every key through G10");
-        {
-            juce::FileOutputStream image (scratch.getParentDirectory().getChildFile ("extended-keyboard.png"));
-            image.setPosition (0); image.truncate();
-            juce::PNGImageFormat().writeImageToStream (keys->createComponentSnapshot (keys->getLocalBounds()), image);
-        }
+        check ((int) pads->getProperties()["padCount"] == 128,
+               "all pads remain present while local MIDI queue overflow is recovered");
         for (const int count : { 12, 36, 37, 49 })
         {
             auto partial = std::make_shared<P::ChopState> (*layout);
@@ -1852,14 +2447,15 @@ struct CueSamplerStateTests
                "OCT stops at C10 without automatically changing the chop range");
         check (chopRange == nullptr, "220 chops do not restore the removed range slider");
         p.setKeyboardMidiBank (2); p.setMidiOctaveOffset (0);
-        check (waitFor ([&] { return keys->getMidiChannel() == 2 && keys->getLowestVisibleKey() == 0; }),
-               "editor follows a restored MIDI channel and keyboard view without the slider");
+        check (waitFor ([&] { return (int) pads->getProperties()["padCount"] == 220; })
+               && p.getKeyboardMidiBank() == 2 && p.getKeyboardStartNote() == 0,
+               "all 220 pads remain available after restoring a MIDI channel and octave");
         for (int step = 0; step < 16; ++step) minus->onClick();
         check (p.getKeyboardMidiBank() == 2 && p.getKeyboardStartNote() == 0 && ! minus->isEnabled(),
                "OCT reaches C0 in the final chop range without switching ranges");
         for (int step = 0; step < 10; ++step) plus->onClick();
-        check (p.getKeyboardStartNote() == 120 && keys->getRangeEnd() == 127,
-               "last screen octave includes C10-G10 without going past MIDI 127");
+        check (p.getKeyboardStartNote() == 120 && (int) pads->getProperties()["padCount"] == 220,
+               "last MIDI octave keeps every chronological pad visible");
         // Pumping the editor may update selection after the last played note;
         // compare the assignments rather than the immutable snapshot pointer.
         check (p.getChopState()->midiMap.channelNoteToChopIndex == bankMap->midiMap.channelNoteToChopIndex,
@@ -1913,6 +2509,7 @@ struct CueSamplerStateTests
         // chop has a manual pin.
         favoritesSong->chops[147].assignedMidiNote = 72;
         p.publishChopState (favoritesSong); p.setFavoritesViewEnabled (true);
+        p.setMidiPerformanceMode (P::MidiPerformanceMode::LegacyFavorites);
         check (p.getMidiChannelForChopId (1) == 2 && p.getMidiNoteForChopId (1) == 91
                && p.getMidiChannelForChopId (220) == 1 && p.getMidiNoteForChopId (220) == 0,
                "Favorites pack across all banks in favorite order");
@@ -1921,6 +2518,7 @@ struct CueSamplerStateTests
         check (p.getLastTriggeredChopId() == 148, "FL C6 matches packed Favorites C6 regardless of the viewport");
         midi.addEvent (juce::MidiMessage::noteOff (1, 72), 0); render();
         p.setFavoritesViewEnabled (false);
+        p.setMidiPerformanceMode (P::MidiPerformanceMode::Legacy);
         auto shortSong = std::make_shared<P::ChopState> (*song); shortSong->chops.resize (12);
         p.publishChopState (shortSong);
         check (p.getKeyboardMidiBank() == 1, "reducing chops clamps an obsolete selected bank");
@@ -1936,8 +2534,9 @@ struct CueSamplerStateTests
         check (p.getKeyboardMidiBank() == 1 && p.getKeyboardStartNote() == 120,
                "C10 limit never changes ranges even when another range is empty");
         p.setKeyboardMidiBank (3); p.setMidiOctaveOffset (0);
-        check (waitFor ([&] { return keys->getMidiChannel() == 3 && keys->getLowestVisibleKey() == 0; }),
-               "restored channel reaches later mapped chops beyond an empty middle range");
+        check (waitFor ([&] { return (int) pads->getProperties()["padCount"] == 257; })
+               && p.getKeyboardMidiBank() == 3 && p.getKeyboardStartNote() == 0,
+               "restored channel retains every pad including chops in an empty middle MIDI range");
         auto bankPins = std::make_shared<P::ChopState> (*song); bankPins->chops[0].assignedMidiNote = 60;
         P::rebuildChopMidiMap (*bankPins, 0, false, true);
         check (bankPins->midiMap.channelNoteToChopIndex[0][60] == 0
@@ -1982,13 +2581,13 @@ struct CueSamplerStateTests
         }
         check (events.back().isNoteOff(), "closing laptop input releases its held keys");
 
-        // Render the actual grid and active keyboard surfaces for visual QA.
+        // Render the actual waveform and active pad surfaces for visual QA.
         if (theme != nullptr && theme->onClick)
         {
             const auto previousTheme = theme->getButtonText();
             auto visualChops = std::make_shared<P::ChopState> (*layout);
             visualChops->chops.resize (12);
-            visualChops->selectedChopId = 2; // selected black key, C#0
+            visualChops->selectedChopId = 2;
             visualChops->chops[2].favorite = true;
             visualChops->chops[3].favorite = true;
             p.publishChopState (visualChops);
@@ -1999,15 +2598,15 @@ struct CueSamplerStateTests
             p.setWaveformZoom (0.0f); p.setWaveformScroll (0.0f);
             p.sampleChangeBroadcaster.sendChangeMessage();
             p.notifyEditStateChanged();
-            waitFor ([&] { return keys->getLowestVisibleKey() == 0 && keys->getMidiChannel() == 1; });
-            p.keyboardState.noteOn (1, 3, 1.0f); // playing favorite black key
-            p.keyboardState.noteOn (1, 4, 1.0f); // playing white key
+            waitFor ([&] { return (int) pads->getProperties()["padCount"] == 12; });
+            p.keyboardState.noteOn (1, 3, 1.0f);
+            p.keyboardState.noteOn (1, 4, 1.0f);
             for (const auto* themeName : { "dark", "light" })
             {
                 if (theme->getButtonText() != juce::String (themeName).toUpperCase()) theme->onClick();
                 for (int i = 0; i < 30; ++i) pump();
                 juce::FileOutputStream image (scratch.getParentDirectory().getChildFile (
-                    "grid-keyboard-active-" + juce::String (themeName) + ".png"));
+                    "grid-pads-active-" + juce::String (themeName) + ".png"));
                 image.setPosition (0); image.truncate();
                 juce::PNGImageFormat().writeImageToStream (editor->createComponentSnapshot (editor->getLocalBounds()), image);
             }
@@ -2044,6 +2643,7 @@ struct CueSamplerStateTests
         if (button == nullptr) return;
         button->onClick();
         check (p.isFavoritesViewEnabled() && button->getToggleState(), "Favorites button enters temporary performance view");
+        p.setMidiPerformanceMode (P::MidiPerformanceMode::LegacyFavorites);
         check (p.getMidiNoteForChopId (3) == 48 && p.getMidiNoteForChopId (1) == 49
                && p.getMidiNoteForChopId (4) == 50 && p.getMidiNoteForChopId (2) == -1,
                "only favorites map consecutively from C4, overriding pins temporarily");
@@ -2059,6 +2659,7 @@ struct CueSamplerStateTests
                    && c.gainDecibels == -2 && c.pitchSemitones == 1;
         }
         check (intact, "Favorites preserves audio, bounds, processing and original MIDI assignments");
+        p.setChopPlaybackMode (P::ChopPlaybackMode::Gate);
         p.prepareToPlay (8000, 64);
         juce::AudioBuffer<float> output (2, 64);
         juce::MidiBuffer midi;
@@ -2073,14 +2674,21 @@ struct CueSamplerStateTests
         check (p.getMidiNoteForChopId (1) == 48 && p.getMidiNoteForChopId (4) == 49,
                "removing a favorite closes the MIDI gap");
         midi.clear(); p.processBlock (output, midi);
-        check (! p.voice.playbackActive, "remapping favorites silences a held voice safely on the audio thread");
+        check (p.getPlayingChopId() == 3 && p.heldMidiNote.load() == 48,
+               "legacy Favorites remapping preserves the sounding chop and its original held note");
+        midi.addEvent (juce::MidiMessage::noteOff (1, 48), 0); p.processBlock (output, midi);
+        midi.clear(); for (int block = 0; block < 10; ++block) p.processBlock (output, midi);
+        check (! p.isPlaying() && p.heldMidiNote.load() == -1,
+               "the original note-off releases a Gate after legacy Favorites remapping");
         p.undoLastEdit();
         check (p.getChopState()->favoriteChopIndices == std::vector<int> { 2, 0, 3 }
                && p.getMidiNoteForChopId (3) == 48, "Undo restores favorite order and compact MIDI mapping");
         p.selectChopById (3); p.toggleSelectedChopFavorite();
         p.setFavoritesViewEnabled (false);
+        p.setMidiPerformanceMode (P::MidiPerformanceMode::Legacy);
         p.selectChopById (3); p.toggleSelectedChopFavorite();
         p.setFavoritesViewEnabled (true);
+        p.setMidiPerformanceMode (P::MidiPerformanceMode::LegacyFavorites);
         check (p.getChopState()->favoriteChopIndices == std::vector<int> { 0, 3, 2 },
                "re-favoriting appends a chop to the end of the lineup");
         juce::MemoryBlock saved; p.getStateInformation (saved);
@@ -2094,17 +2702,29 @@ struct CueSamplerStateTests
         auto* restoredButton = findButton (*reopenedEditor, "FAVORITES");
         check (restoredButton != nullptr && restoredButton->getToggleState(), "reopened editor shows Favorites enabled");
         reopened.setFavoritesViewEnabled (false);
+        reopened.setMidiPerformanceMode (P::MidiPerformanceMode::Legacy);
         check (reopened.getChopState()->midiMap.noteToChopIndex == originalMap && reopened.getMidiRootNote() == 48,
                "leaving Favorites after recall restores exact original mapping and root");
         for (int id : { 1, 3, 4 }) { p.selectChopById (id); p.toggleSelectedChopFavorite(); }
         check (p.getChopState()->favoriteChopIndices.empty() && p.getMappedMidiNotes().none()
-               && p.getChopState()->selectedChopId == -1, "empty Favorites has no phantom MIDI assignments or hidden selection");
+               && p.getChopState()->selectedChopId == 4,
+               "empty Favorites has no phantom MIDI assignments and retains the actual selected chop");
         p.setFavoritesViewEnabled (false);
+        p.setMidiPerformanceMode (P::MidiPerformanceMode::Legacy);
         check (p.getChopState()->midiMap.noteToChopIndex == originalMap, "empty Favorites can return to full original layout");
 
         juce::MemoryInputStream input (saved.getData(), saved.getSize(), false); input.skipNextBytes (4);
         auto legacy = juce::ValueTree::readFromStream (input);
         legacy.removeProperty ("favoritesViewEnabled", nullptr);
+        for (const auto* layerName : { "ChopState", "StashedChopState" })
+        {
+            auto layer = legacy.getChildWithName (layerName);
+            for (const auto* property : { "midiPerformanceMode", "midiMappingLocked", "midiWindowStart", "midiWindowInitialized",
+                                          "favoriteMidiSlotsInitialized", "favoriteMidiHighWater" })
+                layer.removeProperty (property, nullptr);
+            layer.removeChild (layer.getChildWithName ("PerformanceWindowSlots"), nullptr);
+            layer.removeChild (layer.getChildWithName ("PerformanceFavoriteSlots"), nullptr);
+        }
         for (auto child : legacy.getChildWithName ("ChopState")) child.removeProperty ("favoriteOrder", nullptr);
         juce::MemoryBlock oldData;
         { juce::MemoryOutputStream out (oldData, false); out.write ("CSB2", 4); legacy.writeToStream (out); }
@@ -2266,7 +2886,9 @@ struct CueSamplerStateTests
             check (p.getManualChopCaptureEndSample() == 1140, "capture endpoint respects MIDI timestamps");
             juce::MemoryBlock saved; p.getStateInformation (saved);
             const auto tree = juce::ValueTree::readFromData ((const char*) saved.getData() + 4, saved.getSize() - 4);
-            check (tree.getChildWithName ("ChopState").getNumChildren() == 1,
+            int capturedChops = 0;
+            for (auto child : tree.getChildWithName ("ChopState")) if (child.hasType ("Chop")) ++capturedChops;
+            check (capturedChops == 1,
                    "immediate save retains completed capture without an editor timer");
             p.commitPendingManualChopCaptures();
             check (p.getChopState()->chops.size() == 1 && p.getChopState()->chops[0].startSample == 1000
@@ -3037,6 +3659,8 @@ int main (int argc, char** argv)
     if (filter == "--ui-benchmark") CueSamplerStateTests::runUiBenchmark();
     if (filter == "--sample-import") CueSamplerStateTests::runSampleImport (scratch);
     if (filter == "--import-benchmark") CueSamplerStateTests::runImportBenchmark (scratch);
+    if (full || filter == "--midi-performance") CueSamplerStateTests::runMidiPerformance (scratch);
+    if (full || filter == "--chop-pads") CueSamplerStateTests::runChopPads (scratch);
     if (full || filter == "--octave-banking") CueSamplerStateTests::runOctaveBanking (scratch);
     if (full || filter == "--favorites-audio") CueSamplerStateTests::runFavoritesAudio();
     if (full || filter == "--waveform-zoom") CueSamplerStateTests::runWaveformZoom (scratch);

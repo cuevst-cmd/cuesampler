@@ -7,6 +7,69 @@ present at `assets/htdemucs/htdemucs.onnx`; on Windows, fetch and verify it with
 Load the VST3 or AU in a DAW (or AudioPluginHost); watch the log for lines
 prefixed `StemSeparator:`.
 
+## C4 Window / Favorites performance sets
+
+These checks describe the current mapping for new imports. The older C2 and
+channel-bank checks below remain relevant to saved-map compatibility fixtures.
+The user performs the FL Studio portion; automated checks do not control the DAW.
+
+- [ ] Load a new sample with at least 220 chops. At FL's default C4 typing octave,
+      the first chop plays immediately. The active map is WINDOW, with chops 1-56
+      assigned C4-G8. Every source chop stays visible and mouse-playable.
+- [ ] Cyan row bands mark the assigned pads; bright top rails mark the notes
+      reachable in the current typing octave. Favorite, selection and sounding
+      indicators remain readable in both themes.
+- [ ] Drag the Window handle in the pad header. The cyan range previews whole
+      chops, without audition or MIDI remapping. Release to commit. One Undo
+      restores the previous assignments. The final range reaches the last chop.
+- [ ] Favorite chops 1 and 200 in that order. Open Favorites and choose USE FOR
+      MIDI: C4 plays chop 1 and C#4 plays chop 200. Record the pattern in FL.
+- [ ] Return to the waveform and audition outside pads. The recorded Favorites
+      pattern keeps the same sounds. Changing the visible view never changes
+      the MIDI source; the selector in the pad header shows the active source.
+- [ ] Remove chop 1 from Favorites: C4 becomes empty and chop 200 stays on C#4.
+      Add another chop: it takes D4. Re-add chop 1: it returns to C4.
+- [ ] Add more than 56 favorites. Excess favorites remain mouse-playable and
+      show NO MIDI. No implicit MIDI-channel bank or reassignment occurs.
+- [ ] Use SLOTS... > Rebuild slots only when intentionally rebuilding a MIDI
+      layout. Gaps are reclaimed in addition order. Undo restores all old slots.
+- [ ] Enable MIDI LOCK after recording. The mode selector, Window handle, layer
+      switch, regrid controls and slot rebuild cannot change assignments. Sound
+      edits and direct audition still work. Unlocking alone never remaps notes.
+- [ ] Insert or move unassigned chops: existing committed notes keep their chop
+      bindings. If the assigned pads cease to be consecutive, the header reports
+      fixed assignments and the outlines follow the actual owners.
+- [ ] Save/reopen with distinct automatic/manual layouts and MIDI Lock enabled.
+      Restore both maps, reservations, active layer and lock. Older projects retain
+      their saved root, explicit pins, channel banks and saved Favorites mapping.
+
+## Chronological chop pads
+- [ ] The piano keyboard is replaced by numbered pads in source order, left to right,
+      then top to bottom. Pads show chop numbers only, including manually assigned,
+      unassigned, overlapping, and late-song chops.
+- [ ] Exercise short and long songs (16, 64, 220, and 512 chops), both themes, and the
+      minimum window size. All chops fit without scrolling or banks; the window keeps
+      its current height while the waveform shares space with the pad section.
+- [ ] Click the first, middle, and final pads. Each selects the matching waveform chop
+      and updates its controls. MIDI assignments remain unchanged.
+- [ ] A pad follows **GATE** / **ONE SHOT** exactly like a waveform audition. Releasing
+      outside the grid, hiding the editor, or closing it cannot leave a held Gate running.
+- [ ] Selected, sounding, and favorite pads remain distinguishable. Empty cells and gaps
+      do not trigger. Stopped playback clears the sounding highlight.
+- [ ] Favorite pads have a pink face in both themes, including pads outside the active
+      MIDI set. Hover and press transitions are smooth; released pads settle without
+      a permanent flashing or pressed state.
+- [ ] Single-tap auditions; double-tap toggles the exact numbered pad's favorite status.
+      A double-tap does not inject an extra audition or change the active MIDI mode.
+      MIDI Lock protects assigned favorites. Removing a favorite keeps its reserved note.
+- [ ] The MIDI selector offers only WINDOW and FAVORITES. An older project's original
+      notes remain intact under those labels until an explicit remap.
+- [ ] With Favorites open, favorite pads keep that view; a nonfavorite pad returns to
+      the waveform and selects/plays the exact chop.
+- [ ] In FL Studio on macOS, **FL OCT** changes the host's Standard Piano typing octave
+      within C2–C6 after typing keys are released. Every chop pad remains visible.
+      Other hosts do not show those shortcut buttons.
+
 ## Chop playback modes
 - [ ] Both **GATE** and **ONE SHOT** choices stay visible; exactly the active mode is highlighted.
 - [ ] Click/hold a waveform chop in **GATE**: it loops until mouse-up, then releases.
@@ -57,24 +120,25 @@ prefixed `StemSeparator:`.
 ## Manual chopping
 - [ ] Press **CHOP MANUALLY** after automatic chops exist. The waveform immediately becomes
       a clean slate and shows the double-click start instruction.
-- [ ] Double-click a start point, hold a hardware or on-screen MIDI key/pad, and release it
+- [ ] Double-click a start point, hold a hardware or DAW typing-keyboard MIDI note, and release it
       later in the audio. One numbered chop appears from the start point to the exact release
-      position and retriggers only from the MIDI note used during capture.
+      position and keeps the MIDI note used during capture for later triggering.
+      The numbered on-screen pads audition existing chops; use hardware/DAW MIDI for capture.
 - [ ] Place another start marker, then double-click its end without touching MIDI. A numbered,
       sequentially MIDI-mapped chop appears and MIDI capture is cleanly cancelled.
 - [ ] Create several chops out of timeline order. Labels remain numbered in waveform order,
-      while each MIDI-captured chop retains its exact key/pad assignment.
+      while each MIDI-captured chop retains its exact MIDI note assignment.
 - [ ] Hover either boundary of any completed manual chop. The cursor changes to horizontal
       resize; drag the start and end markers independently and confirm the chop bounds update,
-      the label follows waveform order, and its MIDI key/pad assignment is unchanged.
+      the label follows waveform order, and its MIDI note assignment is unchanged.
 - [ ] With overlapping or adjacent chops, click a chop to select it, then resize its shared or
       nearby boundary. The selected chop's marker wins when two edges occupy the same position.
-- [ ] Reassign the same MIDI note to a newer chop. The newer chop owns the pad; the older chop
-      remains selectable and exportable by mouse.
+- [ ] Reassign the same MIDI note to a newer chop. The newer chop owns that MIDI note; the older
+      chop remains directly playable from its numbered pad, selectable and exportable by mouse.
 - [ ] Start manual mode while tempo analysis is still running. Its late result must not refill
       the cleared chop list. Toggle manual mode off, save/reopen, and confirm completed chop
       bounds and MIDI assignments persist.
-- [ ] While holding a pad during capture, confirm the live end guide follows playback and audio
+- [ ] While holding a hardware/DAW MIDI note during capture, confirm the live end guide follows playback and audio
       remains clean throughout the hold and click-free on release. Exercise short taps, long holds,
       release at sample end, zoom, scroll, and several host buffer sizes (especially 64/128 samples).
 - [ ] Enable host sync, HALF TIME, and a non-zero pitch setting before capturing. The in-progress
@@ -86,9 +150,9 @@ prefixed `StemSeparator:`.
       waveform. It disappears while dragging a marker or a chop edge, and returns on release.
       Outside manual mode the guide is still neon red (purple in warp mode).
 - [ ] Place a start marker, then hover it: cursor becomes horizontal resize, the line thickens
-      and shows a soft halo. Drag it — the marker moves and a subsequent pad hold auditions
+      and shows a soft halo. Drag it — the marker moves and a subsequent MIDI-note hold auditions
       from the new position, not the original one.
-- [ ] While holding a pad mid-capture, the marker must NOT be draggable or removable.
+- [ ] While holding a hardware/DAW MIDI note mid-capture, the marker must NOT be draggable or removable.
 - [ ] Double-click the pending marker to remove it. Double-clicking anywhere else still sets
       the chop end.
 - [ ] Select a completed chop in manual mode. A red **×** badge appears immediately right of
@@ -99,9 +163,9 @@ prefixed `StemSeparator:`.
 - [ ] Outside manual mode no × appears, and the ADSR/EXPORT pill sits exactly where it did
       before (position must be unchanged).
 - [ ] After importing a new sample, complete a manual chop by double-clicking the end
-      (no pad held). It is assigned **C2**. The next such chop takes C#2, then D2.
+      (no MIDI note held). It is assigned **C2**. The next such chop takes C#2, then D2.
       Delete the C#2 chop and create another — it reuses C#2 rather than continuing upward.
-- [ ] Chops captured by holding a pad keep that exact pad; the auto-assigned ones skip over
+- [ ] Chops captured by holding a MIDI note keep that exact assignment; the auto-assigned ones skip over
       any note already taken.
 - [ ] Load an older project. Its chops retain their saved root and note assignments.
 
@@ -120,22 +184,22 @@ prefixed `StemSeparator:`.
 - [ ] Zoom until chops are very narrow. The glyph hides rather than colliding with the chop
       number (headers under ~34 px wide).
 
-## MIDI mapping is visible (note names, lit keys, unreachable chops)
+## MIDI mapping and chronological pads
 - [ ] Load a sample. Every chop header wide enough to show it carries the key that
       fires it, on the right of its number. Narrow the zoom until headers are under
       ~52 px — the note name drops, the number stays.
-- [ ] Every header name matches the key that actually triggers that chop. Check at
-      several **OCT +/-** positions; names and lit keys update immediately.
-- [ ] The on-screen keyboard shades every key that triggers a chop. Three states must
-      be tellable apart at a glance: unmapped, mapped-but-silent, and sounding.
-      Verify in both light and dark themes.
+- [ ] Every waveform header name matches the MIDI note/channel that actually triggers
+      that chop. Changing FL's typing octave leaves these assignments unchanged.
+- [ ] The pad rail shows every chop in source order with numbers only. Selection,
+      sounding playback and favorites remain distinguishable in both themes;
+      incoming MIDI highlights the same chop as clicking its numbered pad.
 - [ ] Enter manual mode and pin a chop to a key that a positional chop already
       resolves to (e.g. capture on C2 with the root at C2). The displaced chop's
-      header shows a dimmed `-`, and the status line under CHOP/BARS reads
-      `n CHOPS UNREACHABLE`. Before this change that chop was silently dead.
-- [ ] The unreachable chop is still selectable, previewable and exportable by mouse.
+      header shows a dimmed `-`. Its numbered pad remains visible and playable.
+- [ ] A chop without a MIDI assignment remains selectable, directly previewable from
+      its pad or waveform, and exportable by mouse.
 - [ ] Clear the collision (delete or reassign the pinned chop). The dash disappears,
-      the status line returns to `ROOT <note> | KEY SHOWN ON EACH CHOP`.
+      and that chop's original MIDI note triggers it again. Pad order stays chronological.
 - [ ] A chop carrying warp markers shows both the wave glyph and its note name without
       the two overlapping; below ~72 px the glyph gives way.
 
@@ -152,9 +216,9 @@ prefixed `StemSeparator:`.
       Switch to 2 BARS. Those edits must land on the chop covering the **same audio**
       (bars 7-8), not on the chop that happens to be 7th in the list.
 - [ ] Switch 1 -> 2 -> 4 -> 8 -> 1 and back. No chop ever ends up sharing a key with
-      another (watch the status line for UNREACHABLE, which must stay at zero).
-- [ ] Pin two adjacent chops to different pads at 2 BARS, then switch to 1 BAR. Each
-      pad stays on one chop; the split twins fall back to the positional map rather
+      another (check waveform note labels for unexpected unassigned `-` markers).
+- [ ] Pin two adjacent chops to different MIDI notes at 2 BARS, then switch to 1 BAR. Each
+      note stays on one chop; the split twins fall back to the positional map rather
       than going permanently unassigned.
 - [ ] Set a cue part-way into a chop, then nudge TEMPO trim / grid offset. The cue
       keeps pointing at the same moment of audio rather than the same offset.
@@ -205,7 +269,7 @@ prefixed `StemSeparator:`.
 - [ ] Mute two stems at once (e.g. DRUMS + VOCALS) → only bass + "other" remain.
 
 ## Interaction with existing features (no regressions)
-- [ ] With a stem muted, trigger chops via the on-screen keyboard / MIDI — chops play the
+- [ ] With a stem muted, trigger chops via the numbered pads / MIDI — chops play the
       muted mix, no silence, no stale (pre-mute) audio.
 - [ ] Add warp markers to a chop, then toggle a mute — the warped chop re-bakes against the
       muted audio (no stale warp bake); playback stays warped and correct.
@@ -379,15 +443,15 @@ reporting its worst dispatch gap (under one second required).
 `test_project_restore` exercises the real button, tempo/grid/sync/export math,
 Undo, fine trim, manual chops, saved-state recall and older-state defaults.
 
-## Favorite keyboard colors
+## Favorite pad colors
 
-- [ ] Double-click a chop to favorite it: both the chop and its mapped visual
-      keyboard key turn pink. Check white and black keys.
-- [ ] Select or play a favorite: its key remains pink, with a stronger highlight.
-      Unfavorite it and confirm the usual mapped/selected color returns.
-- [ ] Undo, change OCT, switch chop layers and reopen the editor/project. Pink
-      follows the current resolved MIDI mapping and saved favorite state; an
-      unreachable chop must not tint a key owned by a different chop.
+- [ ] Double-click a waveform chop to favorite it: both the chop and its numbered
+      pad turn pink, including chops without a MIDI assignment.
+- [ ] Select or play a favorite: its pad keeps its pink accent with a stronger
+      highlight. Unfavorite it and confirm the normal selected/sounding styling returns.
+- [ ] Undo, change FL OCT where available, switch chop layers and reopen the
+      editor/project. Pink follows the saved favorite flag on the exact chop;
+      MIDI collisions do not hide or transfer a favorite's pad styling.
 
 ## Favorites performance view
 
@@ -397,12 +461,13 @@ Undo, fine trim, manual chops, saved-state recall and older-state defaults.
       tiles and MIDI after the view has been open for several seconds.
 - [ ] In FL Studio, audition tiles with the host transport stopped. Mouse
       audition uses the same preview path as the waveform, including NO MIDI
-      tiles beyond the first 92 favorites. Hiding Favorites releases a held
+      tiles beyond the available MIDI assignments. Hiding Favorites releases a held
       mouse GATE; hardware MIDI follows the displayed C2-upward assignments.
 - [ ] Favorite chops out of sample order (for example 3, 1, 6, 4). Click
       **FAVORITES** above the waveform: only those chops appear, side by side,
-      labeled C2, C#2, D2, D#2 in the order they were favorited. Pink keyboard
-      keys and incoming MIDI must agree with the tile labels.
+      labeled C2, C#2, D2, D#2 in the order they were favorited. Incoming MIDI
+      agrees with the tile labels. The separate numbered pad rail keeps every
+      chop in source order and highlights the same favorite chop.
 - [ ] Click/hold a tile in GATE mode, then release it. Try ONE SHOT and hardware
       MIDI too. Cue, gain, pitch, reverse, warp and stem settings still belong
       to the original chops. This view does not concatenate or rewrite audio.
@@ -421,15 +486,17 @@ Undo, fine trim, manual chops, saved-state recall and older-state defaults.
 - [ ] Save/reopen with Favorites on, including favorites from a manual chop layout.
       The current view, favorite order and temporary MIDI map return. Switching
       it off after recall still restores the original mappings.
-- [ ] Remove every favorite: show the empty-state instructions and no mapped keys.
+- [ ] Remove every favorite: show the empty-state instructions and no favorite MIDI
+      assignments. The numbered pad rail still shows and auditions every source chop.
       Load another sample: Favorites returns off. Old projects without favorite
       chronology use sample order initially; new favorite actions record order.
 - [ ] With 8, 18 and 24 favorites, verify every tile fits on screen in rows.
       Resize the window: labels and waveforms stay inside their tiles. Play and
       audition tiles in each row; gaps and empty cells must not trigger a chop.
-      The first 92 favorites map from MIDI 36 (C2) through 127 (G9); additional
-      tiles explicitly display NO MIDI. Favorites are taken from the active chop
-      layout; switch the manual/automatic layout in the full view.
+      Favorite MIDI assignments begin at the saved root and retain their existing
+      channel banks; any tile beyond MIDI capacity explicitly displays NO MIDI.
+      Favorites are taken from the active chop layout; switch the manual/automatic
+      layout in the full view. Numbered pads remain chronological in either view.
 
 `test_project_restore` checks chronology, the real Favorites button, C2 MIDI
 triggering, original-pin suppression/restoration, original audio/settings,
@@ -516,42 +583,41 @@ held-voice reset on remap, removal/re-add, Undo, portable recall and old states.
 - [ ] With no favorites (or no selected favorite), EDIT CHOP is disabled.
       Double-clicking a favorite still auditions without removing it.
 
-## OCT -/+ and MIDI mapping (C2 start, higher screen keys)
+## FL OCT -/+ and MIDI mapping
 
-- [ ] Restart FL after installation. Select its standard Piano typing layout.
-      No virtual MIDI input or controller adapter is needed.
-- [ ] Import a sample with at least 104 chops. The screen opens at C2: chop 1
+- [ ] In FL Studio on macOS, restart FL after installation and select its Standard
+      Piano typing layout. **FL OCT** appears; no virtual MIDI input or controller
+      adapter is needed. Other hosts/platforms do not show these shortcut buttons.
+- [ ] Import a sample with at least 104 chops. MIDI mapping starts at C2: chop 1
       is C2, chop 13 is C3, chop 49 is C6, chop 61 is C7, and chop 104 is G10.
-      With FL typing at C2, Z plays/lights chop 1 in both views.
-- [ ] Play a typing note first to reveal its real octave. Release it; OCT −/+
-      controls FL C2–C6, preserving real pitches in the DAW and CUE. Check FL's
-      actual menu/notes as well as the CUE caption.
-- [ ] At OCT C6, press +: CUE shows C7 and SCREEN KEYS. Click C7 to play chop
-      61. Continue to C10 and click G10 for chop 104. FL's typing octave does
-      not change during these higher view steps. Clips/typing do not pull the
-      higher screen view away. Return to C6: FL receives its native C6 shortcut.
-- [ ] Hold a typing key while returning C7→C6: native dispatch is blocked and
-      the view stays C7. Release, retry, and check matching note-off behavior.
-      Test inactive FL, text editing and dialogs. Screen-only navigation must
-      never send unsupported shortcuts or transpose a held host note.
-- [ ] Record a clip using FL typing; OCT never reinterprets its MIDI.
-      Mouse screen keys audition in CUE without injecting a DAW recording input.
-      Save/reopen: root, mapping and screen view return; recall sends no shortcut.
-- [ ] A 220-chop C2 sample exposes 1–104/channel 1, 105–208/channel 2, and
-      209–220/channel 3. Later ranges restart at C2. All corresponding screen
-      keys and DAW channel/note pairs trigger the same chop.
+      Every chop remains visible as a numbered pad. With FL typing at C2, Z
+      plays/highlights chop 1; clicking pad 104 plays that exact late chop directly.
+- [ ] Play a typing note first to reveal its real octave. Release it; FL OCT −/+
+      controls FL C2–C6 while preserving absolute MIDI assignments. Check FL's
+      actual menu/notes as well as the CUE caption. At C2 the − button is disabled;
+      at C6 the + button is disabled. There is no C7–C10 screen navigation.
+- [ ] Hold a typing key and request an octave change: native dispatch is blocked,
+      the caption stays put and the original note-off releases normally. Release,
+      retry and confirm the change. Test inactive FL, text editing and dialogs;
+      blocked requests must not transpose held notes or alter the pad layout.
+- [ ] Record a clip using FL typing; FL OCT never reinterprets its MIDI. Clicking
+      numbered pads auditions in CUE without injecting a DAW recording input.
+      Save/reopen: root and mapping return; recall sends no FL shortcut.
+- [ ] A 220-chop C2 sample retains chops 1–104/channel 1, 105–208/channel 2,
+      and 209–220/channel 3. Later ranges restart at C2. All 220 numbered pads
+      remain visible; each DAW channel/note pair and its pad trigger the same chop.
 - [ ] Older C0 and C4 projects retain their existing mappings/range sizes.
       Importing a new sample starts C2; failed imports preserve the old map.
       Manual captures retain explicit pins; new unpinned manual chops start C2.
 - [ ] Favorites pack from the current saved root. Test both themes and minimum
-      editor size: SCREEN KEYS and blocked-request status fit the mapping strip.
-      The CHOPS slider is absent for all chop counts; later chops retain their DAW channel/note assignments.
+      editor size: FL OCT and blocked-request status fit the mapping strip where
+      available. The CHOPS slider stays absent; later chops keep their DAW
+      channel/note assignments and all source-ordered pads remain visible.
 
-`test_project_restore --octave-banking` covers native-to-screen transitions,
-blocked returns to C6, C10 limits, the new C2/104-note ranges and recall, legacy
-C0/C4 mappings, all 128 legacy screen/host notes, Favorites and release pairing.
-The native C6→C5 change was confirmed live by the user; the new C6→C7 screen
-transition and C2 import UI remain host smoke checks after installation.
+`test_project_restore --octave-banking` covers the C2–C6 FL shortcut limits,
+blocked requests, C2/104-note channel ranges and recall, legacy C0/C4 mappings,
+all 128 legacy MIDI notes, Favorites and release pairing. Validate actual native
+FL shortcut delivery in the host after installation.
 
 ## Background sample import
 
@@ -585,16 +651,19 @@ then verifies compact recall and shared persistence through stem remixes.
 for a 30-second stereo WAV over three runs against the previous import path.
 
 
-## Grid and keyboard visibility
+## Grid and pad visibility
 
 - [ ] In automatic and manual chop modes, orange bar guides use round dots with
       clear gaps. Zoom/scroll and adjust TEMPO: dots stay aligned to the bar grid,
       and no continuous beat line shows through the gaps.
-- [ ] Check both themes at normal and minimum editor sizes. Selected white and
-      black keys have a strong accent fill and outline; playing keys have a bright
-      orange fill (pink for favorites), a pale rim, and a dark bottom indicator.
-- [ ] Release a played key: its playing fill clears and selection/favorite styling
-      returns. Host MIDI and mouse input highlight the same mapped note.
+- [ ] Check both themes at normal and minimum editor sizes. Every chop has a
+      source-ordered, number-only pad. Selected pads have an accent outline;
+      sounding pads have a bright orange fill (pink for favorites), and favorite
+      accents remain visible even when the chop has no MIDI assignment.
+- [ ] Release a Gate pad: its sounding fill clears after release and selection/
+      favorite styling remains. One Shot keeps its sounding fill until playback
+      ends. Host MIDI and direct pad clicks highlight the same sounding chop.
 - [ ] Load more than 128 chops, toggle Favorites and reopen the editor. The CHOPS
-      slider stays absent, OCT stays bounded to C0–C10, and existing DAW MIDI
-      channel/note assignments still trigger the same chops.
+      slider stays absent and every chop stays visible/playable. FL OCT is shown
+      only in FL Studio on macOS and stays bounded to typing C2–C6; existing
+      DAW MIDI channel/note assignments still trigger the same chops.

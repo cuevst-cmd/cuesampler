@@ -1,46 +1,53 @@
 # Keyboard and MIDI
 
-New samples start at **C2 (MIDI 24)**: chop 1 = C2, chop 2 = C#2,
-chop 13 = C3, chop 49 = C6, chop 61 = C7, and chop 104 = G10 (127).
-The screen keyboard opens at C2. FL and CUE use the same absolute MIDI pitches
-and note labels. Explicit manual assignments remain fixed.
+New samples use **WINDOW**, starting at **C4 (MIDI 48)**. At FL Studio's default
+typing octave, the first key plays chop 1 immediately. The window assigns 56
+consecutive chops to C4-G8. All source chops remain visible as numbered pads.
+The MIDI selector has exactly two choices: **WINDOW** and **FAVORITES**.
 
-In FL Studio on macOS, **OCT −/+ controls FL's typing octave within C2–C6**
-using its documented Option + numeric-keypad 2–6 shortcuts. Use FL's standard
-Piano layout. Play a typing note first so CUE can reveal the actual input octave;
-release it before changing OCT. A blocked native request leaves CUE's view intact.
-Held keys, inactive FL, text editing and dialogs block native shortcut dispatch.
+The cyan region shows the assigned set. Bright cyan top rails show notes
+reachable at the current typing octave. Favorite pad faces stay pink, including
+chops outside the active MIDI window. Hover, press, trigger and release highlights
+animate on the UI thread and settle when idle. Drag the Window handle in the pad header
+to preview another consecutive range; release to commit it. This changes which
+chops existing MIDI notes play. One Undo restores the previous map.
 
-**Above C6, OCT browses CUE's on-screen keyboard through C10.** The readout
-changes to SCREEN KEYS. Click those keys to audition the higher chops; FL's
-computer-keyboard octave stays at its previous setting. Returning from C7 to
-C6 sends the native C6 shortcut again. Clips and typing input do not pull CUE
-out of an explicitly selected higher screen view. Screen key lights and MIDI
-labels always refer to the actual note, never a local playback transpose.
+In FL Studio on macOS, **FL OCT -/+** controls the Standard Piano typing octave
+within C2-C6. Release typing keys before changing OCT. A blocked request leaves
+the octave unchanged. The installed Piano layout spans 32 chromatic notes;
+starting at C4 and stepping through C6 reaches the complete 56-note set.
+Lower octaves do not reassign chops. There is no higher screen-keyboard page.
 
-The normal two FL typing rows can play notes above the selected starting octave.
-This does not extend FL's native octave shortcuts beyond C2–C6. Screen-key
-clicks audition inside CUE; they do not inject notes into FL's recording input.
+For a pattern using distant chops, add them to **Favorites** in the desired
+order, then select **USE FOR MIDI** or choose **FAVORITES** in the MIDI selector.
+For example, favoriting chop 1 then chop 200 assigns C4 then C#4. Removing a
+favorite leaves a reserved empty slot. New favorites append; re-adding the same
+chop restores its reserved note. Excess favorites remain mouse-playable without
+an automatic MIDI-channel bank. **SLOTS... > Rebuild slots** explicitly reclaims
+gaps and changes recorded note meanings; Undo restores the previous layout.
+Double-tap a numbered source pad to toggle its favorite status. Single presses
+still audition normally, and MIDI Lock protects assignments from double-tap edits.
 
-Reference: [FL Studio keyboard shortcuts](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/basics_shortcuts.htm).
+Opening Favorites or returning to the waveform only changes the view. The
+active MIDI performance set stays in place. Every pattern on the same plugin
+instance uses that set; use another instance for an independent set.
 
-Each C2-root range has **104 notes, C2–G10**. With more chops, CHOPS selects
-later screen-keyboard MIDI channels. A 220-chop sample uses ranges 1–104 on
-channel 1, 105–208 on channel 2, and 209–220 on channel 3. Selecting a range
-returns the view to its first C2. Host MIDI keeps its original channel/note,
-regardless of OCT or CHOPS. The slider is hidden with 104 or fewer chops.
+Enable **MIDI LOCK** to prevent moving the Window, changing its MIDI source,
+switching chop layers, rebuilding the grid, deleting assigned members, or
+rebuilding favorite slots. Browsing, direct pad audition and intentional sound
+edits remain available. Unlocking alone does not change assignments.
 
-Projects retain their saved root, channel/note map, OCT view and selected range.
-Existing C0 projects keep their 128-note ranges; existing C4 projects keep their
-80-note ranges. They are not silently reassigned to C2. Their lower screen keys
-remain available. Importing a new sample resets the root/view/range to C2,
-channel 1. Failed imports preserve existing state. Legacy projects with channel
-aliases do not expose an overflow slider. Favorites pack from the saved root.
+Projects save the active map, Window bindings, Favorites reservations, both chop
+layers, typing-octave view and MIDI Lock. Older projects retain their saved root,
+explicit assignments, channel banks and saved Favorites map. These appear under
+Window or Favorites without additional selector modes. Opening an old project
+never silently changes its recorded notes. Refreshing / moving its Window or
+choosing USE FOR MIDI explicitly adopts the new C4 layout; Undo restores the old map.
 
-Obsolete learned-transposition settings remain ignored. Recorded clips play
-their actual saved pitches. Opening an editor, loading a project or changing
-CHOPS never sends an FL octave shortcut. FL's typing octave is shared across
-plugins; only an explicit OCT click in the native range changes it.
+Direct pad clicks audition inside CUE using Gate / One Shot. Mouse-click input
+lighting and recording inside FL is a separate host integration requirement;
+this feature does not establish that input path. No controller adapter or
+virtual MIDI source is installed by the Window / Favorites feature.
 
-There is no virtual MIDI source, keyboard interception or controller adapter.
-The temporary full-range MIDI probe was stopped without changing FL settings.
+See [the performance mapping specification](CHOP_MIDI_PERFORMANCE.md) and
+[FL Studio keyboard shortcuts](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/basics_shortcuts.htm).
