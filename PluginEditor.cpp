@@ -10094,7 +10094,7 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
                              ? "ADD CHOP: click start / end   EDIT: select + audition   Drag S / E: trim   Escape: cancel"
                              : "Click chop: preview   DRAG AUDIO: export to DAW   Drag edge: resize   Shift-drag: tempo",
                          juce::Rectangle<int> (400, 84, juce::jmax (0, (int) fluidW - 410), 20),
-                         juce::Justification::centred, 10.8f,
+                         juce::Justification::centred, 15.0f,
                          cue::textMuted.withAlpha (0.9f));
 }
 
