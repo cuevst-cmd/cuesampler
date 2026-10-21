@@ -355,6 +355,15 @@ set(ONNX_DYLIB "${ONNXRUNTIME_ROOT}/lib/${ORT_DYLIB_NAME}")
 # succeeds (StemSeparator falls back to the original buffer). NOT
 # juce_add_binary_data — too large.
 set(CUE_STEM_MODEL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/assets/htdemucs/htdemucs.onnx")
+# On macOS prefer the equivalent compact graph from tools/optimize_stem_model.py.
+# It precomputes a fixed iSTFT envelope, avoiding thousands of constant-folding
+# operations and their multi-GB load-time peak. The original remains available
+# for A/B checks; both variants expose exactly the same waveform I/O.
+set(CUE_COMPACT_STEM_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/assets/htdemucs/htdemucs-compact.onnx")
+if(APPLE AND EXISTS "${CUE_COMPACT_STEM_MODEL}")
+    set(CUE_STEM_MODEL_SRC "${CUE_COMPACT_STEM_MODEL}")
+endif()
+message(STATUS "Stem model: ${CUE_STEM_MODEL_SRC}")
 set(CUE_COPY_IF_EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_if_exists.cmake")
 set(CUE_REMOVE_STALE_ONNX "${CMAKE_CURRENT_SOURCE_DIR}/cmake/remove_stale_onnx_dylibs.cmake")
 
@@ -377,6 +386,9 @@ if(APPLE)
         endif()
 
         add_dependencies(${_tgt} CueSampler_Legal)
+        if(EXISTS "${CUE_STEM_MODEL_SRC}")
+            set_property(TARGET ${_tgt} APPEND PROPERTY LINK_DEPENDS "${CUE_STEM_MODEL_SRC}")
+        endif()
         # Policy changes must relink so POST_BUILD re-seals the updated resources.
         set_property(TARGET ${_tgt} APPEND PROPERTY LINK_DEPENDS
             "${CMAKE_CURRENT_SOURCE_DIR}/EULA.md"
@@ -566,6 +578,7 @@ if(CUE_BUILD_STATE_TEST)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DIRECTML_DLL}" "$<TARGET_FILE_DIR:test_project_restore>/DirectML.dll")
     endif()
     add_test(NAME project_restore COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}")
+    add_test(NAME stem_state COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --state-only)
     add_test(NAME cue_recall COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --cue-recall)
     add_test(NAME manual_chops COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --manual-chops)
     add_test(NAME waveform_colour COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --waveform-colour)

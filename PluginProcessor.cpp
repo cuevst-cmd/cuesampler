@@ -2108,7 +2108,8 @@ public:
         }
 
         cuesampler::StemCache::Entry entry;
-        if (! cuesampler::StemCache::load (key, entry))
+        juce::MemoryBlock encoded;
+        if (! cuesampler::StemCache::load (key, entry, &encoded))
         {
             owner.publishStems (nullptr, generation);
             return jobHasFinished;
@@ -2130,10 +2131,9 @@ public:
             return jobHasFinished;
         }
 
-        juce::MemoryBlock encoded;
-        if (! cuesampler::StemCache::encode (entry, encoded) || shouldExit())
-            return jobHasFinished;
         auto set = std::make_shared<StemSet>();
+        // Reuse the validated cache container. Re-encoding adds CPU work and
+        // another lossy MP3 generation every time an existing sample is loaded.
         set->serializedStemData = juce::var (std::move (encoded));
         set->source   = sampleData;
         set->drums    = std::move (entry.drums);
@@ -2216,11 +2216,12 @@ public:
 
         std::shared_ptr<StemSet> restoredStems;
         cuesampler::StemCache::Entry entry;
+        juce::MemoryBlock cachedStemData;
         const auto* embeddedStems = restoreState.embeddedStemData.getBinaryData();
         const bool decoded = embeddedStems != nullptr
             ? cuesampler::StemCache::decode (*embeddedStems, entry)
             : (restoreState.restoredStemCacheKey.isNotEmpty()
-               && cuesampler::StemCache::load (restoreState.restoredStemCacheKey, entry));
+               && cuesampler::StemCache::load (restoreState.restoredStemCacheKey, entry, &cachedStemData));
         if (shouldExit() || generation != owner.restoreGeneration.load (std::memory_order_acquire))
             return jobHasFinished;
         if (decoded && restoredSample != nullptr
@@ -2234,11 +2235,7 @@ public:
             if (embeddedStems != nullptr)
                 restoredStems->serializedStemData = restoreState.embeddedStemData;
             else
-            {
-                juce::MemoryBlock encoded;
-                if (cuesampler::StemCache::encode (entry, encoded))
-                    restoredStems->serializedStemData = juce::var (encoded);
-            }
+                restoredStems->serializedStemData = juce::var (std::move (cachedStemData));
             restoredStems->drums = std::move (entry.drums);
             restoredStems->bass = std::move (entry.bass);
             restoredStems->vocals = std::move (entry.vocals);
@@ -2800,7 +2797,14 @@ AudioPluginAudioProcessor::AudioPluginAudioProcessor()
         if (atBinary.existsAsFile())
             return atBinary;
 
-        const auto atSource = juce::File (__FILE__).getParentDirectory().getChildFile ("assets/htdemucs/htdemucs.onnx");
+        const auto sourceModels = juce::File (__FILE__).getParentDirectory().getChildFile ("assets/htdemucs");
+       #if JUCE_MAC
+        const auto compact = sourceModels.getChildFile ("htdemucs-compact.onnx");
+        if (compact.existsAsFile())
+            return compact;
+       #endif
+
+        const auto atSource = sourceModels.getChildFile ("htdemucs.onnx");
         if (atSource.existsAsFile())
             return atSource;
 

@@ -1,4 +1,4 @@
-// Offline test for StemSeparator (HTDemucs-FT ONNX stem separation).
+// Offline test and timing harness for StemSeparator (base HTDemucs).
 //
 // Unlike tools/test_warp_map.cpp (no deps), this needs JUCE + ONNX Runtime, so
 // it is built through CMake behind an off-by-default option rather than a bare
@@ -10,8 +10,10 @@
 //
 //   <song.wav>    short stereo WAV (a few seconds is plenty)
 //   [model]       path to htdemucs.onnx, or a dir containing it
-//                 (default: assets/htdemucs/htdemucs.onnx). Produce it with
-//                 export_htdemucs.py.
+//                 (default: assets/htdemucs; prefers htdemucs-compact.onnx).
+//                 Produce the compact model with tools/optimize_stem_model.py.
+//   [output-dir]  optional directory for lossless float WAV stems, for listening
+//                 and numerical A/B comparison with another build/settings.
 //
 // If the onnxruntime dylib isn't found at run time, prefix with:
 //   DYLD_LIBRARY_PATH=build/_deps/onnxruntime-src/lib ./.../test_stem_separator ...
@@ -36,6 +38,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+
+#if defined(__APPLE__) || defined(__unix__)
+ #include <sys/resource.h>
+#endif
 
 namespace
 {
@@ -86,13 +92,38 @@ struct StdoutLogger : juce::Logger
 {
     void logMessage (const juce::String& msg) override { std::cout << "  [log] " << msg << "\n"; }
 };
+
+double processCpuSeconds()
+{
+   #if defined(__APPLE__) || defined(__unix__)
+    rusage usage {};
+    if (getrusage (RUSAGE_SELF, &usage) == 0)
+        return (double) usage.ru_utime.tv_sec + 1.0e-6 * usage.ru_utime.tv_usec
+             + (double) usage.ru_stime.tv_sec + 1.0e-6 * usage.ru_stime.tv_usec;
+   #endif
+    return -1.0;
+}
+
+bool writeStem (const juce::File& file, const juce::AudioBuffer<float>& stem, double sampleRate)
+{
+    // Replace output from a previous A/B run rather than appending to it.
+    if (file.existsAsFile() && ! file.deleteFile())
+        return false;
+    std::unique_ptr<juce::OutputStream> stream = file.createOutputStream();
+    juce::WavAudioFormat format;
+    const auto options = juce::AudioFormatWriterOptions{}.withSampleRate (sampleRate)
+        .withNumChannels (stem.getNumChannels()).withBitsPerSample (32)
+        .withSampleFormat (juce::AudioFormatWriterOptions::SampleFormat::floatingPoint);
+    auto writer = format.createWriterFor (stream, options);
+    return writer != nullptr && writer->writeFromAudioSampleBuffer (stem, 0, stem.getNumSamples());
+}
 } // namespace
 
 int main (int argc, char* argv[])
 {
     if (argc < 2)
     {
-        std::cerr << "usage: test_stem_separator <song.wav> [model=assets/htdemucs/htdemucs.onnx]\n";
+        std::cerr << "usage: test_stem_separator <song.wav> [model=assets/htdemucs/htdemucs.onnx] [output-dir]\n";
         return 2;
     }
 
@@ -102,9 +133,12 @@ int main (int argc, char* argv[])
     const juce::File wavFile { juce::String (argv[1]) };
     // argv[2] may be the model .onnx file, or a directory containing htdemucs.onnx.
     juce::File modelFile { argc >= 3 ? juce::String (argv[2])
-                                     : juce::String ("assets/htdemucs/htdemucs.onnx") };
+                                     : juce::String ("assets/htdemucs") };
     if (modelFile.isDirectory())
-        modelFile = modelFile.getChildFile ("htdemucs.onnx");
+    {
+        const auto compact = modelFile.getChildFile ("htdemucs-compact.onnx");
+        modelFile = compact.existsAsFile() ? compact : modelFile.getChildFile ("htdemucs.onnx");
+    }
 
     if (! wavFile.existsAsFile())
     {
@@ -155,6 +189,7 @@ int main (int argc, char* argv[])
    #endif
 
     const auto tLoad0 = clock::now();
+    const double cpuLoad0 = processCpuSeconds();
     StemSeparator sep (paths);
     const double loadSecs = secsSince (tLoad0);
     if (! sep.isReady())
@@ -165,10 +200,13 @@ int main (int argc, char* argv[])
         return 0; // clean skip — not a failure
     }
     std::printf ("Session load + compile: %.2f s\n", loadSecs);
+    if (cpuLoad0 >= 0.0)
+        std::printf ("Session CPU: %.2f s\n", processCpuSeconds() - cpuLoad0);
 
     // ── Separate ──────────────────────────────────────────────────────────────
     std::cout << "Separating";
     const auto tSep0 = clock::now();
+    const double cpuSep0 = processCpuSeconds();
     auto result = sep.separate (source, srcRate,
                                 [] (float f) { std::printf ("\rSeparating %5.1f%%", f * 100.0f); std::fflush (stdout); });
     const double sepSecs = secsSince (tSep0);
@@ -176,6 +214,20 @@ int main (int argc, char* argv[])
     const double audioSecs = srcLen / srcRate;
     std::printf ("Separation: %.2f s wall for %.2f s audio (%.2fx realtime)\n",
                  sepSecs, audioSecs, audioSecs / juce::jmax (1e-9, sepSecs));
+    if (cpuSep0 >= 0.0)
+        std::printf ("Separation CPU: %.2f s\n", processCpuSeconds() - cpuSep0);
+   #if defined(__APPLE__) || defined(__unix__)
+    rusage usage {};
+    if (getrusage (RUSAGE_SELF, &usage) == 0)
+    {
+       #if defined(__APPLE__)
+        const double peakBytes = (double) usage.ru_maxrss;
+       #else
+        const double peakBytes = (double) usage.ru_maxrss * 1024.0;
+       #endif
+        std::printf ("Peak process RSS (includes model load): %.1f MiB\n", peakBytes / (1024.0 * 1024.0));
+    }
+   #endif
 
     check (result.valid, "separate() returned a valid result");
     if (! result.valid) return failures == 0 ? 0 : 1;
@@ -186,6 +238,16 @@ int main (int argc, char* argv[])
     check (shapeOk (result.drums),  "drums  matches source shape");
     check (shapeOk (result.bass),   "bass   matches source shape");
     check (shapeOk (result.vocals), "vocals matches source shape");
+
+    if (argc >= 4)
+    {
+        const juce::File outputDir { juce::String (argv[3]) };
+        const bool ok = outputDir.createDirectory().wasOk();
+        check (ok && writeStem (outputDir.getChildFile ("drums.wav"), result.drums, srcRate)
+                  && writeStem (outputDir.getChildFile ("bass.wav"), result.bass, srcRate)
+                  && writeStem (outputDir.getChildFile ("vocals.wav"), result.vocals, srcRate),
+               "writes lossless float WAV stems for A/B validation");
+    }
 
     // (b) subtraction reconstruction: other := original − (drums+bass+vocals)
     juce::AudioBuffer<float> sumDBV (srcCh, srcLen); sumDBV.clear();

@@ -4767,13 +4767,55 @@ struct CueSamplerStateTests
         check (two != nullptr && two->getToggleState(), "host restore keeps BARS display synchronized");
         editor.reset();
 
+        // Background cache lookup must publish the portable bytes that were
+        // already stored, without loading the model or transcoding the stems.
+        const auto* originalStemData = originalStems->serializedStemData.getBinaryData();
+        check (cuesampler::StemCache::storeEncoded (originalStems->cacheKey, *originalStemData),
+               "seed cache entry for direct lookup and legacy recall");
+        {
+            P lookup;
+            const auto source = originalStems->source;
+            std::atomic_store (&lookup.loadedSample, source);
+            lookup.launchStemCacheLookup (source, originalStems->cacheKey);
+            check (waitFor ([&] { return lookup.stemThreadPool.getNumJobs() == 0; }),
+                   "direct stem cache lookup finishes");
+            const auto cachedStems = std::atomic_load (&lookup.stemSet);
+            check (lookup.areStemsReady() && ! lookup.isLookingUpStemCache()
+                   && ! lookup.isRestoringSavedStems() && lookup.stemSeparator == nullptr,
+                   "cache hit becomes ready and clears busy status without loading a separator");
+            check (cachedStems != nullptr && cachedStems->serializedStemData.getBinaryData() != nullptr
+                   && *cachedStems->serializedStemData.getBinaryData() == *originalStemData
+                   && lookup.getLoadedSample() == source,
+                   "direct cache lookup reuses exact portable bytes and pristine unmuted source");
+
+            auto mismatchedSource = std::make_shared<P::LoadedSampleData>();
+            mismatchedSource->sampleRate = source->sampleRate;
+            mismatchedSource->buffer.setSize (source->buffer.getNumChannels(), source->buffer.getNumSamples() - 1);
+            mismatchedSource->buffer.clear();
+            std::atomic_store (&lookup.loadedSample, mismatchedSource);
+            lookup.launchStemCacheLookup (mismatchedSource, originalStems->cacheKey);
+            check (waitFor ([&] { return lookup.stemThreadPool.getNumJobs() == 0; })
+                   && ! lookup.areStemsReady() && ! lookup.isLookingUpStemCache()
+                   && ! lookup.isRestoringSavedStems() && std::atomic_load (&lookup.stemSet) == nullptr
+                   && lookup.getLoadedSample() == mismatchedSource,
+                   "mismatched cached stems clear busy status and preserve the current source");
+
+            const juce::String corruptKey = "fedcba9876543210";
+            const juce::MemoryBlock corruptData ("bad container", 13);
+            check (cuesampler::StemCache::storeEncoded (corruptKey, corruptData), "seed corrupt cache entry");
+            lookup.launchStemCacheLookup (mismatchedSource, corruptKey);
+            check (waitFor ([&] { return lookup.stemThreadPool.getNumJobs() == 0; })
+                   && ! lookup.areStemsReady() && ! lookup.isLookingUpStemCache()
+                   && ! lookup.isRestoringSavedStems() && std::atomic_load (&lookup.stemSet) == nullptr
+                   && lookup.getLoadedSample() == mismatchedSource && lookup.stemSeparator == nullptr,
+                   "corrupt cache entry clears busy status without replacing source or loading a model");
+        }
+
         // Older projects use a cache key, but a successful recall upgrades their
         // next save to embedded audio. No model is needed to decode old stems.
         auto legacy = juce::ValueTree::readFromData (static_cast<const char*> (saved.getData()) + 4, saved.getSize() - 4);
         legacy.setProperty ("version", 6, nullptr);
         legacy.removeProperty ("embeddedStemData", nullptr);
-        check (cuesampler::StemCache::storeEncoded (originalStems->cacheKey,
-                   *originalStems->serializedStemData.getBinaryData()), "seed legacy cache entry");
         juce::MemoryBlock legacyState;
         { juce::MemoryOutputStream stream (legacyState, false); stream.write ("CSB2", 4); legacy.writeToStream (stream); }
         reopened.setStateInformation (legacyState.getData(), (int) legacyState.getSize());
@@ -4781,12 +4823,20 @@ struct CueSamplerStateTests
         check (std::atomic_load (&reopened.stemSet) != nullptr
                && correlation (originalMix->buffer, reopened.getLoadedSample()->buffer) > 0.90,
                "legacy mute mix restored");
+        const auto legacyStems = std::atomic_load (&reopened.stemSet);
+        check (legacyStems != nullptr && legacyStems->serializedStemData.getBinaryData() != nullptr
+               && *legacyStems->serializedStemData.getBinaryData() == *originalStemData,
+               "legacy cache-only restore retains the exact original portable stem bytes");
         juce::MemoryBlock upgraded;
         reopened.getStateInformation (upgraded);
         cuesampler::StemCache::clear();
         reopened.setStateInformation (upgraded.getData(), (int) upgraded.getSize());
         check (waitFor ([&] { return restored (reopened); }), "upgraded legacy save restores after cache removal");
         check (std::atomic_load (&reopened.stemSet) != nullptr, "upgraded save embeds stems");
+        const auto upgradedStems = std::atomic_load (&reopened.stemSet);
+        check (upgradedStems != nullptr && upgradedStems->serializedStemData.getBinaryData() != nullptr
+               && *upgradedStems->serializedStemData.getBinaryData() == *originalStemData,
+               "legacy upgrade and cache-free recall preserve the original stem payload exactly");
 
         // Save-time editing has no 256-chop/64-marker limit. Recall must not
         // silently trim either list (a normal long song can exceed 256 chops).
@@ -4925,6 +4975,9 @@ int main (int argc, char** argv)
    #endif
     const auto filter = argc > 2 ? juce::String (argv[2]) : juce::String();
     const bool full = filter.isEmpty() || filter == "--separate";
+    // Focused integration path: real inference/cache/save/mute checks without
+    // unrelated export-drag dialogs or other UI gesture suites.
+    if (filter == "--stem-separation") CueSamplerStateTests::run (true);
     if (filter == "--ui-benchmark") CueSamplerStateTests::runUiBenchmark();
     if (filter == "--sample-import") CueSamplerStateTests::runSampleImport (scratch);
     if (full || filter == "--sample-import" || filter == "--sample-trim") CueSamplerStateTests::runSampleTrim (scratch);

@@ -15,6 +15,14 @@ struct StemProcessingSettings
     double overlap = defaultOverlap;
     int requestedSegmentSamples = segmentSamples;
 
+    // Runtime-only budget: keep host/audio/UI headroom on Intel and avoid
+    // oversubscribing heterogeneous Apple CPUs. It does not alter cache identity.
+    static int defaultIntraOpThreads (unsigned int logicalCpus, int performanceCores = 0) noexcept
+    {
+        const int budget = (int) juce::jlimit (1u, 4u, logicalCpus / 2);
+        return performanceCores > 0 ? juce::jmin (budget, performanceCores) : budget;
+    }
+
     static StemProcessingSettings fromEnvironment()
     {
         StemProcessingSettings settings;

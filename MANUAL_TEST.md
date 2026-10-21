@@ -7,6 +7,21 @@ present at `assets/htdemucs/htdemucs.onnx`; on Windows, fetch and verify it with
 Load the VST3 or AU in a DAW (or AudioPluginHost); watch the log for lines
 prefixed `StemSeparator:`.
 
+## Older Mac stem performance
+
+- [ ] Generate `htdemucs-compact.onnx` with `tools/optimize_stem_model.py` before
+      configuring/building. Verify CMake selects it and the bundle contains that
+      file as `Resources/htdemucs/htdemucs.onnx` (same SHA-256).
+- [ ] On both an Intel Mac and an M1/M2, separate short and full-length music
+      during active DAW playback at a low buffer size. Record chip, sample length,
+      first-use/second-use wall time, CPU time and peak RSS. Confirm responsive
+      controls and no playback dropouts.
+- [ ] Compare original/compact float WAV stems with the offline harness. Listen
+      across segment boundaries. Reload a cached sample and reopen its saved
+      project; confirm identical mute behavior and no new separation/model load.
+- [ ] Repeat with two plugin instances. The four-thread budget is per instance;
+      record aggregate host CPU and memory, including model load.
+
 ## C4 Window / Favorites performance sets
 
 These checks describe the current mapping for new imports. The older C2 and

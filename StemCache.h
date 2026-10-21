@@ -62,7 +62,11 @@ public:
 
     // Decodes the entry for 'key'. Returns false on a miss, a truncated or
     // malformed container, or a version this build doesn't understand.
-    static bool load (const juce::String& key, Entry& result);
+    // When requested, encoded receives the validated original container for
+    // portable project saving without re-encoding the decoded stems. It is
+    // cleared on failure; result is unchanged on failure.
+    static bool load (const juce::String& key, Entry& result,
+                      juce::MemoryBlock* encoded = nullptr);
 
     // The same self-contained container is embedded in DAW state. Encoding and
     // decoding happen on workers; saving only copies the already encoded data.

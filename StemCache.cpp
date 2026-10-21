@@ -217,8 +217,10 @@ bool StemCache::contains (const juce::String& key)
     return file != juce::File() && file.existsAsFile() && file.getSize() > 0;
 }
 
-bool StemCache::load (const juce::String& key, Entry& result)
+bool StemCache::load (const juce::String& key, Entry& result, juce::MemoryBlock* encoded)
 {
+    if (encoded != nullptr)
+        encoded->reset();
     const auto file = entryFileForKey (key);
     if (file == juce::File() || file.getSize() <= 0
         || file.getSize() > std::numeric_limits<int>::max())
@@ -227,6 +229,8 @@ bool StemCache::load (const juce::String& key, Entry& result)
     if (! file.loadFileAsData (data) || ! decode (data, result))
         return false;
     file.setLastModificationTime (juce::Time::getCurrentTime());
+    if (encoded != nullptr)
+        *encoded = std::move (data);
     return true;
 }
 

@@ -2,6 +2,10 @@
 
 **Owner:** Jerry · **Date:** 2026-06-19 · **Status:** Draft for review
 
+**Implementation update, 2026-10-21:** see [LOW_RESOURCE_STEMS.md](LOW_RESOURCE_STEMS.md)
+for the compact fixed-envelope graph, bounded CPU defaults, measurements and
+current release checks. The roadmap and estimates below are historical planning.
+
 This is the follow-on to `STEM_SEPARATION_PLAN.md`. That doc got stem separation
 *working* (base HTDemucs → ONNX → bundled ONNX Runtime). This doc is about making
 it **fast** across **macOS (Apple Silicon + Intel) and Windows**, accepting **minor

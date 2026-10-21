@@ -17,46 +17,34 @@
 #include <cmath>
 #include <cstdlib>
 #include <thread>
+#include <utility>
 #include <vector>
 
 //==============================================================================
 namespace
 {
-    // Intra-op thread count for the offline htdemucs pass.
-    //
-    // On heterogeneous Apple Silicon (M4: 4 performance + 6 efficiency cores)
-    // oversubscribing all 10 logical cores is counter-productive for this
-    // conv/matmul/attention graph: ORT synchronises at every parallel-region
-    // barrier, so the 4 fast P-core threads finish their slice and then stall
-    // waiting on 6 E-core threads running at ~1/3 the speed — plus QoS migration
-    // and cache thrash. Pinning to the performance-core count is the documented
-    // best practice for compute-bound ML. Override with CUE_STEM_THREADS to A/B
-    // sweep without a rebuild.
+    // Limit offline inference so an older Mac is still usable during separation.
+    // Explicit thread counts are a budget, not CPU affinity. CUE_STEM_THREADS
+    // remains available for machine-specific benchmarking/support.
     int chooseIntraOpThreads()
     {
         if (const char* env = std::getenv ("CUE_STEM_THREADS"))
         {
-            const int n = std::atoi (env);
-            if (n >= 1)
-                return juce::jlimit (1, 32, n);
+            char* end = nullptr;
+            const double n = std::strtod (env, &end);
+            if (end != env && *end == '\0' && std::isfinite (n) && n >= 1.0 && std::floor (n) == n)
+                return (int) juce::jlimit (1.0, 32.0, n);
         }
 
+        int performanceCores = 0;
        #if defined(__APPLE__)
-        int    perfCores = 0;
-        size_t sz        = sizeof (perfCores);
-        if (sysctlbyname ("hw.perflevel0.logicalcpu", &perfCores, &sz, nullptr, 0) == 0
-            && perfCores >= 1)
-            return juce::jlimit (1, 32, perfCores);
+        size_t sz = sizeof (performanceCores);
+        if (sysctlbyname ("hw.perflevel0.logicalcpu", &performanceCores, &sz, nullptr, 0) != 0)
+            performanceCores = 0; // Intel Macs and unavailable sysctl: use bounded fallback.
        #endif
 
-       #if defined(_WIN32)
-        // Leave CPU headroom for the message thread, host and audio playback.
-        // ORT owns its own workers; moving the caller off the UI thread alone
-        // does not prevent inference from saturating a Windows machine.
-        return (int) juce::jlimit (1u, 4u, std::thread::hardware_concurrency() / 2);
-       #else
-        return (int) juce::jlimit (1u, 16u, std::thread::hardware_concurrency());
-       #endif
+        return cuesampler::StemProcessingSettings::defaultIntraOpThreads (
+            std::thread::hardware_concurrency(), performanceCores);
     }
 
 
@@ -209,19 +197,26 @@ StemSeparator::StemSeparator (const ModelPaths& paths)
         ortEnv->DisableTelemetryEvents();
         ortOptions = std::make_unique<Ort::SessionOptions>();
 
-        // On Apple Silicon use performance cores; on Windows reserve CPU
-        // headroom for the UI/host (see chooseIntraOpThreads). CUE_STEM_THREADS
-        // remains an explicit override for benchmarking.
+        // Bound inference workers on every platform, including Intel Macs.
         const int nThreads = chooseIntraOpThreads();
         ortOptions->SetIntraOpNumThreads (nThreads);
+        ortOptions->SetInterOpNumThreads (1);
+        ortOptions->SetExecutionMode (ORT_SEQUENTIAL);
         ortOptions->SetGraphOptimizationLevel (GraphOptimizationLevel::ORT_ENABLE_ALL);
-       #if defined(_WIN32)
+       #if defined(__APPLE__)
+        // ORT 1.18 packs a new memory-pattern buffer after the first window,
+        // while its arena retains the first window's allocations. HTDemucs
+        // consequently grows from ~2.8 to ~4.8 GiB on the second window. Keep
+        // normal arena reuse without that extra packed buffer (measured ~1%
+        // wall-time cost, identical output across repeated windows).
+        ortOptions->DisableMemPattern();
+       #endif
         // Idle ORT workers otherwise spin between operators at normal priority,
         // competing with UI rendering even though the caller is a background job.
         ortOptions->AddConfigEntry (kOrtSessionOptionsConfigAllowIntraOpSpinning, "0");
         ortOptions->AddConfigEntry (kOrtSessionOptionsConfigAllowInterOpSpinning, "0");
-       #endif
-        juce::Logger::writeToLog ("StemSeparator: intra-op threads = " + juce::String (nThreads));
+        juce::Logger::writeToLog ("StemSeparator: intra-op threads = " + juce::String (nThreads)
+            + ", worker spinning disabled");
 
 #if defined(__APPLE__)
         // CoreML is OFF by default for the stem models — pure CPU. Benchmarked
@@ -649,27 +644,64 @@ StemSeparator::StemResult StemSeparator::separate (const juce::AudioBuffer<float
 
     const int srcCh  = buffer.getNumChannels();
     const int srcLen = buffer.getNumSamples();
-    if (srcCh <= 0 || srcLen <= 0 || sampleRate <= 0.0)
+    if (srcCh <= 0 || srcLen <= 0 || ! std::isfinite (sampleRate) || sampleRate <= 0.0)
         return result;
 
     if (progress) progress (0.0f);
 
-    // 1. Resample to 44.1 kHz and force stereo for the model.
-    auto mix44 = toStereo (resample (buffer, sampleRate, kModelSampleRate));
-    if (mix44.getNumSamples() <= 0)
-        return result;
-    if (shouldAbort && shouldAbort())
-        return result;
+    const bool atModelRate = juce::approximatelyEqual (sampleRate, kModelSampleRate);
+    Stems44 stems;
+    {
+        // Borrow an already-compatible source. Keep conversion storage in this
+        // scope so it is released before allocating source-rate output stems.
+        juce::AudioBuffer<float> convertedMix;
+        const auto* mix44 = &buffer;
+        if (srcCh != kModelChannels || ! atModelRate)
+        {
+            if (srcCh > kModelChannels)
+            {
+                // Discard unused channels before the expensive resampling pass.
+                convertedMix = toStereo (buffer);
+                if (! atModelRate)
+                    convertedMix = resample (convertedMix, sampleRate, kModelSampleRate);
+            }
+            else if (atModelRate)
+            {
+                convertedMix = toStereo (buffer);
+            }
+            else
+            {
+                // Resample mono once, then duplicate it for the stereo model.
+                convertedMix = resample (buffer, sampleRate, kModelSampleRate);
+                if (srcCh != kModelChannels)
+                    convertedMix = toStereo (convertedMix);
+            }
+            mix44 = &convertedMix;
+        }
+        if (mix44->getNumSamples() <= 0 || (shouldAbort && shouldAbort()))
+            return result;
 
-    // 2. One segmented pass over the base model yields all three stems at once.
-    auto stems = runModel (*stemModel, mix44, progress, shouldAbort);
+        // One segmented pass over the base model yields all three stems at once.
+        stems = runModel (*stemModel, *mix44, progress, shouldAbort);
+    }
     if (stems.drums.getNumSamples() <= 0)
         return result; // aborted or failed → invalid result, caller keeps the original
 
-    // 3. Resample each stem back to the source rate and conform to source shape.
-    result.drums  = conform (resample (stems.drums,  kModelSampleRate, sampleRate), srcCh, srcLen);
-    result.bass   = conform (resample (stems.bass,   kModelSampleRate, sampleRate), srcCh, srcLen);
-    result.vocals = conform (resample (stems.vocals, kModelSampleRate, sampleRate), srcCh, srcLen);
+    // Transfer compatible stems directly; resample/conform only when required.
+    auto finishStem = [&] (juce::AudioBuffer<float>& stem) -> juce::AudioBuffer<float>
+    {
+        if (! atModelRate)
+            stem = resample (stem, kModelSampleRate, sampleRate);
+        if (stem.getNumChannels() == srcCh && stem.getNumSamples() == srcLen)
+            return std::move (stem);
+
+        auto output = conform (stem, srcCh, srcLen);
+        stem = {};
+        return output;
+    };
+    result.drums  = finishStem (stems.drums);
+    result.bass   = finishStem (stems.bass);
+    result.vocals = finishStem (stems.vocals);
     result.valid  = true;
 
     if (progress) progress (1.0f);

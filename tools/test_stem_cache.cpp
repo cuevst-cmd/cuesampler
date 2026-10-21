@@ -3,7 +3,8 @@
 // Covers the properties the project-restore path depends on: keys are stable
 // for identical audio and distinct for anything else, a stored entry decodes
 // back with MP3 timing intact, a damaged or foreign entry is refused rather than
-// half-decoded, and prune() honours its budget oldest-first.
+// half-decoded, original containers can be reused without transcoding, and
+// prune() honours its budget oldest-first.
 //
 //   cmake -S . -B build -DCUE_BUILD_STEM_CACHE_TEST=ON
 //   cmake --build build --target test_stem_cache
@@ -101,6 +102,20 @@ int main (int argc, char** argv)
     constexpr int    numSamples = 44100; // 1 s
     const auto mix = makeBuffer (2, numSamples, 1);
 
+    using Settings = cuesampler::StemProcessingSettings;
+    check (Settings::defaultIntraOpThreads (0) == 1
+           && Settings::defaultIntraOpThreads (1) == 1
+           && Settings::defaultIntraOpThreads (2) == 1,
+           "unknown and small CPUs retain at least one inference thread");
+    check (Settings::defaultIntraOpThreads (4) == 2
+           && Settings::defaultIntraOpThreads (8) == 4
+           && Settings::defaultIntraOpThreads (32) == 4,
+           "Intel budgets reserve half the logical CPUs and cap at four");
+    check (Settings::defaultIntraOpThreads (8, 4) == 4
+           && Settings::defaultIntraOpThreads (20, 16) == 4
+           && Settings::defaultIntraOpThreads (8, 2) == 2,
+           "Apple Silicon budgets stay within performance-core count and cap at four");
+
     // Environment overrides must change cache identity and malformed values
     // must retain the quality default. Keep the caller's environment intact.
     const char* overlapEnv = std::getenv ("CUE_STEM_OVERLAP");
@@ -168,8 +183,19 @@ int main (int argc, char** argv)
     check (cuesampler::StemCache::store (key, written), "store writes an entry");
     check (cuesampler::StemCache::contains (key), "the stored key is now in the cache");
 
+    const auto entryFile = scratch.getChildFile (key + ".cuestems");
+    juce::MemoryBlock storedContainer;
+    check (entryFile.loadFileAsData (storedContainer), "read the original stored container");
+    juce::MemoryBlock reusedContainer ("stale", 5);
     cuesampler::StemCache::Entry read;
-    check (cuesampler::StemCache::load (key, read), "load finds the stored entry");
+    check (cuesampler::StemCache::load (key, read, &reusedContainer), "load finds the stored entry");
+    check (reusedContainer == storedContainer, "load returns the exact original MP3 container without transcoding");
+    cuesampler::StemCache::Entry portableRead;
+    check (cuesampler::StemCache::decode (reusedContainer, portableRead)
+           && maxDifference (read.drums, portableRead.drums) == 0.0f
+           && maxDifference (read.bass, portableRead.bass) == 0.0f
+           && maxDifference (read.vocals, portableRead.vocals) == 0.0f,
+           "reusing the project payload preserves the loaded stem audio exactly");
     check (read.sampleRate == sampleRate, "the sample rate round-trips");
 
     check (correlation (written.drums,  read.drums)  > 0.85, "drums survive the MP3 round trip without timing drift");
@@ -240,18 +266,30 @@ int main (int argc, char** argv)
         }
     }
     check (cuesampler::StemCache::decode (legacy, read), "legacy v1 FLAC entries remain readable");
+    check (cuesampler::StemCache::storeEncoded (key, legacy)
+           && cuesampler::StemCache::load (key, read, &reusedContainer)
+           && reusedContainer == legacy,
+           "legacy FLAC cache payloads remain portable without transcoding");
     check (cuesampler::StemCache::store (key, written), "restore disk fixture");
 
     // ---- misses and malformed entries --------------------------------------
     cuesampler::StemCache::Entry ignored;
-    check (! cuesampler::StemCache::load (juce::String ("ab12cd34").paddedRight ('f', 64), ignored),
-           "an unknown key misses");
-    check (! cuesampler::StemCache::load ("../../etc/passwd", ignored),
-           "a key that is not a hex digest is refused");
-    check (! cuesampler::StemCache::load ({}, ignored), "an empty key misses");
+    ignored.sampleRate = 12345.0;
+    ignored.drums = makeBuffer (1, 16, 99);
+    const auto unchangedDrums = ignored.drums;
+    const auto checkMiss = [&] (const juce::String& missingKey, const juce::String& reason)
+    {
+        reusedContainer = storedContainer; // previous success must never escape a failed load
+        check (! cuesampler::StemCache::load (missingKey, ignored, &reusedContainer), reason);
+        check (reusedContainer.isEmpty(), "failed load clears the previous portable payload");
+        check (ignored.sampleRate == 12345.0 && maxDifference (ignored.drums, unchangedDrums) == 0.0f,
+               "failed load leaves decoded output unchanged");
+    };
+    checkMiss (juce::String ("ab12cd34").paddedRight ('f', 64), "an unknown key misses");
+    checkMiss ("../../etc/passwd", "a key that is not a hex digest is refused");
+    checkMiss ({}, "an empty key misses");
 
     // A truncated container must read as a miss, not as a partial entry.
-    const auto entryFile = scratch.getChildFile (key + ".cuestems");
     const auto fullSize  = entryFile.getSize();
     {
         juce::MemoryBlock whole;
@@ -259,11 +297,11 @@ int main (int argc, char** argv)
         whole.setSize ((size_t) (fullSize / 2));
         entryFile.replaceWithData (whole.getData(), whole.getSize());
     }
-    check (! cuesampler::StemCache::load (key, ignored), "a truncated entry is refused");
+    checkMiss (key, "a truncated entry is refused");
 
     // Garbage in place of the container is refused on the magic.
     entryFile.replaceWithText ("not a stem container");
-    check (! cuesampler::StemCache::load (key, ignored), "an entry with a bad header is refused");
+    checkMiss (key, "an entry with a bad header is refused");
 
     // ---- mismatched stems are rejected at store time ------------------------
     cuesampler::StemCache::Entry ragged;
