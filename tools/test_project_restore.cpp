@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <thread>
 #if JUCE_MAC
 #include <CoreFoundation/CoreFoundation.h>
 #elif JUCE_WINDOWS
@@ -91,6 +92,30 @@ juce::Component* findComponentId (juce::Component& parent, const juce::String& i
         if (auto* found = findComponentId (*child, id)) return found;
     return nullptr;
 }
+juce::Rectangle<float> padCellBounds (juce::Component& pads, int ordinal)
+{
+    const int columns = juce::jmax (1, (int) pads.getProperties()["padColumns"]);
+    const int width = (int) pads.getProperties()["padViewportWidth"];
+    const float height = (float) pads.getProperties()["padCellHeight"];
+    const int column = ordinal % columns;
+    const int left = column * width / columns, right = (column + 1) * width / columns;
+    return { (float) left, (ordinal / columns) * height - (int) pads.getProperties()["padScrollOffset"],
+             (float) (right - left), height };
+}
+bool revealPad (juce::Component& pads, int ordinal)
+{
+    auto* bar = dynamic_cast<juce::ScrollBar*> (findComponentId (pads, "micro-chop-scroll"));
+    const auto cell = padCellBounds (pads, ordinal);
+    const int offset = (int) pads.getProperties()["padScrollOffset"];
+    const int visibleHeight = (int) pads.getProperties()["padVisibleHeight"];
+    if (bar != nullptr && bar->isVisible())
+    {
+        if (cell.getY() < 0) bar->setCurrentRangeStart (offset + cell.getY(), juce::sendNotificationSync);
+        else if (cell.getBottom() > visibleHeight)
+            bar->setCurrentRangeStart (offset + cell.getBottom() - visibleHeight, juce::sendNotificationSync);
+    }
+    return pads.getLocalBounds().toFloat().contains (padCellBounds (pads, ordinal).getCentre());
+}
 }
 
 // Test-only access to exercise real worker publication and serialization without
@@ -98,10 +123,10 @@ juce::Component* findComponentId (juce::Component& parent, const juce::String& i
 struct CueSamplerStateTests
 {
     using P = AudioPluginAudioProcessor;
-    static void setup (P& p)
+    static void setup (P& p, bool rhythmic = false)
     {
-        // An existing C4 project fixture: new imports use C2, but recall and
-        // edit tests must continue exercising this saved project's old map.
+        // An existing project fixture with an explicit C4 root; recall and
+        // edit tests keep exercising its saved map.
         p.recordedMidiRoot.store (48);
         p.midiBankMode.store (false);
         auto source = std::make_shared<P::LoadedSampleData>();
@@ -111,7 +136,18 @@ struct CueSamplerStateTests
         source->buffer.setSize (2, 64000);
         for (int c = 0; c < 2; ++c)
             for (int i = 0; i < 64000; ++i)
-                source->buffer.setSample (c, i, 0.2f * std::sin ((float) i * 0.05f));
+            {
+                // Trim discards the injected analysis below and runs the real
+                // detector. Its fixture therefore needs actual 120 BPM onsets.
+                if (rhythmic)
+                {
+                    const int beat = i / 4000, beatFrame = i % 4000;
+                    const float pulse = (float) (std::exp (-beatFrame / 120.0) * std::cos (beatFrame * 0.8));
+                    source->buffer.setSample (c, i, (beat % 4 == 0 ? 0.8f : 0.6f) * pulse);
+                }
+                else
+                    source->buffer.setSample (c, i, 0.2f * std::sin ((float) i * 0.05f));
+            }
         source->buffer.setSample (0, 0, 1.75f);
         source->buffer.setSample (1, 1, -1.5f);
         source->buffer.setSample (1, 2, 1.0e-12f);
@@ -424,6 +460,179 @@ struct CueSamplerStateTests
         check (p.captureChopExport (7, false, scratch) == nullptr, "missing requested stems cannot silently export the original");
     }
 
+    static void runChopTails (const juce::File& scratch)
+    {
+        P p;
+        auto source = std::make_shared<P::LoadedSampleData>();
+        source->sampleRate = 8000; source->fileName = "per-chop tail fixture";
+        source->buffer.setSize (2, 8000);
+        for (int channel = 0; channel < 2; ++channel)
+            for (int frame = 0; frame < 8000; ++frame)
+                source->buffer.setSample (channel, frame, (channel == 0 ? 0.4f : 0.2f)
+                    * std::sin ((float) (juce::MathConstants<double>::twoPi * 100.0 * frame / 8000.0)));
+        source->buffer.setSample (0, 2999, 0.9f); source->buffer.setSample (0, 3799, -0.8f);
+        juce::MemoryBlock encoded;
+        check (p.serializeSampleToStateData (*source, encoded), "encode recoverable Tail Length fixture");
+        source->serializedStateData = juce::var (encoded); std::atomic_store (&p.loadedSample, source);
+        auto layout = std::make_shared<P::ChopState>();
+        for (const auto fixture : { std::array<int, 4> { 11, 0, 2000, 48 }, { 92, 2000, 4000, 49 },
+                                   { 44, 1000, 3000, 50 }, { 331, 7200, 7900, 51 }, { 45, 100, 500, 52 } })
+        {
+            P::ChopDefinition chop;
+            chop.id = fixture[0]; chop.startSample = fixture[1]; chop.endSample = fixture[2]; chop.assignedMidiNote = fixture[3];
+            chop.releaseMilliseconds = 0; chop.reversed = chop.id == 44 || chop.id == 45;
+            layout->chops.push_back (chop);
+        }
+        layout->selectedChopId = 11; layout->nextChopId = 332; p.publishChopState (layout);
+        const auto tailFor = [] (const P& target, int id)
+        {
+            const auto state = target.getChopState();
+            const auto found = std::find_if (state->chops.begin(), state->chops.end(), [id] (const auto& c) { return c.id == id; });
+            return found != state->chops.end() ? found->tailLengthMilliseconds : -1.0f;
+        };
+        juce::AudioBuffer<float> block (2, 64); juce::MidiBuffer midi;
+        const auto captureFrom = [&] (P& target, int frames)
+        {
+            juce::AudioBuffer<float> result (2, ((frames + 63) / 64) * 64);
+            for (int offset = 0; offset < result.getNumSamples(); offset += 64)
+            {
+                midi.clear(); target.processBlock (block, midi);
+                for (int channel = 0; channel < 2; ++channel) result.copyFrom (channel, offset, block, channel, 0, 64);
+            }
+            return result;
+        };
+        const auto capture = [&] (int frames) { return captureFrom (p, frames); };
+        const auto audition = [&] (int id, int frames)
+        {
+            p.setChopPlaybackMode (P::ChopPlaybackMode::OneShot); p.startChopPreview (id); p.releaseChopPreview();
+            return capture (frames);
+        };
+        p.globalGainDecibels.store (0); p.prepareToPlay (8000, 64);
+        for (const int milliseconds : { 0, 50, 100, 200, 300 })
+        {
+            p.setChopTailLength (11, (float) milliseconds);
+            const int end = 2000 + milliseconds * 8;
+            const auto live = audition (11, end + 512);
+            check (tailFor (p, 11) == milliseconds && tailFor (p, 92) == 0
+                   && live.getRMSLevel (0, 500, 1000) > 0.1f && live.getMagnitude (0, end, live.getNumSamples() - end) < 1.0e-5f,
+                   "each Tail Length choice extends only its chop to the exact live One Shot boundary");
+            const auto exported = readExport (p.renderChopToTempWav (11, false, scratch), 8000, end);
+            if (milliseconds > 0)
+            {
+                const int tailFrames = milliseconds * 8;
+                check (live.getRMSLevel (0, 2000, tailFrames / 2) > 0.03f
+                       && live.getMagnitude (0, end - 16, 16) < 0.03f
+                       && exported.getNumSamples() == end && exported.getRMSLevel (0, 2000, tailFrames / 2) > 0.03f
+                       && exported.getRMSLevel (0, end - 32, 32) < exported.getRMSLevel (0, 500, 1000) * 0.2f,
+                       "live and exported tails contain following source audio and fade to silence at their appended end");
+            }
+        }
+        const auto oldExport = p.captureChopExport (11, false, scratch); p.setChopTailLength (11, 100);
+        check (! p.isChopExportCurrent (oldExport), "changing Tail Length invalidates an already prepared export");
+        for (const auto variant : { std::pair<double, bool> { 8000, true }, { 16000, false }, { 16000, true } })
+        {
+            const auto [rate, halfTime] = variant;
+            p.halfTimeEnabled.store (halfTime); p.prepareToPlay (rate, 64);
+            const int end = juce::roundToInt (2000.0 * rate / 8000.0 * (halfTime ? 2.0 : 1.0) + rate * 0.1);
+            const auto live = audition (11, end + 512);
+            check (live.getMagnitude (0, end, live.getNumSamples() - end) < 1.0e-5f
+                   && live.getRMSLevel (0, end - juce::roundToInt (rate * 0.09), juce::roundToInt (rate * 0.04)) > 0.01f,
+                   "Tail Length remains 100 audible milliseconds across half-time and output sample rates");
+            readExport (p.renderChopToTempWav (11, false, scratch), rate, end);
+            p.setChopPlaybackMode (P::ChopPlaybackMode::Gate); p.startChopPreview (11); capture (64); p.releaseChopPreview();
+            const int releaseFrames = juce::roundToInt (rate * 0.1);
+            const auto gateTail = capture (releaseFrames + 512);
+            check (gateTail.getRMSLevel (0, juce::roundToInt (rate * 0.02), juce::roundToInt (rate * 0.03)) > 0.03f
+                   && gateTail.getMagnitude (0, releaseFrames, gateTail.getNumSamples() - releaseFrames) < 1.0e-5f,
+                   "Gate Tail release also keeps its audible duration across half-time and output sample rates");
+        }
+        p.halfTimeEnabled.store (false); p.prepareToPlay (8000, 64);
+        p.setChopTailLength (44, 0); const auto reverseOff = audition (44, 2512);
+        p.setChopTailLength (44, 100); const auto reverseTail = audition (44, 3312);
+        bool sameAttack = true;
+        for (int frame = 0; frame < 128; ++frame) sameAttack &= std::abs (reverseOff.getSample (0, frame) - reverseTail.getSample (0, frame)) < 1.0e-5f;
+        check (sameAttack && reverseTail.getRMSLevel (0, 2000, 400) > 0.03f
+               && reverseTail.getMagnitude (0, 2800, reverseTail.getNumSamples() - 2800) < 1.0e-5f,
+               "reverse Tail preserves the original attack and continues backward after the logical body");
+        p.setChopTailLength (331, 300); const auto clippedForward = audition (331, 1312);
+        p.setChopTailLength (45, 300); const auto clippedReverse = audition (45, 1012);
+        check (clippedForward.getMagnitude (0, 800, clippedForward.getNumSamples() - 800) < 1.0e-5f
+               && clippedReverse.getMagnitude (0, 500, clippedReverse.getNumSamples() - 500) < 1.0e-5f,
+               "forward and reverse tails stop safely at the available source boundary");
+        readExport (p.renderChopToTempWav (331, false, scratch), 8000, 800);
+        readExport (p.renderChopToTempWav (45, false, scratch), 8000, 500);
+
+        p.setChopPlaybackMode (P::ChopPlaybackMode::Gate); p.startChopPreview (11);
+        bool originalLoop = true;
+        for (int iteration = 0; iteration < 80; ++iteration)
+        {
+            capture (64); originalLoop &= p.getPlayingChopId() == 11 && p.voice.playbackSamplePosition < 2000;
+        }
+        check (originalLoop, "held Gate keeps the original chop loop timing with Tail enabled");
+        p.releaseChopPreview(); const auto released = capture (1312);
+        check (released.getRMSLevel (0, 128, 256) > 0.03f && released.getMagnitude (0, 800, released.getNumSamples() - 800) < 1.0e-5f
+               && ! p.isPlaying(), "Gate release continues from its current position and fades for the selected 100 ms tail");
+        P freshTransport;
+        std::atomic_store (&freshTransport.loadedSample, source);
+        freshTransport.publishChopState (std::make_shared<P::ChopState> (*p.getChopState()));
+        freshTransport.globalGainDecibels.store (0); freshTransport.prepareToPlay (8000, 64);
+        freshTransport.playbackSamplePosition.store (p.playbackSamplePosition.load());
+        freshTransport.startPlayback(); const auto normalTransport = captureFrom (freshTransport, 1536);
+        p.startPlayback(); const auto afterTailTransport = capture (1536);
+        float transportDifference = 0;
+        for (int channel = 0; channel < normalTransport.getNumChannels(); ++channel)
+            for (int frame = 0; frame < normalTransport.getNumSamples(); ++frame)
+                transportDifference = juce::jmax (transportDifference,
+                    std::abs (afterTailTransport.getSample (channel, frame) - normalTransport.getSample (channel, frame)));
+        check (normalTransport.getMagnitude (0, 0, normalTransport.getNumSamples()) > 0.1f && transportDifference < 1.0e-5f
+               && p.isPlaying() == freshTransport.isPlaying() && p.getPlayingChopId() == freshTransport.getPlayingChopId(),
+               "transport Play after a finished Gate tail matches a fresh voice at the same source position");
+        p.stopPlayback(); capture (64);
+        p.startChopPreview (11); capture (64); p.releaseChopPreview(); capture (128);
+        p.setPlaybackSamplePosition (4096); const auto afterTailSeek = capture (1024);
+        check (p.isPlaying() && p.getPlayingChopId() == -1 && afterTailSeek.getRMSLevel (0, 256, 768) > 0.1f,
+               "seeking during a Gate tail retires its fade and continues ordinary source playback");
+        p.stopPlayback(); capture (64);
+        p.startChopPreview (11); capture (64); p.releaseChopPreview(); capture (128);
+        p.clearSelectedChop(); const auto afterTailUnbind = capture (1024);
+        check (p.isPlaying() && p.getPlayingChopId() == -1 && afterTailUnbind.getRMSLevel (0, 256, 768) > 0.1f,
+               "clearing the chop binding during a Gate tail continues audible source playback past its old release deadline");
+        p.stopPlayback(); capture (64); p.selectChopById (11);
+        p.setChopTailLength (11, 0); p.startChopPreview (11); capture (64); p.releaseChopPreview(); capture (64);
+        check (! p.isPlaying(), "Tail Off retains the chop's immediate Gate ADSR release");
+        p.setChopTailLength (11, 100);
+        p.setChopPlaybackMode (P::ChopPlaybackMode::OneShot); p.startChopPreview (11); p.releaseChopPreview(); capture (2240);
+        check (p.getPlayingChopId() == 11 && p.voice.playbackSamplePosition > 2000,
+               "One Shot has entered its appended tail before the live Tail Off edit");
+        p.setChopTailLength (11, 0); const auto afterTailOff = capture (128);
+        check (! p.isPlaying() && afterTailOff.getMagnitude (0, 64, 64) < 1.0e-5f,
+               "turning Tail Off during appended One Shot audio ends the voice without restarting its attack");
+        p.setChopTailLength (11, 100);
+        p.setChopPlaybackMode (P::ChopPlaybackMode::OneShot); p.startChopPreview (11); p.releaseChopPreview(); capture (2240);
+        p.startChopPreview (92); p.releaseChopPreview(); capture (64);
+        check (p.getPlayingChopId() == 92, "retriggering another chop chokes the preceding tail without an extra voice");
+        p.stopPlayback(); capture (64);
+        p.clearEditUndoHistory(); p.setChopTailLength (92, 50); p.undoLastEdit();
+        check (tailFor (p, 92) == 0 && tailFor (p, 11) == 100, "Tail Length Undo restores only the edited chop");
+        p.setChopTailLength (92, 50);
+        auto stashed = std::make_shared<P::ChopState>(); auto stashChop = layout->chops[0];
+        stashChop.id = 708; stashChop.tailLengthMilliseconds = 200; stashed->chops.push_back (stashChop);
+        stashed->selectedChopId = 708; stashed->nextChopId = 709; std::atomic_store (&p.stashedChopState, stashed);
+        juce::MemoryBlock saved; p.getStateInformation (saved);
+        P recalled; recalled.setStateInformation (saved.getData(), (int) saved.getSize());
+        check (waitFor ([&] { return restored (recalled); }) && tailFor (recalled, 11) == 100 && tailFor (recalled, 92) == 50
+               && std::atomic_load (&recalled.stashedChopState)->chops[0].tailLengthMilliseconds == 200,
+               "project recall preserves independent Tail Length settings in both chop layers");
+        auto legacy = juce::ValueTree::readFromData ((const char*) saved.getData() + 4, saved.getSize() - 4);
+        for (const auto* layerName : { "ChopState", "StashedChopState" })
+            for (auto child : legacy.getChildWithName (layerName)) if (child.hasType ("Chop")) child.removeProperty ("tailLengthMilliseconds", nullptr);
+        juce::MemoryBlock legacyData;
+        { juce::MemoryOutputStream output (legacyData, false); output.write ("CSB2", 4); legacy.writeToStream (output); }
+        recalled.setStateInformation (legacyData.getData(), (int) legacyData.getSize());
+        check (waitFor ([&] { return restored (recalled); }) && tailFor (recalled, 11) == 0 && tailFor (recalled, 92) == 0,
+               "legacy projects without Tail Length retain their original chop boundaries");
+    }
+
     static void runMousePlaybackModes()
     {
         P p;
@@ -500,7 +709,7 @@ struct CueSamplerStateTests
         check (! p.voice.playbackActive, "closing the editor releases a held mouse Gate");
     }
 
-    static void runExportHandle()
+    static void runExportHandle (const juce::File& scratch)
     {
         P p; setup (p);
         p.waveformZoom.store (0); p.waveformScroll.store (0);
@@ -567,6 +776,20 @@ struct CueSamplerStateTests
         auto adsrClick = eventAt (adsrPoint, true);
         wave->mouseDown (adsrClick); wave->mouseUp (adsrClick);
         check (findButton (*editor, "SAVE MP3...") != nullptr, "ADSR opens the envelope menu with a separate Save MP3 action");
+        auto* tailMenu = dynamic_cast<juce::ComboBox*> (findComponentId (*editor, "chop-tail-length"));
+        check (tailMenu != nullptr && tailMenu->getNumItems() == 5, "ADSR exposes Off, 50, 100, 200 and 300 ms Tail Length choices");
+        if (tailMenu != nullptr)
+        {
+            tailMenu->setSelectedId (101, juce::sendNotificationSync);
+            check (p.getChopState()->chops[0].tailLengthMilliseconds == 100 && p.getChopState()->chops[0].endSample == 32000,
+                   "the ADSR Tail Length selector binds the exact chop without moving its logical edge");
+            if (auto* menu = findComponentId (*editor, "chop-adsr-menu"))
+            {
+                juce::FileOutputStream image (scratch.getParentDirectory().getChildFile ("chop-tail-menu.png"));
+                image.setPosition (0); image.truncate();
+                juce::PNGImageFormat().writeImageToStream (menu->createComponentSnapshot (menu->getLocalBounds()), image);
+            }
+        }
     }
 
     // Opt-in CPU paint benchmark; timings are reported, never used as flaky CI assertions.
@@ -648,13 +871,13 @@ struct CueSamplerStateTests
         editor->addToDesktop (juce::ComponentPeer::windowIsTemporary);
         editor->setVisible (true);
         for (int i = 0; i < 30; ++i) pump();
-        check (findButton (*editor, "ZOOM +") == nullptr
-               && findButton (*editor, "ZOOM -") == nullptr
-               && findButton (*editor, "FIT") == nullptr, "redundant horizontal zoom buttons are removed");
         auto* heightPlus = findButton (*editor, "+");
         check (heightPlus != nullptr, "waveform height control remains available");
         if (heightPlus == nullptr) return;
         auto* wave = heightPlus->getParentComponent();
+        check (findButton (*wave, "ZOOM +") == nullptr
+               && findButton (*wave, "ZOOM -") == nullptr
+               && findButton (*wave, "FIT") == nullptr, "redundant horizontal zoom buttons are removed from the main waveform");
         juce::ScrollBar* bar = nullptr;
         for (auto* child : wave->getChildren())
             if (auto* candidate = dynamic_cast<juce::ScrollBar*> (child)) bar = candidate;
@@ -1039,6 +1262,630 @@ struct CueSamplerStateTests
         check (render() > 0.001f && p.isPlaying(), "a complete Favorites click between audio blocks starts a One Shot");
     }
 
+    static void runChopTrimAction (const juce::File& scratch)
+    {
+        P p; setup (p); p.beatThisAnalyzer.reset();
+        const auto original = p.getOriginalSampleForTrim();
+        p.resetStemState();
+        p.muteDrums.store (false); p.muteBass.store (false); p.muteVocals.store (false);
+        auto cropped = std::make_shared<P::LoadedSampleData>();
+        cropped->sampleRate = original->sampleRate; cropped->fileName = original->fileName;
+        cropped->buffer.setSize (2, 40000);
+        for (int channel = 0; channel < 2; ++channel) cropped->buffer.copyFrom (channel, 0, original->buffer, channel, 8000, 40000);
+        cropped->trimOriginalSample = original; cropped->trimStartSample = 8000; cropped->trimEndSample = 48000;
+        std::atomic_store (&p.loadedSample, cropped);
+        auto state = std::make_shared<P::ChopState>();
+        P::ChopDefinition chop;
+        chop.id = 7; chop.startSample = 4000; chop.endSample = 16000; chop.cueOffsetSamples = 500;
+        chop.assignedMidiNote = 48; chop.reversed = true; chop.tailLengthMilliseconds = 300;
+        chop.warpMarkers.push_back ({ 10000, 0.9, false, 0 }); state->chops.push_back (chop);
+        chop.id = 91; chop.startSample = 20000; chop.endSample = 32000; chop.assignedMidiNote = 49;
+        chop.warpMarkers.clear(); state->chops.push_back (chop);
+        state->selectedChopId = 7; state->nextChopId = 92; p.publishChopState (state); p.toggleSelectedChopFavorite();
+        p.waveformZoom.store (0); p.waveformScroll.store (0); p.prepareToPlay (8000, 128);
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+        if (auto* orb = findType (*editor, "VisualizerOrb")) orb->setVisible (false);
+        editor->setVisible (true);
+        for (int i = 0; i < 10; ++i) pump();
+        auto* wave = findType (*editor, "WaveformDisplayComponent");
+        auto* hint = dynamic_cast<juce::TooltipClient*> (wave);
+        check (wave != nullptr && hint != nullptr, "selected-chop Trim has native waveform hit targets");
+        if (wave == nullptr || hint == nullptr) return;
+        const auto eventAt = [&] (juce::Point<float> point, int clicks = 1)
+        {
+            const auto now = juce::Time::getCurrentTime();
+            return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), point,
+                juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier), 1, 0, 0, 0, 0,
+                wave, wave, now, point, now, clicks, false);
+        };
+        juce::Point<float> trimPoint, dragPoint, adsrPoint;
+        bool foundTrim = false, foundDrag = false, foundAdsr = false;
+        for (int x = 8; x < wave->getWidth() - 8; x += 2)
+        {
+            const auto point = juce::Point<float> ((float) x, 48.0f);
+            wave->mouseMove (eventAt (point));
+            if (hint->getTooltip().startsWith ("Trim the sample immediately")) { trimPoint = point; foundTrim = true; }
+            if (hint->getTooltip().startsWith ("Drag this chop")) { dragPoint = point; foundDrag = true; }
+            if (hint->getTooltip().startsWith ("Adjust this chop")) { adsrPoint = point; foundAdsr = true; }
+        }
+        check (foundTrim && foundDrag && foundAdsr && trimPoint.x > dragPoint.x && dragPoint.x > adsrPoint.x,
+               "selected-chop TRIM SAMPLE is a distinct target immediately after DRAG AUDIO");
+        if (! foundTrim) return;
+        const auto click = eventAt (trimPoint);
+        wave->mouseDown (click); wave->mouseUp (eventAt (trimPoint.translated (0, 45)));
+        check (p.getSampleImportStatus() == nullptr && p.getLoadedSample() == cropped && ! p.isPlaying() && p.exportThreadPool.getNumJobs() == 0,
+               "releasing outside chop Trim cancels without audition, export or source changes");
+        p.setMidiMappingLocked (true);
+        wave->mouseDown (click); wave->mouseUp (click);
+        check (p.getSampleImportStatus() == nullptr && p.getLoadedSample() == cropped && ! p.isPlaying(),
+               "MIDI Lock prevents the selected-chop Trim action from applying");
+        p.setMidiMappingLocked (false);
+        wave->mouseDown (click); p.selectChopById (91); p.selectChopById (7); wave->mouseUp (click);
+        check (p.getSampleImportStatus() == nullptr && p.getLoadedSample() == cropped,
+               "changing selection during a chop Trim press cancels the captured action instead of retargeting");
+        juce::FileOutputStream image (scratch.getParentDirectory().getChildFile ("chop-trim-action.png"));
+        image.setPosition (0); image.truncate();
+        juce::PNGImageFormat().writeImageToStream (editor->createComponentSnapshot (editor->getLocalBounds()), image);
+        juce::WaitableEvent workerEntered, releaseWorker;
+        p.sampleImportThreadPool.addJob ([&] { workerEntered.signal(); releaseWorker.wait (10000); });
+        check (workerEntered.wait (5000), "hold the crop worker to inspect immediate chop Trim publication");
+        const auto beforeApply = p.getChopState();
+        wave->mouseDown (click); wave->mouseUp (click);
+        const auto* trimOverlay = findComponentId (*editor, "sample-trim-editor");
+        check (p.getSampleImportStatus() != nullptr && p.getLoadedSample() == cropped && p.exportThreadPool.getNumJobs() == 0 && ! p.isPlaying()
+               && trimOverlay != nullptr && ! trimOverlay->isVisible(),
+               "a chop Trim click immediately queues its crop without opening Trim, preparing export or auditioning");
+        const auto secondClick = eventAt (trimPoint, 2);
+        wave->mouseDown (secondClick); wave->mouseUp (secondClick); wave->mouseDoubleClick (secondClick);
+        check (p.getChopState() == beforeApply && ! p.isPlaying() && p.exportThreadPool.getNumJobs() == 0
+               && p.sampleImportThreadPool.getNumJobs() == 2,
+               "a second click after immediate Trim remains consumed without audition, favorite changes or another crop");
+        releaseWorker.signal();
+        check (waitFor ([&] { return p.getSampleImportStatus() == nullptr && p.getSampleTrimStartSample() == 12000
+               && p.getSampleTrimEndSample() == 24000; }), "selected-chop Trim adds the existing original-source offset to logical chop boundaries");
+        const auto result = p.getLoadedSample();
+        bool exact = result != nullptr && result->buffer.getNumSamples() == 12000;
+        for (int channel = 0; channel < 2 && exact; ++channel)
+            exact &= std::memcmp (result->buffer.getReadPointer (channel), original->buffer.getReadPointer (channel) + 12000,
+                                  12000 * sizeof (float)) == 0;
+        check (exact && p.getOriginalSampleForTrim() == original && p.getChopState()->favoriteChopIndices.empty(),
+               "immediate chop Trim crops pristine logical audio, ignoring cue, reverse, warp and Tail, while retaining recovery and clearing Favorites");
+    }
+
+    static void runSampleTrimAudition (const juce::File& scratch)
+    {
+        P p;
+        p.beatThisAnalyzer.reset();
+        auto original = std::make_shared<P::LoadedSampleData>();
+        original->sampleRate = 8000; original->fileName = "Trim audition original";
+        original->buffer.setSize (2, 64000);
+        for (int frame = 0; frame < 64000; ++frame)
+        {
+            const auto phase = juce::MathConstants<double>::twoPi * 125.0 * frame / 8000.0;
+            original->buffer.setSample (0, frame, 0.4f * (float) std::sin (phase));
+            original->buffer.setSample (1, frame, 0.2f * (float) std::cos (phase));
+        }
+        juce::MemoryBlock encoded;
+        check (p.serializeSampleToStateData (*original, encoded), "encode the retained original for Trim audition recall");
+        original->serializedStateData = juce::var (encoded);
+        auto cropped = std::make_shared<P::LoadedSampleData>();
+        cropped->sampleRate = 8000; cropped->fileName = original->fileName;
+        cropped->buffer.setSize (2, 40000);
+        for (int channel = 0; channel < 2; ++channel) cropped->buffer.copyFrom (channel, 0, original->buffer, channel, 8000, 40000);
+        cropped->trimOriginalSample = original; cropped->trimStartSample = 8000; cropped->trimEndSample = 48000;
+        std::atomic_store (&p.loadedSample, cropped);
+        auto layout = std::make_shared<P::ChopState>();
+        for (const int id : { 91, 205 })
+        {
+            P::ChopDefinition chop;
+            chop.id = id; chop.startSample = id == 91 ? 0 : 2000; chop.endSample = chop.startSample + 2000;
+            chop.assignedMidiNote = id == 91 ? 48 : 49; chop.pitchSemitones = 7; chop.gainDecibels = -9;
+            chop.tailLengthMilliseconds = 300; layout->chops.push_back (chop);
+        }
+        layout->selectedChopId = 205; layout->nextChopId = 206; p.publishChopState (layout);
+        p.toggleSelectedChopFavorite(); p.setMidiPerformanceMode (P::MidiPerformanceMode::Favorites);
+        p.globalGainDecibels.store (-6.0206f); p.prepareToPlay (16000, 128);
+        p.playbackSamplePosition.store (12345);
+        const auto beforeSample = p.getLoadedSample();
+        const auto beforeChops = p.getChopState();
+        const auto normalPosition = p.playbackSamplePosition.load();
+        juce::AudioBuffer<float> block (2, 128); juce::MidiBuffer midi;
+        const auto capture = [&] (int frames)
+        {
+            juce::AudioBuffer<float> result (2, ((frames + 127) / 128) * 128);
+            for (int offset = 0; offset < result.getNumSamples(); offset += 128)
+            {
+                midi.clear(); p.processBlock (block, midi);
+                for (int channel = 0; channel < 2; ++channel) result.copyFrom (channel, offset, block, channel, 0, 128);
+            }
+            return result;
+        };
+        check (! p.beginSampleTrimPreview (original) && p.beginSampleTrimPreview (cropped),
+               "Trim audition rejects a stale opening sample and accepts the current cropped source");
+        p.updateSampleTrimPreviewRange (56000, 57024); p.startPlayback();
+        const auto looped = capture (2304);
+        float sourceDifference = 0, loopDifference = 0;
+        for (int channel = 0; channel < 2; ++channel)
+            for (int frame = 64; frame < 128; ++frame)
+            {
+                const double position = 56000 + frame * 0.5;
+                const double phase = juce::MathConstants<double>::twoPi * 125.0 * position / 8000.0;
+                const float expected = (channel == 0 ? 0.4f * (float) std::sin (phase) : 0.2f * (float) std::cos (phase)) * 0.5f;
+                sourceDifference = juce::jmax (sourceDifference, std::abs (looped.getSample (channel, frame) - expected));
+                loopDifference = juce::jmax (loopDifference, std::abs (looped.getSample (channel, frame) - looped.getSample (channel, frame + 2048)));
+            }
+        const bool originalAudioMatches = p.isSampleTrimPreviewPlaying() && p.getPlayingChopId() == -1
+            && sourceDifference < 1.0e-4f && loopDifference < 1.0e-5f
+            && p.getSampleTrimPreviewPosition() >= 56000 && p.getSampleTrimPreviewPosition() < 57024;
+        if (! originalAudioMatches)
+            std::cout << "TRIM AUDITION sourceDifference=" << sourceDifference << " loopDifference=" << loopDifference
+                      << " playing=" << p.isSampleTrimPreviewPlaying() << " cursor=" << p.getSampleTrimPreviewPosition()
+                      << " chop=" << p.getPlayingChopId() << " gainDb=" << p.globalGainDecibels.load() << std::endl;
+        check (originalAudioMatches,
+               "Trim Play loops original audio beyond the committed crop with master gain and host sample-rate conversion");
+        p.updateSampleTrimPreviewRange (60000, 61024); const auto moved = capture (256);
+        check (p.isSampleTrimPreviewPlaying() && p.getSampleTrimPreviewPosition() >= 60000 && p.getSampleTrimPreviewPosition() < 61024
+               && moved.getRMSLevel (0, 64, 128) > 0.1f, "moving Trim bounds during audition keeps playback inside the new original-source range");
+        p.pausePlayback(); const auto paused = capture (256); const auto pausedPosition = p.getSampleTrimPreviewPosition();
+        capture (256);
+        check (p.isSampleTrimPreviewActive() && ! p.isSampleTrimPreviewPlaying() && paused.getMagnitude (0, 0, 256) < 1.0e-6f
+               && p.getSampleTrimPreviewPosition() == pausedPosition, "Trim Pause silences audition and holds its original-source cursor");
+        p.startPlayback(); capture (128);
+        check (p.isSampleTrimPreviewPlaying() && p.getSampleTrimPreviewPosition() > pausedPosition, "Trim Play resumes the paused audition cursor");
+        p.stopPlayback(); const auto stopped = capture (256);
+        check (! p.isSampleTrimPreviewPlaying() && p.isSampleTrimPreviewActive() && p.getSampleTrimPreviewPosition() == 60000
+               && stopped.getMagnitude (0, 0, 256) < 1.0e-6f, "Trim Stop silences playback and returns to the candidate start");
+        p.startPlayback(); capture (128); p.endSampleTrimPreview(); const auto ended = capture (256);
+        check (! p.isSampleTrimPreviewActive() && ! p.isSampleTrimPreviewPlaying() && ended.getMagnitude (0, 0, 256) < 1.0e-6f
+               && p.getLoadedSample() == beforeSample && p.getChopState() == beforeChops && p.playbackSamplePosition.load() == normalPosition,
+               "ending Trim audition preserves committed audio, chops, Favorites, MIDI mapping and the normal playhead");
+
+        p.beginSampleTrimPreview (cropped); p.updateSampleTrimPreviewRange (56000, 57024); p.startPlayback();
+        std::atomic<bool> stopRendering { false }, publishing { false }, finiteAudio { true }, rendererFinished { false };
+        std::atomic<int> renderedBlocks { 0 }, overlappingBlocks { 0 };
+        juce::WaitableEvent rendererStarted, blockRendered;
+        juce::AudioBuffer<float> stressAudio (2, 128);
+        juce::MidiBuffer stressEvents;
+        std::thread renderThread ([&]
+        {
+            for (int iteration = 0; iteration < 65536 && ! stopRendering.load(); ++iteration)
+            {
+                const bool publicationBefore = publishing.load();
+                p.processBlock (stressAudio, stressEvents);
+                for (int channel = 0; channel < 2; ++channel)
+                    for (int frame = 0; frame < 128; ++frame)
+                        if (! std::isfinite (stressAudio.getSample (channel, frame)) || std::abs (stressAudio.getSample (channel, frame)) > 0.21f)
+                            finiteAudio.store (false);
+                if (publicationBefore || publishing.load()) overlappingBlocks.fetch_add (1);
+                renderedBlocks.fetch_add (1); blockRendered.signal();
+                if (iteration == 0) rendererStarted.signal();
+                std::this_thread::yield();
+            }
+            rendererFinished.store (true); blockRendered.signal();
+        });
+        const bool started = rendererStarted.wait (5000);
+        bool allContextsValid = started, publicationsAdvanced = started;
+        publishing.store (true);
+        for (int iteration = 0; iteration < 64 && allContextsValid && publicationsAdvanced; ++iteration)
+        {
+            blockRendered.reset(); const int previousBlocks = renderedBlocks.load();
+            const int start = iteration % 2 == 0 ? 56000 : 60000;
+            p.updateSampleTrimPreviewRange (start, start + 1024);
+            if (iteration % 4 == 0)
+            {
+                p.endSampleTrimPreview();
+                allContextsValid &= ! p.beginSampleTrimPreview (original) && p.beginSampleTrimPreview (cropped);
+                p.updateSampleTrimPreviewRange (start, start + 1024); p.startPlayback();
+            }
+            allContextsValid &= p.getLoadedSample() == beforeSample && p.getChopState() == beforeChops;
+            while (renderedBlocks.load() <= previousBlocks && ! rendererFinished.load())
+                if (! blockRendered.wait (5000)) { publicationsAdvanced = false; break; }
+            publicationsAdvanced &= renderedBlocks.load() > previousBlocks;
+        }
+        publishing.store (false); stopRendering.store (true); renderThread.join();
+        p.endSampleTrimPreview(); const auto afterStress = capture (256);
+        const bool stressClean = allContextsValid && publicationsAdvanced && overlappingBlocks.load() > 0 && finiteAudio.load()
+            && p.getLoadedSample() == beforeSample && p.getChopState() == beforeChops && p.playbackSamplePosition.load() == normalPosition
+            && ! p.isSampleTrimPreviewActive() && afterStress.getMagnitude (0, 0, 256) < 1.0e-6f;
+        if (! stressClean)
+            std::cout << "TRIM PUBLICATION contextsValid=" << allContextsValid << " advanced=" << publicationsAdvanced
+                      << " blocks=" << renderedBlocks.load() << " overlapping=" << overlappingBlocks.load()
+                      << " finite=" << finiteAudio.load() << " normalPosition=" << p.playbackSamplePosition.load()
+                      << " previewActive=" << p.isSampleTrimPreviewActive() << " endedPeak=" << afterStress.getMagnitude (0, 0, 256) << std::endl;
+        check (stressClean,
+               "concurrent Trim context updates and retirement keep audio finite, reject stale sources and preserve committed state");
+
+        p.setChopPlaybackMode (P::ChopPlaybackMode::Gate);
+        p.beginSampleTrimPreview (cropped); p.updateSampleTrimPreviewRange (56000, 57024); p.startPlayback(); capture (128);
+        const int favoriteNote = p.getMidiNoteForChopId (205);
+        const int safeFavoriteNote = juce::jlimit (0, 127, favoriteNote);
+        midi.addEvent (juce::MidiMessage::noteOn (1, safeFavoriteNote, 1.0f), 0); p.processBlock (block, midi); midi.clear();
+        check (favoriteNote >= 0 && p.getPlayingChopId() == 205 && p.isSampleTrimPreviewActive()
+               && ! p.isSampleTrimPreviewPlaying() && p.getSampleTrimPreviewPosition() < 0,
+               "a valid MIDI pad takes over Trim audition and hides its cursor while retaining the editing context");
+        midi.addEvent (juce::MidiMessage::noteOff (1, safeFavoriteNote), 0); p.processBlock (block, midi); midi.clear(); capture (8192);
+        check (! p.isPlaying() && p.isSampleTrimPreviewActive(), "the takeover MIDI note-off releases its Gate without closing Trim");
+        p.startPlayback(); const auto resumedTrim = capture (256);
+        check (p.isSampleTrimPreviewPlaying() && p.getPlayingChopId() == -1 && resumedTrim.getRMSLevel (0, 64, 128) > 0.1f,
+               "Play after MIDI takeover resumes original-source Trim audition");
+        p.startChopPreview (205); capture (128); p.endSampleTrimPreview(); capture (256);
+        check (p.getPlayingChopId() == 205 && p.isPlaying() && ! p.isSampleTrimPreviewActive(),
+               "ending the Trim context leaves a later directly auditioned pad voice playing");
+        p.releaseChopPreview(); capture (8192);
+
+        juce::MemoryBlock saved; p.getStateInformation (saved);
+        const auto openEditor = [&]
+        {
+            auto editor = std::unique_ptr<juce::AudioProcessorEditor> (p.createEditor());
+            if (auto* orb = findType (*editor, "VisualizerOrb")) orb->setVisible (false);
+            editor->setVisible (true);
+            return editor;
+        };
+        auto editor = openEditor();
+        auto* open = dynamic_cast<juce::Button*> (findComponentId (*editor, "trim-sample-button"));
+        auto* play = dynamic_cast<juce::Button*> (findComponentId (*editor, "transport-play"));
+        auto* pause = dynamic_cast<juce::Button*> (findComponentId (*editor, "transport-pause"));
+        auto* stop = dynamic_cast<juce::Button*> (findComponentId (*editor, "transport-stop"));
+        check (open != nullptr && play != nullptr && pause != nullptr && stop != nullptr, "Trim audition uses the existing Play, Pause and Stop controls");
+        if (open != nullptr && play != nullptr && pause != nullptr && stop != nullptr)
+        {
+            open->onClick();
+            auto* view = findComponentId (*editor, "sample-trim-editor");
+            auto* start = dynamic_cast<juce::TextEditor*> (findComponentId (*editor, "sample-trim-start-seconds"));
+            auto* end = dynamic_cast<juce::TextEditor*> (findComponentId (*editor, "sample-trim-end-seconds"));
+            auto* cancel = dynamic_cast<juce::Button*> (findComponentId (*editor, "sample-trim-cancel"));
+            auto* done = dynamic_cast<juce::Button*> (findComponentId (*editor, "sample-trim-done"));
+            check (view != nullptr && start != nullptr && end != nullptr && cancel != nullptr && done != nullptr,
+                   "Trim audition integration exposes editable candidate bounds and commit controls");
+            if (view != nullptr && start != nullptr && end != nullptr && cancel != nullptr && done != nullptr)
+            {
+                start->setText ("7.0", false); start->onReturnKey(); end->setText ("7.75", false); end->onReturnKey();
+                const auto property = [&] (const char* name) { return (double) view->getProperties()[name]; };
+                auto* zoomIn = dynamic_cast<juce::Button*> (findComponentId (*view, "sample-trim-zoom-in"));
+                auto* fit = dynamic_cast<juce::Button*> (findComponentId (*view, "sample-trim-fit"));
+                check (zoomIn != nullptr && fit != nullptr, "Trim audition can preserve an independently positioned zoomed viewport");
+                if (zoomIn != nullptr && fit != nullptr)
+                {
+                    fit->onClick(); for (int i = 0; i < 3; ++i) zoomIn->onClick();
+                    const auto point = juce::Point<float> ((float) (property ("trimOverviewX") + property ("trimOverviewWidth") * 0.875),
+                        (float) (property ("trimOverviewY") + property ("trimOverviewHeight") * 0.5));
+                    const auto now = juce::Time::getCurrentTime();
+                    const auto event = juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), point,
+                        juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier), 1, 0, 0, 0, 0,
+                        view, view, now, point, now, 1, false);
+                    view->mouseDown (event); view->mouseUp (event);
+                    check (property ("trimViewSamples") < 64000 && property ("trimViewEndSample") < property ("trimEndSample"),
+                           "the audition viewport deliberately leaves the selected End off-screen");
+                }
+                const double auditionViewStart = property ("trimViewStartSample"), auditionViewSamples = property ("trimViewSamples");
+                play->onClick(); const auto uiAudio = capture (512);
+                const bool playheadReady = waitFor ([&]
+                {
+                    const double position = property ("trimPreviewPlayheadSample");
+                    return p.isSampleTrimPreviewPlaying() && position >= 56000 && position < 62000;
+                });
+                const double playhead = (double) view->getProperties()["trimPreviewPlayheadSample"];
+                const bool uiAuditionMatches = playheadReady && p.isSampleTrimPreviewPlaying()
+                    && uiAudio.getRMSLevel (0, 64, 128) > 0.1f && playhead >= 56000 && playhead < 62000;
+                if (! uiAuditionMatches)
+                    std::cout << "TRIM UI AUDITION playing=" << p.isSampleTrimPreviewPlaying()
+                              << " rms=" << uiAudio.getRMSLevel (0, 64, 128) << " playhead=" << playhead
+                              << " cursor=" << p.getSampleTrimPreviewPosition() << " gainDb=" << p.globalGainDecibels.load()
+                              << " candidate=" << property ("trimStartSample") << ".." << property ("trimEndSample") << std::endl;
+                check (uiAuditionMatches,
+                       "the real Play button auditions the visible original-source Trim selection and updates its playhead");
+                check (property ("trimViewStartSample") == auditionViewStart && property ("trimViewSamples") == auditionViewSamples
+                       && property ("trimStartSample") == 56000 && property ("trimEndSample") == 62000,
+                       "Play preserves a zoomed Trim viewport instead of revealing unchanged time fields");
+                juce::FileOutputStream image (scratch.getParentDirectory().getChildFile ("sample-trim-playing.png"));
+                image.setPosition (0); image.truncate();
+                juce::PNGImageFormat().writeImageToStream (editor->createComponentSnapshot (editor->getLocalBounds()), image);
+                pause->onClick(); const auto uiPaused = capture (256);
+                check (! p.isSampleTrimPreviewPlaying() && uiPaused.getMagnitude (0, 0, 256) < 1.0e-6f, "the real Pause button pauses Trim audition");
+                play->onClick(); capture (128);
+                check (property ("trimViewStartSample") == auditionViewStart && property ("trimViewSamples") == auditionViewSamples,
+                       "Pause then Play preserves the user's Trim zoom and pan");
+                stop->onClick(); capture (128);
+                check (! p.isSampleTrimPreviewPlaying() && p.getSampleTrimPreviewPosition() == 56000, "the real Stop button returns Trim audition to its candidate start");
+                start->setText ("7.9", false); play->onClick(); capture (128);
+                check (property ("trimStartSample") == 63200 && property ("trimEndSample") >= 63202 && property ("trimEndSample") <= 64000
+                       && p.isSampleTrimPreviewPlaying() && p.getSampleTrimPreviewPosition() >= 63200,
+                       "Play commits a pending Start past the old End and keeps the pushed End instead of pulling Start backward");
+                stop->onClick(); capture (128); end->setText ("7.99", false); play->onClick(); const auto pendingEndAudio = capture (256);
+                check (property ("trimStartSample") == 63200 && property ("trimEndSample") == 63920
+                       && pendingEndAudio.getRMSLevel (0, 64, 128) > 0.1f,
+                       "Play also commits an edited pending End and auditions the resulting usable range");
+                play->onClick(); capture (128); cancel->onClick(); const auto afterCancel = capture (256);
+                check (! p.isSampleTrimPreviewActive() && afterCancel.getMagnitude (0, 0, 256) < 1.0e-6f
+                       && p.getLoadedSample() == beforeSample && p.getChopState() == beforeChops, "Cancel closes active Trim audition without changing committed edits");
+                open->onClick(); play->onClick(); capture (128); editor.reset(); const auto afterClose = capture (256);
+                check (! p.isSampleTrimPreviewActive() && afterClose.getMagnitude (0, 0, 256) < 1.0e-6f, "closing the editor stops its active Trim audition");
+                editor = openEditor();
+                auto* reopen = dynamic_cast<juce::Button*> (findComponentId (*editor, "trim-sample-button"));
+                auto* replay = dynamic_cast<juce::Button*> (findComponentId (*editor, "transport-play"));
+                auto* redone = dynamic_cast<juce::Button*> (findComponentId (*editor, "sample-trim-done"));
+                check (reopen != nullptr && replay != nullptr && redone != nullptr, "reopening the editor retains the Trim audition commit controls");
+                if (reopen != nullptr && replay != nullptr && redone != nullptr)
+                {
+                    reopen->onClick(); replay->onClick(); capture (128); redone->onClick(); const auto afterDone = capture (256);
+                    check (! p.isSampleTrimPreviewActive() && afterDone.getMagnitude (0, 0, 256) < 1.0e-6f,
+                           "Done retires the Trim audition before queuing its committed crop");
+                    check (waitFor ([&] { return p.getSampleImportStatus() == nullptr; }), "the auditioned Trim commit finishes its crop publication");
+                }
+            }
+        }
+        editor.reset();
+        auto openingSample = p.getLoadedSample();
+        check (p.beginSampleTrimPreview (openingSample), "reopen Trim audition before host restore invalidation");
+        p.updateSampleTrimPreviewRange (56000, 57024); p.startPlayback(); capture (128);
+        p.setStateInformation (saved.getData(), (int) saved.getSize());
+        check (waitFor ([&] { return restored (p); }), "host restore replaces a source during Trim audition");
+        const auto afterRestore = capture (256);
+        check (! p.isSampleTrimPreviewActive() && afterRestore.getMagnitude (0, 0, 256) < 1.0e-6f && ! p.beginSampleTrimPreview (openingSample),
+               "host restore invalidates the old Trim audition and rejects its stale opening source");
+        openingSample = p.getLoadedSample(); p.beginSampleTrimPreview (openingSample);
+        p.updateSampleTrimPreviewRange (56000, 57024); p.startPlayback(); capture (128);
+        const auto replacement = scratch.getChildFile ("trim-audition-replacement.wav");
+        auto stream = replacement.createOutputStream();
+        auto* writer = juce::WavAudioFormat().createWriterFor (stream.get(), 8000, 2, 24, {}, 0);
+        check (writer != nullptr, "create the replacement source for active Trim audition invalidation");
+        if (writer != nullptr)
+        {
+            stream.release(); writer->writeFromAudioSampleBuffer (original->buffer, 0, 8000); delete writer;
+            bool imported = false;
+            p.loadAudioFileAsync (replacement, [&] (auto result) { imported = result == P::SampleLoadResult::loaded; });
+            check (waitFor ([&] { return imported; }), "import replaces an actively auditioned original source");
+            const auto afterImport = capture (256);
+            check (! p.isSampleTrimPreviewActive() && afterImport.getMagnitude (0, 0, 256) < 1.0e-6f && ! p.beginSampleTrimPreview (openingSample),
+                   "a new import stops the old Trim audition and rejects its stale source context");
+        }
+        p.endSampleTrimPreview();
+    }
+
+    static void runSampleTrim (const juce::File& scratch)
+    {
+        P p; setup (p, true);
+        // This focused crop test exercises the real classical detector without
+        // requiring a neural inference for each five-second crop. Neural tempo
+        // selection has separate model/frontend regressions.
+        p.beatThisAnalyzer.reset();
+        p.setMicroChopDivision (8); p.setGridBpmTrim (1.5f); p.setGridStartOffset (0.1f);
+        p.selectChopById (7); p.toggleSelectedChopFavorite(); p.setMidiPerformanceMode (P::MidiPerformanceMode::Favorites);
+        const auto original = p.getOriginalSampleForTrim();
+        check (original != nullptr && original->buffer.getNumSamples() == 64000 && original->buffer.getSample (0, 0) == 1.75f,
+               "Trim retains the full pristine source even when stems are muted");
+        if (original == nullptr) return;
+        const auto cropMatches = [] (const P& target, int start, int end)
+        {
+            const auto whole = target.getOriginalSampleForTrim(), crop = target.getLoadedSample();
+            if (whole == nullptr || crop == nullptr || start < 0 || end > whole->buffer.getNumSamples()
+                || crop->buffer.getNumSamples() != end - start || crop->buffer.getNumChannels() != whole->buffer.getNumChannels()) return false;
+            for (int channel = 0; channel < crop->buffer.getNumChannels(); ++channel)
+                if (std::memcmp (crop->buffer.getReadPointer (channel), whole->buffer.getReadPointer (channel) + start,
+                                 (size_t) (end - start) * sizeof (float)) != 0) return false;
+            return true;
+        };
+        const auto waitForTrim = [&] (P& target, int start, int end)
+        {
+            return waitFor ([&] { return target.getSampleImportStatus() == nullptr && target.getSampleTrimStartSample() == start
+                && target.getSampleTrimEndSample() == end && cropMatches (target, start, end); });
+        };
+        const auto checkFreshAnalysis = [&] (const std::shared_ptr<const P::TempoAnalysisData>& previous, const char* label)
+        {
+            const bool ready = waitFor ([&] { const auto analysis = p.getTempoAnalysis(); return ! p.isTempoAnalysisInProgress()
+                && analysis != nullptr && analysis != previous && analysis->estimatedBpm > 0 && ! p.getChopState()->chops.empty(); });
+            if (! ready)
+            {
+                const auto analysis = p.getTempoAnalysis();
+                std::cout << "TRIM ANALYSIS in-progress=" << p.isTempoAnalysisInProgress()
+                          << " bpm=" << (analysis != nullptr ? analysis->estimatedBpm : 0.0)
+                          << " chops=" << p.getChopState()->chops.size() << std::endl;
+            }
+            check (ready, label);
+        };
+
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+        if (auto* orb = findType (*editor, "VisualizerOrb")) orb->setVisible (false);
+        auto* openTrim = dynamic_cast<juce::Button*> (findComponentId (*editor, "trim-sample-button"));
+        check (openTrim != nullptr, "Trim Sample action is available for loaded audio");
+        if (openTrim != nullptr)
+        {
+            const auto beforeCancel = p.getLoadedSample();
+            const auto beforeCancelChops = p.getChopState();
+            openTrim->onClick();
+            auto* trimView = findComponentId (*editor, "sample-trim-editor");
+            auto* startSeconds = dynamic_cast<juce::TextEditor*> (findComponentId (*editor, "sample-trim-start-seconds"));
+            auto* endSeconds = dynamic_cast<juce::TextEditor*> (findComponentId (*editor, "sample-trim-end-seconds"));
+            auto* cancel = dynamic_cast<juce::Button*> (findComponentId (*editor, "sample-trim-cancel"));
+            check (trimView != nullptr && trimView->isVisible() && startSeconds != nullptr && endSeconds != nullptr && cancel != nullptr,
+                   "Trim editor exposes full-source start/end seconds and Cancel");
+            if (trimView != nullptr && startSeconds != nullptr && endSeconds != nullptr && cancel != nullptr)
+            {
+                startSeconds->setText ("1.0", false); if (startSeconds->onReturnKey) startSeconds->onReturnKey();
+                endSeconds->setText ("6.0", false); if (endSeconds->onReturnKey) endSeconds->onReturnKey();
+                check ((int) trimView->getProperties()["trimStartSample"] == 8000 && (int) trimView->getProperties()["trimEndSample"] == 48000,
+                       "numeric Trim edits select original-source bounds without cropping");
+                startSeconds->setText ("6.5", false); if (startSeconds->onReturnKey) startSeconds->onReturnKey();
+                endSeconds->setText ("7.5", false); if (endSeconds->onReturnKey) endSeconds->onReturnKey();
+                check ((int) trimView->getProperties()["trimStartSample"] == 52000 && (int) trimView->getProperties()["trimEndSample"] == 60000,
+                       "typing a later Trim range moves past the old end instead of clamping the new start");
+                startSeconds->setText ("1.0", false); if (startSeconds->onReturnKey) startSeconds->onReturnKey();
+                endSeconds->setText ("6.0", false); if (endSeconds->onReturnKey) endSeconds->onReturnKey();
+                auto* zoomIn = dynamic_cast<juce::Button*> (findComponentId (*trimView, "sample-trim-zoom-in"));
+                auto* zoomOut = dynamic_cast<juce::Button*> (findComponentId (*trimView, "sample-trim-zoom-out"));
+                auto* fit = dynamic_cast<juce::Button*> (findComponentId (*trimView, "sample-trim-fit"));
+                check (zoomIn != nullptr && zoomOut != nullptr && fit != nullptr, "Trim exposes zoom in, zoom out and Fit controls");
+                if (zoomIn != nullptr && zoomOut != nullptr && fit != nullptr)
+                {
+                    const auto property = [&] (const char* name) { return (double) trimView->getProperties()[name]; };
+                    fit->onClick(); zoomIn->onClick(); zoomIn->onClick();
+                    const double zoomedSamples = property ("trimViewSamples");
+                    check (zoomedSamples > 0 && zoomedSamples < 64000 && property ("trimStartSample") == 8000
+                           && property ("trimEndSample") == 48000, "zooming Trim changes only the viewport, preserving original-coordinate bounds");
+                    zoomOut->onClick();
+                    check (property ("trimViewSamples") > zoomedSamples && property ("trimViewSamples") <= 64000,
+                           "Trim zoom out reveals more of the retained source");
+                    zoomIn->onClick();
+                    const double viewStart = property ("trimViewStartSample"), viewSamples = property ("trimViewSamples");
+                    const int numericStart = juce::roundToInt (viewStart + viewSamples * 0.25);
+                    const int numericEnd = juce::roundToInt (viewStart + viewSamples * 0.75);
+                    startSeconds->setText (juce::String (numericStart / 8000.0, 6), false); if (startSeconds->onReturnKey) startSeconds->onReturnKey();
+                    endSeconds->setText (juce::String (numericEnd / 8000.0, 6), false); if (endSeconds->onReturnKey) endSeconds->onReturnKey();
+                    check (property ("trimStartSample") == numericStart && property ("trimEndSample") == numericEnd
+                           && property ("trimViewStartSample") == viewStart && property ("trimViewSamples") == viewSamples,
+                           "numeric edits while zoomed still use original-source seconds and preserve the viewport");
+                    const auto trimEvent = [&] (juce::Point<float> point)
+                    {
+                        const auto now = juce::Time::getCurrentTime();
+                        return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), point,
+                            juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier), 1, 0, 0, 0, 0,
+                            trimView, trimView, now, point, now, 1, false);
+                    };
+                    const float waveX = (float) property ("trimWaveX"), waveWidth = (float) property ("trimWaveWidth");
+                    const float waveY = (float) (property ("trimWaveY") + property ("trimWaveHeight") * 0.5);
+                    const auto endHandle = juce::Point<float> (waveX + waveWidth * (float) ((numericEnd - viewStart) / viewSamples), waveY);
+                    const auto movedHandle = juce::Point<float> (waveX + waveWidth * 0.85f, waveY);
+                    trimView->mouseDown (trimEvent (endHandle)); trimView->mouseDrag (trimEvent (movedHandle)); trimView->mouseUp (trimEvent (movedHandle));
+                    const int mappedEnd = juce::roundToInt (viewStart + viewSamples * (movedHandle.x - waveX) / waveWidth);
+                    check (property ("trimStartSample") == numericStart && std::abs (property ("trimEndSample") - mappedEnd) <= 1,
+                           "dragging a zoomed Trim handle maps its viewport position back to the original source");
+                    juce::FileOutputStream zoomSnapshot (scratch.getParentDirectory().getChildFile ("sample-trim-zoomed.png"));
+                    zoomSnapshot.setPosition (0); zoomSnapshot.truncate();
+                    juce::PNGImageFormat().writeImageToStream (editor->createComponentSnapshot (editor->getLocalBounds()), zoomSnapshot);
+                    const auto panPoint = juce::Point<float> ((float) (property ("trimOverviewX") + property ("trimOverviewWidth") * 0.9),
+                        (float) (property ("trimOverviewY") + property ("trimOverviewHeight") * 0.5));
+                    trimView->mouseDown (trimEvent (panPoint)); trimView->mouseDrag (trimEvent (panPoint)); trimView->mouseUp (trimEvent (panPoint));
+                    check (property ("trimViewStartSample") > viewStart && property ("trimViewEndSample") <= 64000
+                           && property ("trimStartSample") == numericStart && std::abs (property ("trimEndSample") - mappedEnd) <= 1,
+                           "the original-source overview pans a zoomed Trim view without moving either endpoint");
+                    fit->onClick();
+                    check (property ("trimViewStartSample") == 0 && property ("trimViewEndSample") == 64000
+                           && property ("trimStartSample") == numericStart && std::abs (property ("trimEndSample") - mappedEnd) <= 1,
+                           "Fit restores the complete original waveform without resetting the pending Trim");
+                    for (int i = 0; i < 11; ++i) zoomIn->onClick();
+                    const double tinyViewStart = property ("trimViewStartSample"), tinyViewSamples = property ("trimViewSamples");
+                    const auto thumbCentre = juce::Point<float> ((float) (property ("trimOverviewThumbX") + property ("trimOverviewThumbWidth") * 0.5),
+                        (float) (property ("trimOverviewThumbY") + property ("trimOverviewThumbHeight") * 0.5));
+                    trimView->mouseDown (trimEvent (thumbCentre)); trimView->mouseUp (trimEvent (thumbCentre));
+                    check (tinyViewSamples == 32 && property ("trimViewStartSample") == tinyViewStart
+                           && property ("trimStartSample") == numericStart && std::abs (property ("trimEndSample") - mappedEnd) <= 1,
+                           "grabbing the visible overview thumb at maximum zoom does not jump the viewport or Trim endpoints");
+                    trimView->mouseDown (trimEvent (thumbCentre));
+                    trimView->mouseDrag (trimEvent (thumbCentre.translated (1.0f, 0)));
+                    trimView->mouseUp (trimEvent (thumbCentre.translated (1.0f, 0)));
+                    check (property ("trimViewStartSample") > tinyViewStart && property ("trimViewSamples") == tinyViewSamples
+                           && property ("trimStartSample") == numericStart && std::abs (property ("trimEndSample") - mappedEnd) <= 1,
+                           "the minimum-width overview thumb still pans a maximum-zoom viewport without editing the Trim");
+                    fit->onClick();
+                    startSeconds->setText ("1.0", false); if (startSeconds->onReturnKey) startSeconds->onReturnKey();
+                    endSeconds->setText ("6.0", false); if (endSeconds->onReturnKey) endSeconds->onReturnKey();
+                }
+                juce::Button* theme = nullptr;
+                std::function<void (juce::Component&)> findTheme = [&] (juce::Component& component)
+                {
+                    if (auto* button = dynamic_cast<juce::Button*> (&component);
+                        button != nullptr && button->getTooltip() == "Switch between light and dark themes.") theme = button;
+                    for (auto* child : component.getChildren()) findTheme (*child);
+                };
+                findTheme (*editor);
+                if (theme != nullptr && theme->onClick)
+                {
+                    const auto previousTheme = theme->getButtonText();
+                    for (const auto* themeName : { "dark", "light" })
+                    {
+                        if (theme->getButtonText() != juce::String (themeName).toUpperCase()) theme->onClick();
+                        pump();
+                        juce::FileOutputStream image (scratch.getParentDirectory().getChildFile (
+                            "sample-trim-editor-" + juce::String (themeName) + ".png"));
+                        image.setPosition (0); image.truncate();
+                        juce::PNGImageFormat().writeImageToStream (editor->createComponentSnapshot (editor->getLocalBounds()), image);
+                    }
+                    if (theme->getButtonText() != previousTheme) theme->onClick();
+                }
+                cancel->onClick();
+                check (! trimView->isVisible() && p.getLoadedSample() == beforeCancel && p.getChopState() == beforeCancelChops
+                       && p.getSampleTrimStartSample() == 0 && p.getSampleTrimEndSample() == 64000 && p.getSampleImportStatus() == nullptr,
+                       "Cancel discards only the local Trim preview and preserves audio, Favorites and MIDI mapping");
+            }
+        }
+        editor.reset();
+        check (! p.applySampleTrim (0, 1) && ! p.applySampleTrim (100, 100) && ! p.applySampleTrim (200, 100),
+               "Trim rejects one-frame, empty and reversed ranges without replacing audio");
+        juce::WaitableEvent analysisEntered, releaseAnalysis;
+        p.analysisThreadPool.addJob ([&] { analysisEntered.signal(); releaseAnalysis.wait (10000); });
+        check (analysisEntered.wait (5000), "hold real Trim analysis before testing the temporary empty grid");
+        const auto oldAnalysis = p.getTempoAnalysis();
+        check (p.applySampleTrim (8000, 48000) && waitForTrim (p, 8000, 48000),
+               "Done crops exactly the original half-open start/end range on every channel");
+        p.setMidiMappingLocked (true);
+        check (p.isTempoAnalysisInProgress() && p.getChopState()->chops.empty() && ! p.isMidiMappingLocked(),
+               "MIDI Lock cannot freeze Trim's temporary empty grid before analysis completes");
+        p.setMidiMappingLocked (false); releaseAnalysis.signal();
+        checkFreshAnalysis (oldAnalysis, "Trim completion re-analyzes tempo and creates a fresh chop grid");
+        bool boundedChops = true;
+        for (const auto& chop : p.getChopState()->chops) boundedChops &= chop.startSample >= 0 && chop.endSample > chop.startSample && chop.endSample <= 40000;
+        check (boundedChops && p.getChopState()->favoriteChopIndices.empty() && ! p.isManualChopModeActive()
+               && ! p.isFavoritesViewEnabled() && p.getMidiPerformanceMode() == P::MidiPerformanceMode::Window
+               && p.getMicroChopDivision() == 8 && p.getChopBarsCount() == 2
+               && p.getGridBpmTrim() == 0 && p.getGridStartOffset() == 0 && p.getMidiWindowStart() == 0,
+               "Trim rebuilds valid C4 Window chops, clears old Favorites and preserves Bars/Micro preferences");
+        const auto firstCropAnalysis = p.getTempoAnalysis();
+        check (p.applySampleTrim (4000, 56000) && waitForTrim (p, 4000, 56000)
+               && p.getOriginalSampleForTrim()->buffer.getNumSamples() == 64000,
+               "reopening Trim can expand both edges using the retained original source");
+        checkFreshAnalysis (firstCropAnalysis, "expanded Trim receives its own fresh analysis");
+        p.setMidiMappingLocked (true);
+        const auto lockedSample = p.getLoadedSample();
+        check (! p.applySampleTrim (0, 64000) && p.getLoadedSample() == lockedSample && p.getSampleImportStatus() == nullptr,
+               "MIDI Lock rejects trimming before any source or map changes");
+        p.setMidiMappingLocked (false);
+        juce::MemoryBlock savedTrim; p.getStateInformation (savedTrim);
+        P recalledTrim; recalledTrim.beatThisAnalyzer.reset(); recalledTrim.setStateInformation (savedTrim.getData(), (int) savedTrim.getSize());
+        check (waitFor ([&] { return restored (recalledTrim); }) && waitForTrim (recalledTrim, 4000, 56000)
+               && recalledTrim.getOriginalSampleForTrim()->buffer.getNumSamples() == 64000
+               && correlation (original->buffer, recalledTrim.getOriginalSampleForTrim()->buffer) > 0.90,
+               "project recall restores both the full original audio and the saved Trim bounds");
+        check (recalledTrim.applySampleTrim (0, 64000) && waitForTrim (recalledTrim, 0, 64000),
+               "a saved trimmed project can recover the complete original source");
+
+        juce::WaitableEvent workerEntered, releaseWorker;
+        const auto holdWorker = [&]
+        {
+            workerEntered.reset(); releaseWorker.reset();
+            p.sampleImportThreadPool.addJob ([&] { workerEntered.signal(); releaseWorker.wait (10000); });
+            check (workerEntered.wait (5000), "hold Trim preparation worker for generation regression");
+        };
+        holdWorker();
+        const bool firstQueued = p.applySampleTrim (8000, 16000), latestQueued = p.applySampleTrim (0, 32000);
+        releaseWorker.signal();
+        check (firstQueued && latestQueued && waitForTrim (p, 0, 32000)
+               && waitFor ([&] { return p.sampleImportThreadPool.getNumJobs() == 0; }),
+               "a newer queued Trim supersedes stale crop preparation");
+        holdWorker(); p.applySampleTrim (1000, 9000); p.setStateInformation (savedTrim.getData(), (int) savedTrim.getSize());
+        releaseWorker.signal();
+        check (waitFor ([&] { return restored (p) && p.sampleImportThreadPool.getNumJobs() == 0; }) && waitForTrim (p, 4000, 56000),
+               "queued Trim cannot replace audio or bounds restored by the host");
+
+        const auto replacement = scratch.getChildFile ("trim-replacement.wav");
+        auto output = replacement.createOutputStream();
+        auto* writer = juce::WavAudioFormat().createWriterFor (output.get(), 8000, 2, 24, {}, 0);
+        check (writer != nullptr, "create a new-file replacement for Trim reset");
+        if (writer != nullptr)
+        {
+            output.release(); writer->writeFromAudioSampleBuffer (original->buffer, 0, 8000); delete writer;
+            bool replaced = false;
+            const auto staleTrimPreviewSource = p.getLoadedSample();
+            p.loadAudioFileAsync (replacement, [&] (auto result) { replaced = result == P::SampleLoadResult::loaded; });
+            check (waitFor ([&] { return replaced; }) && waitForTrim (p, 0, 8000)
+                   && p.getOriginalSampleForTrim()->buffer.getNumSamples() == 8000 && p.getMicroChopDivision() == 8,
+                   "a new import resets Trim to its own full source while preserving the subdivision preference");
+            const auto replacementSample = p.getLoadedSample();
+            check (! p.applySampleTrim (0, 4000, staleTrimPreviewSource) && p.getLoadedSample() == replacementSample
+                   && p.getSampleTrimStartSample() == 0 && p.getSampleTrimEndSample() == 8000 && p.getSampleImportStatus() == nullptr,
+                   "Done from a stale Trim preview cannot crop a newly imported source");
+        }
+    }
+
     static void runSampleImport (const juce::File& scratch)
     {
         P p;
@@ -1046,6 +1893,12 @@ struct CueSamplerStateTests
         std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
         // Keep GL out of the console harness; import still runs real UI listeners.
         if (auto* orb = findType (*editor, "VisualizerOrb")) orb->setVisible (false);
+        auto* preloadMicro = dynamic_cast<juce::ComboBox*> (findComponentId (*editor, "micro-chop-division"));
+        check (preloadMicro != nullptr && preloadMicro->isEnabled() && p.getMicroChopDivision() == 0,
+               "Micro-Chops defaults to Off and can be chosen before loading or analysis");
+        if (preloadMicro != nullptr) preloadMicro->setSelectedId (4, juce::sendNotificationSync);
+        check (p.getMicroChopDivision() == 4 && p.getLoadedSample() == nullptr,
+               "pre-load Micro-Chops choice stores the future subdivision without requiring audio");
         for (const auto rate : { 44100, 48000 })
             for (const auto channels : { 1, 2 })
             {
@@ -1073,8 +1926,9 @@ struct CueSamplerStateTests
                        "import publishes the complete source for UI and playback");
                 check (p.getMidiRootNote() == 24 && p.getKeyboardStartNote() == 48
                        && p.getMidiPerformanceMode() == P::MidiPerformanceMode::Window
-                       && p.getChopState()->midiMap.rootNote == 48 && p.getKeyboardMidiBank() == 1,
-                       "new import starts a C4 Window independently of retained legacy root settings");
+                       && p.getChopState()->midiMap.rootNote == 48 && p.getKeyboardMidiBank() == 1
+                       && p.getMicroChopDivision() == 4,
+                       "new import starts a C4 Window and preserves the chosen Micro-Chops preference");
                 juce::AudioBuffer<float> audio (2, 128);
                 juce::MidiBuffer midi;
                 p.startPlayback(); p.processBlock (audio, midi);
@@ -1457,6 +2311,177 @@ struct CueSamplerStateTests
         check (recalled.getMidiNoteForChopId (idFor (0)) == 84 && recalled.getMidiNoteForChopId (idFor (1)) == -1,
                "opting out of performance mapping restores the original explicit and unassigned legacy notes");
 
+        {
+            P micro; setup (micro);
+            const auto analysis = std::atomic_load (&micro.tempoAnalysis);
+            micro.publishChopState (std::make_shared<P::ChopState>()); micro.buildChopsFromAnalysis (*analysis);
+            micro.setMidiPerformanceMode (Mode::Window);
+            for (const int division : { 2, 4, 8, 16, 4, 2, 16 })
+            {
+                if (micro.getChopState()->chops.size() > 56) micro.setMidiWindowStart (8);
+                micro.setMicroChopDivision (division);
+                const auto state = micro.getChopState();
+                const int frames = 16000 / division, expectedCount = 4 * division;
+                bool exact = (int) state->chops.size() == expectedCount;
+                for (int chop = 0; chop < (int) state->chops.size(); ++chop)
+                    exact &= state->chops[(size_t) chop].startSample == chop * frames
+                        && state->chops[(size_t) chop].endSample == (chop + 1) * frames
+                        && state->chops[(size_t) chop].endSample > state->chops[(size_t) chop].startSample;
+                bool mapped = micro.getMappedMidiNotes().count() == (size_t) juce::jmin (56, expectedCount);
+                for (int slot = 0; slot < juce::jmin (56, expectedCount); ++slot)
+                    mapped &= idAt (micro, 48 + slot) == state->chops[(size_t) slot].id;
+                check (micro.getMicroChopDivision() == division && micro.getChopBarsCount() == 2
+                       && std::abs (micro.getChopLengthInBars() - 1.0 / division) < 1.0e-12 && exact,
+                       "Micro-Chops create exact half/quarter/eighth/sixteenth-bar slices without gaps or zero lengths");
+                const double expectedMilliseconds = division == 2 ? 1000.0 : division == 4 ? 500.0 : division == 8 ? 250.0 : 125.0;
+                check (! state->chops.empty() && std::abs ((state->chops[0].endSample - state->chops[0].startSample)
+                       * 1000.0 / 8000.0 - expectedMilliseconds) < 1.0e-9,
+                       "120 BPM Micro-Chops produce 1000, 500, 250 and 125 millisecond bar fractions");
+                check (micro.getMidiWindowStart() == 0 && windowIsContiguous (micro) && mapped,
+                       "each Micro-Chops change restarts consecutive C4 Window notes at chop 1");
+            }
+            const auto sameDivision = micro.getChopState(); micro.setMicroChopDivision (16);
+            check (micro.getChopState() == sameDivision, "reselecting the active Micro-Chops division preserves chop identities");
+            micro.undoLastEdit();
+            check (micro.getMicroChopDivision() == 2 && micro.getChopState()->chops.size() == 8,
+                   "a repeated Micro-Chops value adds no undo step");
+            micro.setMicroChopDivision (16); micro.setMidiWindowStart (8);
+            const auto beforeMicroUndo = micro.getChopState(); micro.setMicroChopDivision (8); micro.undoLastEdit();
+            check (micro.getMicroChopDivision() == 16 && micro.getMidiWindowStart() == 8
+                   && micro.getChopState()->midiWindowChopIds == beforeMicroUndo->midiWindowChopIds,
+                   "one Undo restores the Micro-Chops division and exact previous MIDI Window");
+            micro.setMidiMappingLocked (true);
+            const auto lockedMicro = micro.getChopState(); micro.setMicroChopDivision (2); micro.setChopBarsCount (2);
+            check (micro.getMicroChopDivision() == 16 && micro.getChopState() == lockedMicro,
+                   "MIDI Lock blocks both Micro-Chops changes and exiting Micro through Bars");
+            juce::MemoryBlock savedMicro; micro.getStateInformation (savedMicro);
+            auto savedMicroTree = juce::ValueTree::readFromData ((const char*) savedMicro.getData() + 4, savedMicro.getSize() - 4);
+            check (savedMicroTree.getProperty ("microChopUnit").toString() == "bar" && ! micro.isPreservedMicroChopBeatGrid(),
+                   "new Micro-Chops projects explicitly save bar units");
+            P recalledMicro; recalledMicro.setStateInformation (savedMicro.getData(), (int) savedMicro.getSize());
+            check (waitFor ([&] { return restored (recalledMicro); }) && recalledMicro.getMicroChopDivision() == 16
+                   && ! recalledMicro.isPreservedMicroChopBeatGrid()
+                   && recalledMicro.getChopBarsCount() == 2 && recalledMicro.isMidiMappingLocked()
+                   && recalledMicro.getMidiWindowStart() == 8 && recalledMicro.getChopState()->chops.size() == 64
+                   && recalledMicro.getChopState()->midiWindowChopIds == lockedMicro->midiWindowChopIds,
+                   "project recall retains Micro-Chops, its base Bars preference, Lock and all Window bindings");
+            auto legacyBarTree = savedMicroTree.createCopy(); legacyBarTree.removeProperty ("microChopUnit", nullptr);
+            juce::MemoryBlock legacyBarData;
+            { juce::MemoryOutputStream output (legacyBarData, false); output.write ("CSB2", 4); legacyBarTree.writeToStream (output); }
+            P legacyBar; legacyBar.beatThisAnalyzer.reset(); legacyBar.setStateInformation (legacyBarData.getData(), (int) legacyBarData.getSize());
+            check (waitFor ([&] { return restored (legacyBar); }) && ! legacyBar.isPreservedMicroChopBeatGrid()
+                   && legacyBar.getMicroChopDivision() == 16 && legacyBar.getChopLengthInBars() == 1.0 / 16
+                   && legacyBar.getChopState()->chops.size() == 64
+                   && legacyBar.getChopState()->midiWindowChopIds == lockedMicro->midiWindowChopIds,
+                   "original Micro projects without a unit retain their bar-fraction chops, identities and MIDI Window");
+
+            // Recreate a project from the short-lived beat version. Restore
+            // must not reinterpret its denominator or remap recorded patterns.
+            P beatSource; setup (beatSource); beatSource.beatThisAnalyzer.reset();
+            beatSource.setMicroChopDivision (16);
+            beatSource.preservedMicroChopBeatGrid.store (true);
+            beatSource.buildChopsFromAnalysis (*beatSource.getTempoAnalysis());
+            beatSource.setMidiPerformanceMode (Mode::Window); beatSource.setMidiWindowStart (8);
+            const auto beatLayout = beatSource.getChopState();
+            juce::MemoryBlock beatData; beatSource.getStateInformation (beatData);
+            P savedBeat; savedBeat.beatThisAnalyzer.reset(); savedBeat.setStateInformation (beatData.getData(), (int) beatData.getSize());
+            check (waitFor ([&] { return restored (savedBeat); }) && savedBeat.isPreservedMicroChopBeatGrid()
+                   && savedBeat.getMicroChopDivision() == 16 && savedBeat.getChopLengthInBars() == 1.0 / 64
+                   && savedBeat.getChopState()->chops.size() == 256
+                   && savedBeat.getChopState()->midiWindowChopIds == beatLayout->midiWindowChopIds,
+                   "beat-version projects retain their exact timings, chop identities and MIDI Window");
+            juce::MemoryBlock beatResaved; savedBeat.getStateInformation (beatResaved);
+            const auto beatTree = juce::ValueTree::readFromData ((const char*) beatResaved.getData() + 4, beatResaved.getSize() - 4);
+            check (beatTree.getProperty ("microChopUnit").toString() == "beat",
+                   "resaving a beat-version project preserves its timing unit explicitly");
+            savedBeat.setGridStartOffset (0.03125f);
+            check (savedBeat.isPreservedMicroChopBeatGrid() && ! savedBeat.getChopState()->chops.empty()
+                   && savedBeat.getChopState()->chops[0].endSample - savedBeat.getChopState()->chops[0].startSample == 250,
+                   "ordinary grid edits retain a saved sixteenth-beat grid at 31.25 milliseconds");
+            savedBeat.setGridStartOffset (0); savedBeat.clearEditUndoHistory();
+            const auto beforeUnitAdoption = savedBeat.getChopState();
+            std::unique_ptr<juce::AudioProcessorEditor> beatEditor (savedBeat.createEditor());
+            if (auto* orb = findType (*beatEditor, "VisualizerOrb")) orb->setVisible (false);
+            auto* beatMenu = dynamic_cast<juce::ComboBox*> (findComponentId (*beatEditor, "micro-chop-division"));
+            check (beatMenu != nullptr && beatMenu->getSelectedId() == 1016 && beatMenu->getText() == "1/16 BEAT*"
+                   && beatMenu->getTooltip().contains ("Saved beat-based"),
+                   "a saved beat grid is labelled accurately beside the normal bar options");
+            if (beatMenu != nullptr) beatMenu->setSelectedId (16, juce::sendNotificationSync);
+            check (! savedBeat.isPreservedMicroChopBeatGrid() && savedBeat.getChopState()->chops.size() == 64,
+                   "explicitly choosing the same Micro denominator adopts bar fractions for a beat-version project");
+            savedBeat.undoLastEdit();
+            check (savedBeat.isPreservedMicroChopBeatGrid() && savedBeat.getChopState()->chops.size() == 256
+                   && savedBeat.getChopState()->midiWindowChopIds == beforeUnitAdoption->midiWindowChopIds,
+                   "one Undo restores saved beat timing, boundaries and MIDI bindings after bar adoption");
+
+            auto legacyMicroTree = savedMicroTree.createCopy();
+            legacyMicroTree.removeProperty ("microChopDivision", nullptr);
+            legacyMicroTree.removeProperty ("microChopUnit", nullptr);
+            juce::MemoryBlock legacyMicroData;
+            { juce::MemoryOutputStream output (legacyMicroData, false); output.write ("CSB2", 4); legacyMicroTree.writeToStream (output); }
+            P legacyMicro; legacyMicro.setStateInformation (legacyMicroData.getData(), (int) legacyMicroData.getSize());
+            check (waitFor ([&] { return restored (legacyMicro); }) && legacyMicro.getMicroChopDivision() == 0
+                   && ! legacyMicro.isPreservedMicroChopBeatGrid()
+                   && legacyMicro.getChopBarsCount() == 2,
+                   "older projects without Micro-Chops state default to Off and retain their Bars setting");
+            micro.setMidiMappingLocked (false); micro.setMicroChopDivision (0);
+            check (micro.getMicroChopDivision() == 0 && micro.getChopLengthInBars() == 2.0 && micro.getChopState()->chops.size() == 2,
+                   "Micro-Chops Off restores the selected whole-bar length");
+            micro.setMicroChopDivision (16); micro.setChopBarsCount (2);
+            check (micro.getMicroChopDivision() == 0 && micro.getChopState()->chops.size() == 2,
+                   "clicking the current base Bars choice explicitly exits Micro-Chops");
+            micro.undoLastEdit();
+            check (micro.getMicroChopDivision() == 16 && micro.getChopState()->chops.size() == 64,
+                   "one Undo restores Micro-Chops after choosing the same base Bars value");
+            micro.gridStartOffset.store (-0.0625f); micro.buildChopsFromAnalysis (*analysis);
+            check (! micro.getChopState()->chops.empty() && micro.getChopState()->chops[0].startSample == 500,
+                   "a negative grid offset advances by micro subdivisions without skipping a whole bar of chops");
+            micro.gridStartOffset.store (0.0f); micro.buildChopsFromAnalysis (*analysis);
+
+            micro.setMicroChopDivision (8);
+            const auto beforeMicroResize = micro.getChopState();
+            const int resizedId = beforeMicroResize->chops.empty() ? -1 : beforeMicroResize->chops[0].id;
+            micro.resizeChopBoundaryAndTempo (resizedId, 0, 2500);
+            const auto afterMicroResize = micro.getChopState();
+            bool resizedGrid = afterMicroResize->chops.size() == 26;
+            for (int chop = 0; chop < (int) afterMicroResize->chops.size(); ++chop)
+                resizedGrid &= afterMicroResize->chops[(size_t) chop].startSample == chop * 2500
+                    && afterMicroResize->chops[(size_t) chop].endSample == juce::jmin (64000, (chop + 1) * 2500);
+            check (micro.getMicroChopDivision() == 8 && std::abs (micro.getAdjustedAnalysisBpm (*analysis) - 96.0) < 1.0e-9
+                   && resizedGrid && windowIsContiguous (micro),
+                   "shift-resizing an eighth-bar chop from 2000 to 2500 samples produces a 96 BPM micro grid");
+            micro.undoLastEdit();
+            check (micro.getMicroChopDivision() == 8 && micro.getGridBpmTrim() == 0.0f && micro.getGridStartOffset() == 0.0f
+                   && micro.getChopState()->chops.size() == 32
+                   && micro.getChopState()->midiWindowChopIds == beforeMicroResize->midiWindowChopIds,
+                   "one Undo restores Micro-Chops tempo, grid and exact pre-resize MIDI slots");
+
+            std::unique_ptr<juce::AudioProcessorEditor> microEditor (micro.createEditor());
+            if (auto* orb = findType (*microEditor, "VisualizerOrb")) orb->setVisible (false);
+            auto* microMenu = dynamic_cast<juce::ComboBox*> (findComponentId (*microEditor, "micro-chop-division"));
+            auto* midiMenu = findComponentId (*microEditor, "midi-map-mode");
+            check (microMenu != nullptr && midiMenu != nullptr, "Micro-Chops selector is available beside the MIDI selector");
+            if (microMenu != nullptr && midiMenu != nullptr)
+            {
+                check (microMenu->getNumItems() == 5 && microMenu->getItemId (0) == 1 && microMenu->getItemId (4) == 16
+                       && microMenu->getItemText (1) == "1/2 BAR" && microMenu->getItemText (2) == "1/4 BAR"
+                       && microMenu->getItemText (3) == "1/8 BAR" && microMenu->getItemText (4) == "1/16 BAR"
+                       && microEditor->getLocalArea (microMenu, microMenu->getLocalBounds()).getRight()
+                          <= microEditor->getLocalArea (midiMenu, midiMenu->getLocalBounds()).getX(),
+                       "Micro-Chops offers Off and four bar fractions to the left of MIDI mode");
+                microMenu->setSelectedId (4, juce::sendNotificationSync);
+                check (micro.getMicroChopDivision() == 4 && micro.getChopState()->chops.size() == 16,
+                       "Micro-Chops selector is bound to the processor's real grid rebuild");
+                micro.setMidiMappingLocked (true);
+                check (waitFor ([&] { return ! microMenu->isEnabled(); }), "Micro-Chops selector disables while MIDI Lock protects the map");
+                micro.setMidiMappingLocked (false); micro.setManualChopModeActive (true);
+                const auto manualMicro = micro.getChopState(); micro.setMicroChopDivision (8);
+                check (micro.getMicroChopDivision() == 4 && micro.getChopState() == manualMicro
+                       && waitFor ([&] { return ! microMenu->isEnabled(); }),
+                       "manual chopping keeps its boundaries and disables automatic Micro-Chops edits");
+            }
+        }
+
         // Compress grid time so 1/2/4/8 bars yield 512/256/128/64 chops in
         // the existing eight-second source. This exercises full windows at
         // every bars setting without a multi-minute audio fixture.
@@ -1596,6 +2621,19 @@ struct CueSamplerStateTests
                 handle, handle, now, point, now, 1, false);
         };
         const auto dragged = point.translated (3.0f * (float) pads->getWidth() / (float) columns, 0.0f);
+        auto* uiMicroMenu = dynamic_cast<juce::ComboBox*> (findComponentId (*editor, "micro-chop-division"));
+        check (uiMicroMenu != nullptr, "Micro-Chops selector is available during a Window preview");
+        if (uiMicroMenu != nullptr)
+        {
+            handle->mouseDown (eventAt (point)); handle->mouseDrag (eventAt (dragged));
+            uiMicroMenu->setSelectedId (8, juce::sendNotificationSync);
+            check (ui.getMicroChopDivision() == 8 && (int) pads->getProperties()["midiWindowPreviewStart"] == -1
+                   && ui.getMidiWindowStart() == 0,
+                   "choosing Micro-Chops during a drag cancels the preview and applies the chosen fraction without moving MIDI");
+            handle->mouseUp (eventAt (dragged)); ui.undoLastEdit();
+            check (ui.getMicroChopDivision() == 0 && ui.getMidiWindowStart() == 0,
+                   "Undo restores the pre-drag Micro-Chops preference without committing the cancelled Window");
+        }
         handle->mouseDown (eventAt (point)); handle->mouseDrag (eventAt (dragged));
         check (ui.getMidiWindowStart() == 0 && (int) pads->getProperties()["midiWindowPreviewStart"] == 3 && ! ui.isPlaying(),
                "Window dragging previews whole chops without remapping MIDI or auditioning");
@@ -1639,14 +2677,15 @@ struct CueSamplerStateTests
                 check (waitFor ([&] { return (int) pads->getProperties()["padFavoriteCount"] == 2
                     && (int) pads->getProperties()["padAnimatingCount"] == 0; }),
                        "distant favorite pad highlights settle in either MIDI mode and theme");
-                const auto padImage = pads->createComponentSnapshot (pads->getLocalBounds());
-                const int padColumns = juce::jmax (1, (int) pads->getProperties()["padColumns"]);
-                const int padRows = juce::jmax (1, (int) pads->getProperties()["padRows"]);
                 bool filledPink = true;
                 for (const int ordinal : { 0, 199 })
                 {
-                    const int x = juce::roundToInt (((float) (ordinal % padColumns) + 0.25f) * pads->getWidth() / padColumns);
-                    const int y = juce::roundToInt (((float) (ordinal / padColumns) + 0.25f) * pads->getHeight() / padRows);
+                    if (! revealPad (*pads, ordinal)) { filledPink = false; continue; }
+                    waitFor ([&] { return (int) pads->getProperties()["padAnimatingCount"] == 0; });
+                    const auto padImage = pads->createComponentSnapshot (pads->getLocalBounds());
+                    const auto tile = padCellBounds (*pads, ordinal);
+                    const int x = juce::roundToInt (tile.getX() + tile.getWidth() * 0.25f);
+                    const int y = juce::roundToInt (tile.getY() + tile.getHeight() * 0.25f);
                     const auto colour = padImage.getPixelAt (x, y);
                     filledPink &= colour.getRed() > colour.getGreen() + 20 && colour.getBlue() > colour.getGreen() + 15;
                 }
@@ -1659,6 +2698,85 @@ struct CueSamplerStateTests
         }
         if (theme != nullptr && theme->onClick && theme->getButtonText() != previousTheme) theme->onClick();
         modes->setSelectedId (1, juce::sendNotificationSync);
+        auto* microScroll = dynamic_cast<juce::ScrollBar*> (findComponentId (*pads, "micro-chop-scroll"));
+        for (const int division : { 0, 8 })
+        {
+            ui.setMicroChopDivision (division);
+            check (microScroll != nullptr && waitFor ([&] { return microScroll->isVisible()
+                && (int) pads->getProperties()["padContentHeight"] > (int) pads->getProperties()["padVisibleHeight"]
+                && (uiMicroMenu == nullptr || uiMicroMenu->getSelectedId() == (division == 0 ? 1 : division)); }),
+                   "whole-bar and Micro chop sets share a comfortable three-row scrollable pad window");
+            if (microScroll == nullptr || ! microScroll->isVisible()) continue;
+            const auto beforeScrollMap = ui.getChopState()->midiMap.channelNoteToChopIndex;
+            const auto scrollPoint = [&] (int ordinal)
+            {
+                return padCellBounds (*pads, ordinal).getCentre();
+            };
+            const auto padEvent = [&] (juce::Point<float> position)
+            {
+                const auto now = juce::Time::getCurrentTime();
+                return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), position,
+                    juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier), 1, 0, 0, 0, 0,
+                    pads, pads, now, position, now, 1, false);
+            };
+            ui.prepareToPlay (8000, 64); ui.setChopPlaybackMode (P::ChopPlaybackMode::Gate);
+            juce::AudioBuffer<float> uiAudio (2, 64); juce::MidiBuffer uiMidi;
+            const auto renderUi = [&] (int blocks) { for (int block = 0; block < blocks; ++block) { uiMidi.clear(); ui.processBlock (uiAudio, uiMidi); } };
+            microScroll->setCurrentRangeStart (0, juce::sendNotificationSync);
+            const auto firstPress = padEvent (scrollPoint (0)); pads->mouseDown (firstPress); renderUi (1);
+            const int lastScroll = (int) pads->getProperties()["padContentHeight"] - (int) pads->getProperties()["padVisibleHeight"];
+            microScroll->setCurrentRangeStart (lastScroll, juce::sendNotificationSync); renderUi (1);
+            check ((int) pads->getProperties()["padScrollOffset"] > 0 && ui.getPlayingChopId() == idFor (0),
+                   "scrolling a dense pad set keeps an already held Gate playing its original chop");
+            pads->mouseUp (firstPress); renderUi (10);
+            check (! ui.isPlaying() && ! ui.mousePreviewHeld.load(), "the original mouse-up releases a Gate after scrolling its pad away");
+            const auto lastPoint = scrollPoint (219);
+            check (pads->getLocalBounds().toFloat().contains (lastPoint), "scrolling to the bottom reveals the final chop pad");
+            const auto lastPress = padEvent (lastPoint); pads->mouseDown (lastPress); renderUi (1);
+            check (ui.getPlayingChopId() == idFor (219) && ui.getChopState()->selectedChopId == idFor (219),
+                   "the final scrolled pad remains directly playable by stable chop ID");
+            pads->mouseUp (lastPress); renderUi (10);
+            const auto gutter = padEvent ({ (float) (int) pads->getProperties()["padViewportWidth"] + 1.0f, 20.0f });
+            pads->mouseDown (gutter); pads->mouseUp (gutter); renderUi (1);
+            check (! ui.isPlaying() && ui.getChopState()->selectedChopId == idFor (219), "the scrollbar gutter cannot trigger a neighboring pad");
+            check (ui.getChopState()->midiMap.channelNoteToChopIndex == beforeScrollMap,
+                   "scrolling, selecting and auditioning distant pads preserves the complete MIDI map");
+            waitFor ([&] { return (int) pads->getProperties()["padAnimatingCount"] == 0; });
+            juce::FileOutputStream microSnapshot (scratch.getParentDirectory().getChildFile (division == 0 ? "whole-bar-pads-bottom.png" : "micro-chop-pads-bottom.png"));
+            microSnapshot.setPosition (0); microSnapshot.truncate();
+            juce::PNGImageFormat().writeImageToStream (editor->createComponentSnapshot (editor->getLocalBounds()), microSnapshot);
+        }
+        ui.setMicroChopDivision (0);
+        check (waitFor ([&] { return microScroll != nullptr && microScroll->isVisible()
+            && (float) pads->getProperties()["padCellHeight"] == 40.0f && (int) pads->getProperties()["padVisibleHeight"] <= 120; }),
+               "Micro Off retains comfortable pad sizing and scrolling for a long whole-bar set");
+        const int lateWindow = juce::jmin (164, columns * 6 - 1);
+        ui.setMidiWindowStart (lateWindow);
+        check (waitFor ([&] { return (int) pads->getProperties()["padScrollOffset"] > 0
+            && pads->getLocalBounds().toFloat().contains (padCellBounds (*pads, lateWindow).getCentre()); }),
+               "a late Window reveals its first mapped row even when the 56-note set spans more than three rows");
+        const auto lateMap = ui.getChopState()->midiMap.channelNoteToChopIndex;
+        const auto lateDrag = point.translated (0, (float) pads->getProperties()["padCellHeight"]);
+        const int expectedPreview = juce::jmin (164, lateWindow + columns);
+        handle->mouseDown (eventAt (point)); handle->mouseDrag (eventAt (lateDrag));
+        check ((int) pads->getProperties()["midiWindowPreviewStart"] == expectedPreview
+               && ui.getMidiWindowStart() == lateWindow && ui.getChopState()->midiMap.channelNoteToChopIndex == lateMap
+               && pads->getLocalBounds().toFloat().contains (padCellBounds (*pads, expectedPreview).getCentre()) && ! ui.isPlaying(),
+               "Window dragging across scrolled rows reveals the preview while retaining the committed map until release");
+        handle->mouseUp (eventAt (lateDrag));
+        check (ui.getMidiWindowStart() == expectedPreview && idAt (ui, 48) == idFor (expectedPreview),
+               "releasing a scrolled Window drag commits the visible chronological range");
+        ui.undoLastEdit();
+        check (ui.getMidiWindowStart() == lateWindow && ui.getChopState()->midiMap.channelNoteToChopIndex == lateMap,
+               "one Undo restores the preceding scrolled Window and its exact map");
+        handle->mouseDown (eventAt (point)); handle->mouseDrag (eventAt (lateDrag));
+        const auto beforeResize = juce::Point<int> (editor->getWidth(), editor->getHeight());
+        editor->setSize (beforeResize.x + 80, beforeResize.y);
+        check ((int) pads->getProperties()["midiWindowPreviewStart"] == -1 && ui.getMidiWindowStart() == lateWindow
+               && ui.getChopState()->midiMap.channelNoteToChopIndex == lateMap && ! ui.isPlaying(),
+               "resizing cancels a scrolled Window preview without committing another range or auditioning");
+        handle->mouseUp (eventAt (lateDrag)); editor->setSize (beforeResize.x, beforeResize.y);
+        ui.setMidiWindowStart (0);
         handle->mouseDown (eventAt (point)); handle->mouseDrag (eventAt (dragged));
         editor.reset();
         for (int tick = 0; tick < 10; ++tick) pump();
@@ -1717,12 +2835,7 @@ struct CueSamplerStateTests
         check (refreshCount (5), "pad grid exposes every chop independently of MIDI assignments");
         const auto cell = [&] (int index)
         {
-            const int columns = juce::jmax (1, (int) pads->getProperties()["padColumns"]);
-            const int rows = juce::jmax (1, (int) pads->getProperties()["padRows"]);
-            const float width = (float) pads->getWidth() / (float) columns;
-            const float height = (float) pads->getHeight() / (float) rows;
-            return juce::Rectangle<float> ((float) (index % columns) * width,
-                                          (float) (index / columns) * height, width, height);
+            return padCellBounds (*pads, index);
         };
         const auto eventAt = [&] (juce::Point<float> point, int clicks = 1)
         {
@@ -1731,7 +2844,7 @@ struct CueSamplerStateTests
                 juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier), 1, 0, 0, 0, 0,
                 pads, pads, now, point, now, clicks, false);
         };
-        const auto press = [&] (int index) { pads->mouseDown (eventAt (cell (index).getCentre())); };
+        const auto press = [&] (int index) { revealPad (*pads, index); pads->mouseDown (eventAt (cell (index).getCentre())); };
         const auto release = [&] (int index) { pads->mouseUp (eventAt (cell (index).getCentre())); };
         const auto stop = [&] { p.stopPlayback(); render(); };
 
@@ -1891,6 +3004,8 @@ struct CueSamplerStateTests
         findTheme (*editor);
         const auto originalSize = juce::Point<int> (editor->getWidth(), editor->getHeight());
         const auto originalTheme = theme != nullptr ? theme->getButtonText() : juce::String();
+        auto* waveform = findType (*editor, "WaveformDisplayComponent");
+        std::array<int, 2> waveformPlateau { 0, 0 };
         for (const int count : { 16, 64, 220, 512 })
         {
             auto song = std::make_shared<P::ChopState>();
@@ -1906,22 +3021,77 @@ struct CueSamplerStateTests
             song->selectedChopId = 1; song->nextChopId = count + 1;
             p.publishChopState (song);
             check (refreshCount (count), "pad count grows to include the complete song");
+            const auto songMap = p.getChopState()->midiMap.channelNoteToChopIndex;
+            int scaleIndex = 0;
             for (const float scale : { 1.0f, 0.85f })
             {
                 editor->setSize (juce::roundToInt ((float) originalSize.x * scale),
                                  juce::roundToInt ((float) originalSize.y * scale));
                 const int columns = (int) pads->getProperties()["padColumns"];
                 const int rows = (int) pads->getProperties()["padRows"];
-                bool allInside = columns > 0 && rows > 0 && columns * rows >= count;
-                for (int pad = 0; pad < count; ++pad)
-                    allInside &= pads->getLocalBounds().toFloat().contains (cell (pad).getCentre());
-                check (allInside && pads->isShowing()
+                const int visibleHeight = (int) pads->getProperties()["padVisibleHeight"];
+                auto* scroll = dynamic_cast<juce::ScrollBar*> (findComponentId (*pads, "micro-chop-scroll"));
+                check (columns > 0 && rows > 0 && columns * rows >= count && (float) pads->getProperties()["padCellWidth"] >= 48.0f
+                       && (float) pads->getProperties()["padCellHeight"] == 40.0f && visibleHeight <= 120
+                       && (int) pads->getProperties()["padVisibleRows"] == juce::jmin (3, rows) && pads->isShowing()
                        && editor->getLocalBounds().contains (editor->getLocalArea (pads, pads->getLocalBounds())),
-                       "every pad fits inside the grid at normal and minimum editor sizes");
-                press (count - 1); render();
-                check (p.voice.activeChopId == count && p.getChopState()->selectedChopId == count,
-                       "the final unmapped pad remains playable after resizing");
-                release (count - 1); render (20);
+                       "all song sizes retain comfortable pads in at most three visible rows at normal and minimum editor sizes");
+                if (rows >= 3 && waveform != nullptr)
+                {
+                    if (waveformPlateau[(size_t) scaleIndex] == 0) waveformPlateau[(size_t) scaleIndex] = waveform->getHeight();
+                    check (waveform->getHeight() == waveformPlateau[(size_t) scaleIndex],
+                           "adding chops beyond three pad rows does not shrink the waveform further");
+                }
+                bool reachable = true;
+                for (const int ordinal : { 0, count / 2, count - 1 })
+                {
+                    reachable &= revealPad (*pads, ordinal) && pads->getLocalBounds().toFloat().contains (cell (ordinal).getCentre());
+                    press (ordinal); render();
+                    reachable &= p.getPlayingChopId() == ordinal + 1 && p.getChopState()->selectedChopId == ordinal + 1;
+                    release (ordinal); render (20);
+                }
+                check (reachable && p.getChopState()->midiMap.channelNoteToChopIndex == songMap,
+                       "first, middle and final chronological pads remain reachable and playable without remapping MIDI");
+                if (rows > 3 && scroll != nullptr)
+                {
+                    check (scroll->isVisible() && (int) pads->getProperties()["padContentHeight"] > visibleHeight
+                           && (int) pads->getProperties()["padScrollOffset"] % 40 == 0,
+                           "long songs expose a row-aligned vertical scrollbar instead of shrinking pads");
+                    scroll->setCurrentRangeStart (0, juce::sendNotificationSync);
+                    juce::MouseWheelDetails wheel {}; wheel.deltaY = -0.1f;
+                    for (int tick = 0; tick < 3; ++tick) pads->mouseWheelMove (eventAt (cell (0).getCentre()), wheel);
+                    const bool accumulated = (int) pads->getProperties()["padScrollOffset"] == 0;
+                    pads->mouseWheelMove (eventAt (cell (0).getCentre()), wheel);
+                    check (accumulated && (int) pads->getProperties()["padScrollOffset"] == 40,
+                           "fractional trackpad motion accumulates into whole pad rows without exposing a fourth row");
+                    press (0); render(); revealPad (*pads, count - 1); render();
+                    const auto heldId = p.getPlayingChopId();
+                    editor->setSize (editor->getWidth() + 80, editor->getHeight()); render();
+                    const bool heldAcrossResize = p.getPlayingChopId() == 1;
+                    editor->setSize (juce::roundToInt ((float) originalSize.x * scale), juce::roundToInt ((float) originalSize.y * scale));
+                    release (0); render (20);
+                    check (heldId == 1 && heldAcrossResize && ! p.isPlaying() && ! p.mousePreviewHeld.load()
+                           && p.getChopState()->midiMap.channelNoteToChopIndex == songMap,
+                           "scrolling and resizing retain a held Gate, and its original mouse-up still releases it");
+                    const bool wasFavorite = isFavorite (count / 2 + 1);
+                    press (count / 2); release (count / 2); render (20);
+                    const auto secondTap = eventAt (cell (count / 2).getCentre(), 2);
+                    pads->mouseDown (secondTap); pads->mouseUp (secondTap); pads->mouseDoubleClick (secondTap); render (20);
+                    check (isFavorite (count / 2 + 1) != wasFavorite && ! isFavorite (count / 2)
+                           && p.getChopState()->midiMap.channelNoteToChopIndex == songMap,
+                           "double-tapping a scrolled source pad toggles its exact chronological ID without changing MIDI");
+                    if (isFavorite (count / 2 + 1))
+                    {
+                        p.setFavoritesViewEnabled (true); press (count / 2); render();
+                        const bool favoriteStays = p.isFavoritesViewEnabled() && p.getPlayingChopId() == count / 2 + 1;
+                        release (count / 2); render (20); press (count - 1); render();
+                        check (favoriteStays && ! p.isFavoritesViewEnabled() && p.getPlayingChopId() == count
+                               && p.getChopState()->midiMap.channelNoteToChopIndex == songMap,
+                               "scrolled favorite and nonfavorite pads preserve view behavior and the active MIDI map");
+                        release (count - 1); render (20);
+                    }
+                    press (count - 1); release (count - 1); render (20);
+                }
                 if (columns * rows > count)
                 {
                     const auto blank = eventAt (cell (count).getCentre());
@@ -1933,6 +3103,7 @@ struct CueSamplerStateTests
                     check (p.getChopState() == beforeDoubleTap && ! p.isPlaying(),
                            "double-tapping an empty grid cell does not favorite a neighboring chop");
                 }
+                ++scaleIndex;
             }
             editor->setSize (originalSize.x, originalSize.y);
             if (theme != nullptr && theme->onClick)
@@ -2073,6 +3244,15 @@ struct CueSamplerStateTests
                 check (cuesampler::postFlOctaveShortcut (60) == Result::unsupportedHost,
                        "real native bridge refuses shortcuts in the test process");
         }
+        int padOctave = 48;
+        for (int press = 0; press < 10; ++press) padOctave = cuesampler::flPadTypingOctaveStep (padOctave, -1);
+        check (padOctave == 48, "FL pad OCT minus stops at C4");
+        for (int press = 0; press < 10; ++press) padOctave = cuesampler::flPadTypingOctaveStep (padOctave, 1);
+        check (padOctave == 72 && cuesampler::flPadTypingOctaveStep (72, -1) == 60
+               && cuesampler::flPadTypingOctaveStep (60, -1) == 48,
+               "FL pad OCT steps only through C4, C5 and C6");
+        check (cuesampler::flPadTypingOctaveStep (0, 0) == 48 && cuesampler::flPadTypingOctaveStep (120, 0) == 72,
+               "older out-of-range viewport values are sanitized to the FL pad typing range");
         P p;
         {
             using Result = cuesampler::FlOctaveShortcutResult;
@@ -3747,7 +4927,12 @@ int main (int argc, char** argv)
     const bool full = filter.isEmpty() || filter == "--separate";
     if (filter == "--ui-benchmark") CueSamplerStateTests::runUiBenchmark();
     if (filter == "--sample-import") CueSamplerStateTests::runSampleImport (scratch);
+    if (full || filter == "--sample-import" || filter == "--sample-trim") CueSamplerStateTests::runSampleTrim (scratch);
+    if (full || filter == "--sample-trim" || filter == "--trim-audition") CueSamplerStateTests::runSampleTrimAudition (scratch);
+    if (full || filter == "--sample-trim" || filter == "--chop-trim") CueSamplerStateTests::runChopTrimAction (scratch);
     if (filter == "--import-benchmark") CueSamplerStateTests::runImportBenchmark (scratch);
+    if (full || filter == "--chop-tails" || filter == "--mp3-exports") CueSamplerStateTests::runChopTails (scratch);
+    if (filter == "--export-handle") CueSamplerStateTests::runExportHandle (scratch);
     if (full || filter == "--midi-performance") CueSamplerStateTests::runMidiPerformance (scratch);
     if (full || filter == "--chop-pads") CueSamplerStateTests::runChopPads (scratch);
     if (full || filter == "--octave-banking") CueSamplerStateTests::runOctaveBanking (scratch);
@@ -3765,7 +4950,7 @@ int main (int argc, char** argv)
         {
             CueSamplerStateTests::runExports (scratch);
             CueSamplerStateTests::runMousePlaybackModes();
-            CueSamplerStateTests::runExportHandle();
+            CueSamplerStateTests::runExportHandle (scratch);
         }
         CueSamplerStateTests::runFavorites();
         CueSamplerStateTests::runDoubleTempo (scratch);

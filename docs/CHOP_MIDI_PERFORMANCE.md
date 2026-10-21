@@ -4,7 +4,9 @@ Implementation specification, October 20, 2026. FL Studio testing belongs to the
 
 ## Agreed behavior
 
-- Keep every source chop visible, numbered in song order, within the current window height.
+- Keep source chops numbered in song order within the current window height.
+  Use comfortable pads in at most three visible rows, with vertical scrolling for
+  the remaining whole-bar or Micro chops.
 - All source pads remain directly playable with the mouse using Gate / One Shot.
 - Provide a draggable highlight over the consecutive chops assigned to laptop MIDI.
 - Favorites combine chops from anywhere in the song into one performance set.
@@ -55,8 +57,14 @@ Examples:
 
 Use exactly the same chronological sort as the numbered pads. Highlight the
 actual pads in the range with cyan row bands, following row wraps. Bright cyan
-top rails show the currently reachable typing octave. Keep favorite, selection and
+bottom ticks show the currently reachable typing octave. Keep favorite, selection and
 sounding indicators distinguishable from this range outline.
+
+Use the approved Signal Grid style: flat CUE foundation faces, small corners,
+narrow gutters and stable-contrast numbers. Favorites use a solid CUE pink face;
+selection has an orange inner rim and sounding/trigger flash has a separate cream
+rim (dark ink on neutral light-theme pads). Keep the MIDI outline outside the
+faces. No pad gradients, bevels, drop shadows or continuous idle glow are needed.
 
 Move the range with a dedicated grab handle so pad clicks keep their current
 audition behavior. Snap to whole chops, preview the range while dragging, and
@@ -85,6 +93,44 @@ do not imply that 56 notes can all be played from one unchanged typing octave.
 When Favorites controls MIDI, show which scattered source pads belong to that
 set. The draggable Window range becomes active again only when the user
 explicitly selects WINDOW as the MIDI source.
+
+## Micro-Chops and header controls
+
+Keep the MIDI selector's Window / Favorites text at 14 px in design coordinates.
+Place a separate Micro-Chops dropdown to its left, using OFF and 1/2, 1/4, 1/8,
+1/16 BAR. The readable DRAG MIDI label and grip identify the existing Window
+handle; show LOCKED or MIDI SET when that action is unavailable. Keep the current
+editor height. Keep all pads at least 48 px wide and 40 px high. Show at most
+three pad rows in a 120 px viewport, with up to 36 px for its header. Short sets
+retain the existing minimum panel height. Adding more than three rows never
+shrinks the waveform further; scroll the remaining content for every chop mode.
+Wheel / trackpad scrolling and the scrollbar change the view only, without
+changing the active MIDI map or releasing a held Gate pad. Accumulate fractional
+trackpad deltas and move in whole 40 px rows, keeping the thumb aligned and
+avoiding a partial fourth visible row. A held Gate also survives resizing.
+Window commits and previews reveal their first mapped row; a 56-note range may
+span more content rows than fit at once. Resizing cancels an active Window drag
+without committing new assignments.
+
+Micro divisions are absolute fractions of one bar, independent of the remembered
+whole-bar setting. At 120 BPM in 4/4, 1/2, 1/4, 1/8 and 1/16 BAR produce chops of
+1000, 500, 250 and 125 ms. The existing grid convention remains four beats per
+bar. OFF restores the whole-bar setting; selecting any BARS button exits
+Micro, including the already remembered value. Clear whole-bar button latches
+while Micro is active. Micro edits rebuild automatic chops, preserve the normal
+Window / Favorites regrid rules, and participate in grid Undo, host state and
+project recall. Disable them for MIDI Lock and manual chopping. Import preserves
+the denominator and uses bar fractions; projects lacking Micro default to OFF.
+
+Persist the timing unit as `microChopUnit` (`bar` or `beat`). A saved nonzero
+division without this unit belongs to the original bar-fraction grid. Projects
+from the beat-based version retain their exact chop boundaries, IDs and MIDI
+assignments, including during tempo edits or same-source trimming. Show a
+disabled current-only dropdown item such as `1/8 BEAT*`, with an explanatory
+tooltip. The four normal choices are BAR fractions. An explicit BAR choice,
+including the same denominator, or a BARS button rebuilds using bar timing.
+One Undo restores the saved beat unit, grid and assignments. A genuinely new
+source/import uses bar timing with the remembered denominator.
 
 ## Favorites performance mapping
 
@@ -121,6 +167,7 @@ Add it to Favorites before using it in that set's MIDI pattern.
 1. **Starting note:** use C4 for both Window and Favorites. This prioritizes
    immediate sound at FL Studio's default typing octave. C4-G10 would be 80
    legal MIDI notes, but its upper 24 are outside the current laptop range.
+   FL OCT controls stay within C4-C6; the minus button is disabled at C4.
 2. **MIDI Lock:** the control prevents changing the active map, dragging
    its Window, changing the root, switching chop layers, or reassigning performance
    slots while locked. Browsing, direct audition, and intentional sound edits
@@ -135,6 +182,23 @@ The root and capacity are fixed for these new performance layouts. Compacting
 gaps is an explicit new-layout action that changes recorded note meanings.
 It is unavailable while locked. Bookmarked overflow favorites
 must not acquire reserved or existing slots automatically.
+
+## Recoverable sample trim
+
+TRIM SAMPLE opens the full retained original, with draggable start/end handles
+and exact second fields. Changes remain local until Done. Cancel leaves audio,
+chops, Favorites and MIDI assignments unchanged. Full Sample restores the full
+range in the editor and still requires Done to apply.
+
+Done prepares the selected range off the audio thread, reanalyzes BPM/key and
+rebuilds automatic chops using the current BARS / Micro-Chops choice. It resets
+tempo fine trim and grid offset, clears Favorites and old chop edits, and resets
+Window to chop 1. MIDI Lock prevents applying a trim. New imports, trims and
+project restores supersede stale preparation work.
+
+Keep the original audio embedded once with the selected original-coordinate
+trim bounds. Save/reopen must preserve both the playing range and the ability
+to expand it. Trim recovery is through TRIM SAMPLE, rather than chop Undo.
 
 ## State, editing and compatibility
 
@@ -170,6 +234,9 @@ intentionally change that chop's sound.
   range resetting to chop 1, fewer than 56 chops, inactive Window, Undo and recall.
 - Pad outlines, drag hit targets and readable numbers in both themes at the
   existing plugin height.
+- Whole-bar and Micro sets share the three-row viewport. First, middle and final
+  pads remain reachable in 220- and 512-chop songs, waveform height stops shrinking,
+  and scrolling preserves MIDI maps, held Gate playback and exact pad gestures.
 - Exactly two selector options, safe double-tap favorite edits, persistent pink
   pad faces in either MIDI mode, and hover / press / release settling while idle.
 

@@ -32,6 +32,9 @@ public:
         // know it can fast-path back to reading the source buffer if needed.
         bool isIdentity = false;
         bool usedFallback = false;
+        int chopStartSample = 0, chopEndSample = 0;
+        int prefixFrames = 0, suffixFrames = 0;
+        std::uint64_t warpHash = 0;
     };
 
     struct PreparedKey
@@ -39,6 +42,7 @@ public:
         int chopStartSample = 0;
         int chopEndSample = 0;
         int cueOffsetSamples = 0;
+        int prefixFrames = 0, suffixFrames = 0;
         int sourceSampleRate = 0;
         int outputSampleRate = 0;
         int pitchCents = 0;
@@ -50,6 +54,8 @@ public:
             return chopStartSample == other.chopStartSample
                 && chopEndSample == other.chopEndSample
                 && cueOffsetSamples == other.cueOffsetSamples
+                && prefixFrames == other.prefixFrames
+                && suffixFrames == other.suffixFrames
                 && sourceSampleRate == other.sourceSampleRate
                 && outputSampleRate == other.outputSampleRate
                 && pitchCents == other.pitchCents
@@ -70,6 +76,7 @@ public:
         PreparedKey key;
         std::shared_ptr<const juce::AudioBuffer<float>> buffer;
         int cueFrame = 0;
+        int chopStartFrame = 0; // rendered prefix before the logical chop
         bool renderedWithBungee = false;
         bool usedFallback = false;
     };
@@ -109,7 +116,9 @@ public:
         int chopEndSample,
         const std::vector<ChopWarpMarker>& markers,
         std::uint64_t generation,
-        bool allowFallback = true);
+        bool allowFallback = true,
+        int prefixFrames = 0,
+        int suffixFrames = 0);
 
     static PreparedKey makePreparedKey (
         int chopStartSample,
@@ -119,7 +128,9 @@ public:
         double sourceSampleRate,
         double outputSampleRate,
         float pitchSemitones,
-        float stretchRatio) noexcept;
+        float stretchRatio,
+        int prefixFrames = 0,
+        int suffixFrames = 0) noexcept;
 
     static std::shared_ptr<PreparedEntry> renderPreparedChopSync (
         const juce::AudioBuffer<float>& source,
@@ -133,7 +144,9 @@ public:
         float pitchSemitones,
         float stretchRatio,
         std::uint64_t generation,
-        bool allowFallback = true);
+        bool allowFallback = true,
+        int prefixFrames = 0,
+        int suffixFrames = 0);
 
 private:
     struct Snapshot

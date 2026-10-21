@@ -16,12 +16,30 @@ The user performs the FL Studio portion; automated checks do not control the DAW
 - [ ] Load a new sample with at least 220 chops. At FL's default C4 typing octave,
       the first chop plays immediately. The active map is WINDOW, with chops 1-56
       assigned C4-G8. Every source chop stays visible and mouse-playable.
-- [ ] Cyan row bands mark the assigned pads; bright top rails mark the notes
+- [ ] Cyan row outlines mark the assigned pads; short bottom ticks mark the notes
       reachable in the current typing octave. Favorite, selection and sounding
       indicators remain readable in both themes.
 - [ ] Drag the Window handle in the pad header. The cyan range previews whole
       chops, without audition or MIDI remapping. Release to commit. One Undo
       restores the previous assignments. The final range reaches the last chop.
+- [ ] Window / Favorites selector text is larger and readable in both themes;
+      DRAG MIDI clearly identifies the range handle. Labels and dropdowns fit at
+      minimum editor size, with Micro-Chops immediately left of MIDI.
+- [ ] Exercise Micro-Chops OFF / 1/2 / 1/4 / 1/8 / 1/16 BAR. At 120 BPM in 4/4 these
+      produce 1000 / 500 / 250 / 125 ms chops. Pads stay comfortably sized; use vertical
+      wheel / trackpad scrolling and the scrollbar to reach the final chop.
+      Scrolling does not change MIDI assignments or release a held Gate pad.
+      OFF returns to the previous whole-bar choice; long sets continue to scroll.
+      Clicking that BARS button also exits Micro.
+- [ ] Micro changes reset Window to chop 1 and support one-step Undo and save/reopen.
+      MIDI Lock and manual chopping prevent changes. Shift-resize still produces
+      the correct tempo, and new sample imports retain the selected fraction.
+- [ ] Reopen a Micro-Chops project saved with beat fractions. Its BEAT* value, chop
+      boundaries and MIDI assignments stay intact, including after ordinary
+      tempo/offset edits. Explicitly choose a BAR fraction, even the same one,
+      to adopt bar fractions; one Undo restores the previous beat grid. Original
+      projects without a saved unit use bars. New imports also use bar fractions
+      while retaining the chosen denominator.
 - [ ] Switch repeatedly between 1 / 2 / 4 / 8 bars. Window maps consecutive pads
       from C4 with no holes or every-eighth-pad pattern. A moved Window resets to
       chop 1, covering the first 56 chops or all available chops when fewer exist.
@@ -55,14 +73,23 @@ The user performs the FL Studio portion; automated checks do not control the DAW
       then top to bottom. Pads show chop numbers only, including manually assigned,
       unassigned, overlapping, and late-song chops.
 - [ ] Exercise short and long songs (16, 64, 220, and 512 chops), both themes, and the
-      minimum window size. All chops fit without scrolling or banks; the window keeps
-      its current height while the waveform shares space with the pad section.
-- [ ] Click the first, middle, and final pads. Each selects the matching waveform chop
-      and updates its controls. MIDI assignments remain unchanged.
+      minimum window size. Pads stay at least 48 px wide and 40 px high, with at
+      most three visible rows. Scroll vertically with the wheel, trackpad or
+      scrollbar to reach later rows, for both whole-bar and Micro chops. The pad
+      window stops growing at 120 px; adding more chops does not shrink the waveform.
+- [ ] Scroll to and click the first, middle, and final pads. Each selects the matching
+      waveform chop and updates its controls. MIDI assignments remain unchanged.
+      Fractional trackpad motion accumulates into whole-row movement; the view
+      never exposes a partial fourth row and the scrollbar follows the row offset.
 - [ ] A pad follows **GATE** / **ONE SHOT** exactly like a waveform audition. Releasing
       outside the grid, hiding the editor, or closing it cannot leave a held Gate running.
+      Scroll its pad off-screen and resize while holding Gate; playback continues
+      until the original mouse-up. Scrolling does not select or trigger another pad.
 - [ ] Selected, sounding, and favorite pads remain distinguishable. Empty cells and gaps
       do not trigger. Stopped playback clears the sounding highlight.
+- [ ] Signal Grid uses flat warm faces, small corners and narrow gutters without
+      bevels or shadows. Selection stays orange and playback has a separate cream
+      rim (dark ink on neutral light-theme pads), including on pink favorites.
 - [ ] Favorite pads have a pink face in both themes, including pads outside the active
       MIDI set. Hover and press transitions are smooth; released pads settle without
       a permanent flashing or pressed state.
@@ -71,10 +98,15 @@ The user performs the FL Studio portion; automated checks do not control the DAW
       MIDI Lock protects assigned favorites. Removing a favorite keeps its reserved note.
 - [ ] The MIDI selector offers only WINDOW and FAVORITES. An older project's original
       notes remain intact under those labels until an explicit remap.
+- [ ] Move the Window to later rows, including a 56-note range spanning four content
+      rows. Its first mapped row is revealed within the three-row viewport. Dragging
+      previews and reveals the range without remapping until release. Undo restores
+      the previous map; resizing during a drag cancels its preview.
 - [ ] With Favorites open, favorite pads keep that view; a nonfavorite pad returns to
       the waveform and selects/plays the exact chop.
 - [ ] In FL Studio on macOS, **FL OCT** changes the host's Standard Piano typing octave
-      within C2–C6 after typing keys are released. Every chop pad remains visible.
+      within C4–C6 after typing keys are released. The same three-row pad window
+      scrolls whole-bar and Micro chop sets.
       Other hosts do not show those shortcut buttons.
 
 ## Chop playback modes
@@ -600,8 +632,8 @@ held-voice reset on remap, removal/re-add, Undo, portable recall and old states.
       Every chop remains visible as a numbered pad. With FL typing at C2, Z
       plays/highlights chop 1; clicking pad 104 plays that exact late chop directly.
 - [ ] Play a typing note first to reveal its real octave. Release it; FL OCT −/+
-      controls FL C2–C6 while preserving absolute MIDI assignments. Check FL's
-      actual menu/notes as well as the CUE caption. At C2 the − button is disabled;
+      controls FL C4–C6 while preserving absolute MIDI assignments. Check FL's
+      actual menu/notes as well as the CUE caption. At C4 the − button is disabled;
       at C6 the + button is disabled. There is no C7–C10 screen navigation.
 - [ ] Hold a typing key and request an octave change: native dispatch is blocked,
       the caption stays put and the original note-off releases normally. Release,
@@ -621,10 +653,81 @@ held-voice reset on remap, removal/re-add, Undo, portable recall and old states.
       available. The CHOPS slider stays absent; later chops keep their DAW
       channel/note assignments and all source-ordered pads remain visible.
 
-`test_project_restore --octave-banking` covers the C2–C6 FL shortcut limits,
+`test_project_restore --octave-banking` covers the C4–C6 pad shortcut limits,
 blocked requests, C2/104-note channel ranges and recall, legacy C0/C4 mappings,
 all 128 legacy MIDI notes, Favorites and release pairing. Validate actual native
 FL shortcut delivery in the host after installation.
+
+## Recoverable sample trim
+
+- [ ] Select a waveform chop and click its TRIM SAMPLE action beside DRAG AUDIO.
+      It immediately applies that chop's logical start/end as the sample bounds;
+      cue, reverse, warp and Tail do not alter the crop. No export or audition is
+      started. Repeat on an already trimmed source to verify original offsets.
+      The full original stays recoverable and Favorites clears after completion.
+      Releasing outside the button or changing selection during the press cancels;
+      MIDI Lock blocks the action. A double-click does not audition a pad, toggle
+      a favorite or queue another crop after the first click is accepted.
+- [ ] Click TRIM SAMPLE. Drag START / END and edit their seconds fields. CANCEL
+      restores the same audio, chops, Favorites and MIDI assignments.
+- [ ] While Trim is open, use the normal Play button to loop the proposed range.
+      Adjust either endpoint while listening: playback stays inside the current
+      range. Pending seconds-field edits apply when Play is pressed. Pause keeps
+      the audition position; Stop returns to the proposed Start.
+- [ ] Reopen an already trimmed sample and audition a range outside the current
+      crop. Listen to the retained original, without old chop cue / ADSR / Tail /
+      reverse / warp / pitch / sync changes. Master output gain still applies.
+      The green playhead and time display use the original sample timeline,
+      including when the waveform is zoomed or panned.
+- [ ] Cancel, Done, editor hide/close, import and project restore stop the trim
+      audition. A later pad or MIDI trigger takes over normally; returning to
+      Play while Trim remains open resumes the range audition. Previewing never
+      changes the sample, chops, Favorites or recorded MIDI assignments.
+- [ ] Use the trim header's −/+ buttons, vertical wheel or pinch to zoom. Wheel /
+      pinch zoom anchors to the pointer. Pan with horizontal / Shift-wheel or drag
+      the viewport in the full-original overview below the waveform. FIT shows
+      the full original without changing either trim point.
+- [ ] Zoom closely into each endpoint, pan to the other end and drag it precisely.
+      The seconds fields retain original-source coordinates. Numeric edits reveal
+      an endpoint outside the current view. FULL SAMPLE resets both bounds and view.
+- [ ] Apply a shorter range with DONE. Existing audio remains available during
+      preparation, then BPM/key analysis and automatic chopping run on the range.
+      Current BARS / Micro-Chops preference stays selected; Window starts at chop 1,
+      Favorites clears, and previous chop edits / tempo fine trim / offset reset.
+- [ ] Open TRIM SAMPLE again. The full original is visible. Expand either edge,
+      or choose FULL SAMPLE and DONE, to recover removed audio exactly.
+- [ ] Save/reopen while trimmed with the original file unavailable. Both the
+      selected range and full-original recovery remain available. Repeat after
+      muting stems; trim starts from the original unmuted audio.
+- [ ] MIDI Lock disables applying trim. A new file / trim / project restore wins
+      over an older pending trim. Closing/reopening the editor during preparation
+      does not lose the result or crash.
+- [ ] In FL, FL OCT minus is disabled at C4 and plus at C6. Check actual typing
+      notes and release held keys before changing octave. Legacy saved MIDI maps
+      retain their notes even though the shortcut controls have the new floor.
+
+`test_project_restore --sample-import` includes trim validation; `--sample-trim`
+runs the focused trim checks. These cover exact original slices, cancellation,
+Favorites clearing, fresh analysis, stale work and portable recovery.
+
+## Per-chop tail length
+
+- [ ] Open a chop's ADSR menu. TAIL LENGTH offers OFF / 50 / 100 / 200 / 300 ms.
+      Each chop keeps its own value; OFF preserves existing playback and exports.
+- [ ] In ONE SHOT, hear the original attack and body followed by extra source
+      audio fading to silence. Check a chop near the end of the sample: the tail
+      stops safely at available audio and reaches silence without a hard cut.
+- [ ] In GATE, hold through several loops: loop timing stays unchanged. Release
+      partway through a loop: audio continues from that position for the selected
+      tail fade. With Tail enabled this fade replaces the Release knob; OFF uses
+      the normal ADSR release. A new pad still replaces the previous chop.
+- [ ] Test reverse with a nonzero cue, warped chops, SYNC, half-time, pitch and
+      different host rates. The attack stays in place and tail milliseconds refer
+      to audible output time. Reverse continues backward, bounded by the source.
+- [ ] Drag audio and SAVE MP3 include the same One Shot tail and fade. Editing
+      Tail invalidates prepared exports. Save/reopen, Undo and switch manual /
+      automatic layers: values stay attached to their chops and recorded notes
+      retain their assignments. Old projects start with Tail OFF.
 
 ## Background sample import
 
@@ -672,5 +775,5 @@ for a 30-second stereo WAV over three runs against the previous import path.
       ends. Host MIDI and direct pad clicks highlight the same sounding chop.
 - [ ] Load more than 128 chops, toggle Favorites and reopen the editor. The CHOPS
       slider stays absent and every chop stays visible/playable. FL OCT is shown
-      only in FL Studio on macOS and stays bounded to typing C2–C6; existing
+      only in FL Studio on macOS and stays bounded to typing C4–C6; existing
       DAW MIDI channel/note assignments still trigger the same chops.

@@ -726,11 +726,19 @@ ChopAudioCache::renderChopSync (const juce::AudioBuffer<float>& source,
                                 int chopEndSample,
                                 const std::vector<ChopWarpMarker>& markers,
                                 std::uint64_t generation,
-                                bool allowFallback)
+                                bool allowFallback,
+                                int prefixFrames,
+                                int suffixFrames)
 {
     auto entry = std::make_shared<Entry>();
     entry->chopId     = chopId;
     entry->generation = generation;
+    entry->chopStartSample = chopStartSample;
+    entry->chopEndSample = chopEndSample;
+    entry->prefixFrames = juce::jlimit (0, juce::jmax (0, chopStartSample), prefixFrames);
+    entry->suffixFrames = juce::jlimit (0, juce::jmax (0, source.getNumSamples() - chopEndSample), suffixFrames);
+    entry->warpHash = makePreparedKey (chopStartSample, chopEndSample, 0, markers,
+                                       sampleRate, sampleRate, 0.0f, 1.0f).warpHash;
 
     if (chopEndSample <= chopStartSample
         || sampleRate <= 0.0
@@ -779,6 +787,22 @@ ChopAudioCache::renderChopSync (const juce::AudioBuffer<float>& source,
                                 frames);
     }
 
+    // Preserve the logical warp endpoints. Extra audio is a continuation of
+    // the source, rather than a change to the final warped segment's slope.
+    if (entry->prefixFrames > 0 || entry->suffixFrames > 0)
+    {
+        auto extended = std::make_shared<juce::AudioBuffer<float>> (
+            channels, entry->prefixFrames + frames + entry->suffixFrames);
+        for (int ch = 0; ch < channels; ++ch)
+        {
+            if (entry->prefixFrames > 0)
+                extended->copyFrom (ch, 0, source, ch, chopStartSample - entry->prefixFrames, entry->prefixFrames);
+            extended->copyFrom (ch, entry->prefixFrames, *warped, ch, 0, frames);
+            if (entry->suffixFrames > 0)
+                extended->copyFrom (ch, entry->prefixFrames + frames, source, ch, chopEndSample, entry->suffixFrames);
+        }
+        warped = std::move (extended);
+    }
     entry->warpedBuffer = warped;
     return entry;
 }
@@ -791,12 +815,16 @@ ChopAudioCache::PreparedKey ChopAudioCache::makePreparedKey (
     double sourceSampleRate,
     double outputSampleRate,
     float pitchSemitones,
-    float stretchRatio) noexcept
+    float stretchRatio,
+    int prefixFrames,
+    int suffixFrames) noexcept
 {
     PreparedKey key;
     key.chopStartSample = chopStartSample;
     key.chopEndSample = chopEndSample;
     key.cueOffsetSamples = cueOffsetSamples;
+    key.prefixFrames = juce::jmax (0, prefixFrames);
+    key.suffixFrames = juce::jmax (0, suffixFrames);
     key.sourceSampleRate = (int) std::round (sourceSampleRate);
     key.outputSampleRate = (int) std::round (outputSampleRate);
     key.pitchCents = (int) std::round (pitchSemitones * 100.0f);
@@ -828,7 +856,9 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
                                         float pitchSemitones,
                                         float stretchRatio,
                                         std::uint64_t generation,
-                                        bool allowFallback)
+                                        bool allowFallback,
+                                        int prefixFrames,
+                                        int suffixFrames)
 {
     auto entry = std::make_shared<PreparedEntry>();
     entry->chopId = chopId;
@@ -840,7 +870,7 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
                                   sourceSampleRate,
                                   outputSampleRate,
                                   pitchSemitones,
-                                  stretchRatio);
+                                  stretchRatio, prefixFrames, suffixFrames);
 
     if (chopEndSample <= chopStartSample
         || sourceSampleRate <= 0.0
@@ -864,6 +894,8 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
     // fading them into the zero-padding. chopBaseFrames is the chop length only.
     int preRollFrames  = 0;
     int chopBaseFrames = 0;
+    prefixFrames = juce::jlimit (0, juce::jmax (0, chopStartSample), prefixFrames);
+    suffixFrames = juce::jlimit (0, juce::jmax (0, source.getNumSamples() - chopEndSample), suffixFrames);
 
     // ~0.37 s each side, comfortably beyond Bungee's look-ahead (about 0.1 s).
     // Chops at the very start or end of the sample get whatever is available.
@@ -872,8 +904,8 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
     std::shared_ptr<const juce::AudioBuffer<float>> baseHolder;
     if (markers.empty())
     {
-        const int sliceStart = juce::jlimit (0, juce::jmax (0, source.getNumSamples() - 1), chopStartSample);
-        const int sliceEnd   = juce::jlimit (sliceStart, source.getNumSamples(), chopEndSample);
+        const int sliceStart = juce::jlimit (0, juce::jmax (0, source.getNumSamples() - 1), chopStartSample - prefixFrames);
+        const int sliceEnd   = juce::jlimit (sliceStart, source.getNumSamples(), chopEndSample + suffixFrames);
         const int chopLen    = juce::jmax (0, sliceEnd - sliceStart);
         if (chopLen <= 0)
             return entry;
@@ -898,7 +930,7 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
                                            chopStartSample,
                                            chopEndSample,
                                            markers,
-                                           generation, allowFallback);
+                                           generation, allowFallback, prefixFrames, suffixFrames);
         if (warpedEntry == nullptr || warpedEntry->warpedBuffer == nullptr
             || warpedEntry->warpedBuffer->getNumSamples() <= 0)
         {
@@ -913,8 +945,8 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
         // Splice raw source context either side of the warped chop. Its only job
         // is to give the pitch/stretch pass grain history and flush room; both
         // regions are discarded, so the seam at the chop edges is never heard.
-        const int sliceStart = juce::jlimit (0, juce::jmax (0, source.getNumSamples() - 1), chopStartSample);
-        const int sliceEnd   = juce::jlimit (sliceStart, source.getNumSamples(), chopEndSample);
+        const int sliceStart = juce::jlimit (0, juce::jmax (0, source.getNumSamples() - 1), chopStartSample - prefixFrames);
+        const int sliceEnd   = juce::jlimit (sliceStart, source.getNumSamples(), chopEndSample + suffixFrames);
         const int preRoll    = juce::jmin (sliceStart, kContextWanted);
         const int postRoll   = juce::jmin (source.getNumSamples() - sliceEnd, kContextWanted);
 
@@ -959,7 +991,7 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
     // Chop-relative (local time 0 == chop start), so the lead-in never enters it.
     const auto cueBaseFrame = juce::jlimit (0.0,
                                             (double) juce::jmax (0, chopBaseFrames - 1),
-                                            cueLocalSeconds * sourceSampleRate);
+                                            (double) prefixFrames + cueLocalSeconds * sourceSampleRate);
 
     auto prepared = std::make_shared<juce::AudioBuffer<float>> (channels, outputFrames);
     prepared->clear();
@@ -999,6 +1031,7 @@ ChopAudioCache::renderPreparedChopSync (const juce::AudioBuffer<float>& source,
     entry->cueFrame = juce::jlimit (0,
                                     juce::jmax (0, outputFrames - 1),
                                     (int) std::llround (cueOutputFrame));
+    entry->chopStartFrame = (int) std::llround ((double) prefixFrames / sourceFramesPerOutputFrame);
     entry->buffer = prepared;
     entry->renderedWithBungee = renderedWithBungee;
     return entry;

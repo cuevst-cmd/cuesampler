@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "SampleTrimComponent.h"
 #include "WaveformColourAnalysis.h"
 #include "MidiNoteNames.h"
 #include "FlOctaveShortcut.h"
@@ -866,6 +867,13 @@ public:
     // Slider value bubbles in the CUERACK voice: mono digits in a flat well.
     juce::Font getSliderPopupFont (juce::Slider&) override { return monoFont (12.5f); }
 
+    juce::Font getComboBoxFont (juce::ComboBox& box) override
+    {
+        const auto style = getCueStyle (box);
+        const bool compactMenu = style == "padMidiMode" || style == "padMicroMode" || style == "chopTailLength";
+        return compactMenu ? monoFont (14.0f) : juce::LookAndFeel_V4::getComboBoxFont (box);
+    }
+
     void drawBubble (juce::Graphics& g, juce::BubbleComponent& bubble,
                      const juce::Point<float>&, const juce::Rectangle<float>& body) override
     {
@@ -1094,6 +1102,20 @@ public:
     {
         const auto style = getCueStyle (button);
 
+        if (style == "padMidiLock")
+        {
+            const auto bounds = button.getLocalBounds().toFloat().reduced (0.5f);
+            const float hover = button.isEnabled() ? getHoverAlpha (button, isMouseOverButton) : 0.0f;
+            auto face = panelDark.interpolatedWith (textPrimary, hover * 0.04f);
+            if (button.getToggleState()) face = face.interpolatedWith (accentOrange, 0.12f);
+            if (isButtonDown) face = face.darker (0.04f);
+            g.setColour (face);
+            g.fillRoundedRectangle (bounds, 2.0f);
+            g.setColour (button.getToggleState() ? accentOrange : borderMid);
+            g.drawRoundedRectangle (bounds, 2.0f, 1.0f);
+            return;
+        }
+
         // One cell of a joined 1|2|4|8 selector. Same keycap chassis as the rest
         // of the family, with the latched treatment flatAction already uses for
         // CHOP MANUALLY and WARP — so "this one is active" looks the same here
@@ -1215,12 +1237,13 @@ public:
         if (style == "effectSwitch")
             return; // Handled entirely in drawButtonBackground
 
-        if (style == "segment")
+        if (style == "segment" || style == "padMidiLock")
         {
             const float hover = getHoverAlpha (button, false);
             const auto accent = getCueAccent (button, themedTitleColour (accentOrange));
+            const auto idleInk = style == "padMidiLock" ? textPrimary : textMuted;
             auto ink = button.getToggleState() ? accent
-                                               : textMuted.interpolatedWith (textPrimary, hover);
+                                               : idleInk.interpolatedWith (textPrimary, hover);
 
             // The octave buttons use this style and do hit their limits. Nothing
             // in this LookAndFeel dimmed a disabled button, so "you cannot go
@@ -1229,7 +1252,7 @@ public:
                 ink = ink.withMultipliedAlpha (0.35f);
 
             g.setColour (ink);
-            g.setFont (monoFont (14.0f));
+            g.setFont (monoFont (style == "padMidiLock" ? 12.0f : 14.0f));
             g.drawFittedText (button.getButtonText(), button.getLocalBounds(),
                               juce::Justification::centred, 1);
             return;
@@ -1456,7 +1479,8 @@ public:
           sustainKnob ("SUSTAIN", 52, 13.0f, "miniColourKnob", lightCueOrange),
           releaseKnob ("RELEASE", 52, 13.0f, "miniColourKnob", lightCueOrange)
     {
-        setSize (340, 142);
+        setComponentID ("chop-adsr-menu");
+        setSize (340, 180);
 
         configureTimeKnob (attackKnob, 2000.0, 0.0, chop.attackMilliseconds,
                            AudioPluginAudioProcessor::ChopEnvelopeParameter::Attack);
@@ -1486,9 +1510,31 @@ public:
         addAndMakeVisible (sustainKnob);
         addAndMakeVisible (releaseKnob);
 
+        configureTextLabel (tailLabel, "TAIL LENGTH", 12.0f, textPrimary, juce::Justification::centredLeft);
+        addAndMakeVisible (tailLabel);
+        tailLength.setComponentID ("chop-tail-length");
+        tailLength.getProperties().set ("cueStyle", "chopTailLength");
+        tailLength.setWantsKeyboardFocus (false);
+        tailLength.addItem ("OFF", 1);
+        for (const int milliseconds : { 50, 100, 200, 300 })
+            tailLength.addItem (juce::String (milliseconds) + " ms", milliseconds + 1);
+        const int tailMs = std::isfinite (chop.tailLengthMilliseconds)
+            ? juce::roundToInt (juce::jlimit (0.0f, 300.0f, chop.tailLengthMilliseconds)) : 0;
+        if (tailMs > 0 && tailLength.indexOfItemId (tailMs + 1) < 0)
+            tailLength.addItem (juce::String (tailMs) + " ms", tailMs + 1);
+        tailLength.setSelectedId (tailMs + 1, juce::dontSendNotification);
+        tailLength.setTooltip ("Extra source audio with a fade. One Shot: after the chop end. Gate: after release, using Tail instead of Release. Limited by available audio; the next chop replaces it.");
+        tailLength.onChange = [this]
+        {
+            processor.setChopTailLength (chopId, (float) (tailLength.getSelectedId() - 1));
+            updateReleaseTooltip();
+        };
+        addAndMakeVisible (tailLength);
+        updateReleaseTooltip();
+
         configureButton (exportButton, "SAVE MP3...", textPrimary.withAlpha (0.92f));
         exportButton.getProperties().set ("cueStyle", "flatAction");
-        exportButton.setTooltip ("Save this chop with its ADSR envelope baked into the audio.");
+        exportButton.setTooltip ("Save this chop with its ADSR envelope and tail baked into the audio.");
         exportButton.onClick = [this]
         {
             const auto callback = onExport;
@@ -1530,10 +1576,20 @@ public:
         decayKnob.setBounds (knobRow.removeFromLeft (knobWidth));
         sustainKnob.setBounds (knobRow.removeFromLeft (knobWidth));
         releaseKnob.setBounds (knobRow);
+        auto tailRow = area.removeFromTop (34).reduced (9, 3);
+        tailLabel.setBounds (tailRow.removeFromLeft (124));
+        tailLength.setBounds (tailRow);
         exportButton.setBounds (area.removeFromBottom (30).reduced (28, 1));
     }
 
 private:
+    void updateReleaseTooltip()
+    {
+        releaseKnob.getSlider().setTooltip (tailLength.getSelectedId() > 1
+            ? "RELEASE: fade before a One-Shot ends. Gate release uses Tail Length while enabled."
+            : "RELEASE: fade time after note-off or before a One-Shot ends.");
+    }
+
     void configureTimeKnob (LabelledKnob& knob, double maximum, double defaultValue,
                             float value, AudioPluginAudioProcessor::ChopEnvelopeParameter parameter)
     {
@@ -1565,6 +1621,8 @@ private:
     LabelledKnob decayKnob;
     LabelledKnob sustainKnob;
     LabelledKnob releaseKnob;
+    juce::Label tailLabel;
+    juce::ComboBox tailLength;
     SmoothHoverButton exportButton;
 };
 
@@ -1573,6 +1631,7 @@ private:
 // processor's existing mouse-preview mailbox and Gate / One Shot behavior.
 class ChopPadGridComponent final : public juce::Component,
                                    public juce::SettableTooltipClient,
+                                   private juce::ScrollBar::Listener,
                                    private juce::Timer
 {
 public:
@@ -1582,18 +1641,36 @@ public:
         setWantsKeyboardFocus (false);
         setMouseClickGrabsKeyboardFocus (false);
         setMouseCursor (juce::MouseCursor::PointingHandCursor);
-        setTooltip ("Chops run left to right, then top to bottom. Double tap: favorite. GATE: hold to play. ONE SHOT: click to play once.");
+        setTooltip ("Chops run left to right, then top to bottom. Scroll for more chops. Double tap: favorite. GATE: hold to play. ONE SHOT: click to play once.");
+        verticalScrollBar.setComponentID ("micro-chop-scroll");
+        verticalScrollBar.setSingleStepSize (40.0);
+        verticalScrollBar.addListener (this);
+        addChildComponent (verticalScrollBar);
         observedTriggerRevision = processor.getChopTriggerRevision();
         refreshChops();
     }
 
-    ~ChopPadGridComponent() override { releaseNote(); stopTimer(); }
+    ~ChopPadGridComponent() override
+    {
+        verticalScrollBar.removeListener (this);
+        releaseNote();
+        stopTimer();
+    }
 
     std::function<void()> onChopCountChanged;
     std::function<void()> onLeaveFavorites;
     std::function<void()> onWindowPreviewChanged;
 
     int getPadCount() const noexcept { return (int) orderedIndices.size(); }
+
+    static int preferredPanelHeight (int padCount, int width) noexcept
+    {
+        const int fullWidthColumns = juce::jmax (1, width / padCellWidth);
+        const int neededRows = (padCount + fullWidthColumns - 1) / fullWidthColumns;
+        // A scrollbar is needed only after the three-row cap, where reserving
+        // its width cannot increase the preferred viewport height any further.
+        return 36 + juce::jmax (64, juce::jlimit (1, maxVisibleRows, neededRows) * padCellHeight);
+    }
 
     int getPreviewWindowStart() const noexcept { return previewWindowStart; }
 
@@ -1625,6 +1702,7 @@ public:
         dragStart = processor.getMidiWindowStart();
         previewWindowStart = dragStart;
         getProperties().set ("midiWindowPreviewStart", dragStart);
+        revealWindow (dragStart);
         repaint();
         return true;
     }
@@ -1639,13 +1717,14 @@ public:
         }
         const auto delta = screenPosition - dragOrigin;
         const float scale = juce::jmax (0.01f, getScreenBounds().getWidth() / (float) juce::jmax (1, getWidth()));
-        const int steps = juce::roundToInt (delta.x / (scale * juce::jmax (1.0f, getWidth() / (float) columns)))
-                        + columns * juce::roundToInt (delta.y / (scale * juce::jmax (1.0f, getHeight() / (float) rows)));
+        const int steps = juce::roundToInt (delta.x / (scale * juce::jmax (1.0f, viewportWidth / (float) columns)))
+                        + columns * juce::roundToInt (delta.y / (scale * juce::jmax (1.0f, cellHeight())));
         const int next = juce::jlimit (0, juce::jmax (0, getPadCount() - AudioPluginAudioProcessor::performanceMidiCapacity),
                                      dragStart + steps);
         if (next == previewWindowStart) return;
         previewWindowStart = next;
         getProperties().set ("midiWindowPreviewStart", next);
+        revealWindow (next);
         repaint();
         if (onWindowPreviewChanged) onWindowPreviewChanged();
     }
@@ -1669,9 +1748,15 @@ public:
     void refreshChops()
     {
         const auto next = processor.getChopState();
-        if (next == state) return;
+        const int nextDivision = processor.getMicroChopDivision();
+        const auto nextSource = processor.getLoadedSample();
+        const bool geometryChanged = nextDivision != layoutMicroDivision || nextSource != layoutSource;
+        if (next == state && ! geometryChanged) return;
         if (previewWindowStart >= 0 && ! dragSourceUnchanged (next)) endWindowDrag (false);
         const int previousCount = getPadCount();
+        const bool revealNewWindow = next != nullptr && isWindowMode (next->midiPerformanceMode)
+            && (state == nullptr || next->midiPerformanceMode != state->midiPerformanceMode
+                || next->midiWindowStart != state->midiWindowStart || next->midiWindowChopIds != state->midiWindowChopIds);
         if (heldChopId >= 0)
         {
             const auto exists = next != nullptr && std::any_of (next->chops.begin(), next->chops.end(),
@@ -1679,6 +1764,9 @@ public:
             if (! exists) releaseNote();
         }
         state = next;
+        layoutMicroDivision = nextDivision;
+        layoutSource = nextSource;
+        if (geometryChanged) { scrollOffset = 0; wheelRowRemainder = 0.0; }
         orderedIndices.clear();
         if (state != nullptr)
         {
@@ -1693,8 +1781,9 @@ public:
                 return a.id < b.id;
             });
         }
-        updateGrid();
         syncVisuals();
+        updateGrid();
+        if (revealNewWindow && state != nullptr) revealWindow (state->midiWindowStart);
         int mapped = 0, favorites = 0;
         if (state != nullptr)
             for (size_t index = 0; index < state->chops.size(); ++index)
@@ -1747,11 +1836,20 @@ public:
         else { refreshPlayback(); startAnimations(); }
     }
     void parentHierarchyChanged() override { if (! isShowing()) { releaseNote(); endWindowDrag (false); } }
-    void resized() override { updateGrid(); }
+    void resized() override
+    {
+        // Screen deltas from an in-flight Window drag no longer match a
+        // resized grid. Cancel its preview without changing the MIDI map.
+        endWindowDrag (false);
+        lastDownChopId = doubleTapCandidateId = -1;
+        lastDownClickCount = 0;
+        wheelRowRemainder = 0.0;
+        updateGrid();
+    }
 
     void paint (juce::Graphics& g) override
     {
-        g.fillAll (blackPanel);
+        g.fillAll (shellDark);
         if (state == nullptr || orderedIndices.empty())
         {
             g.setColour (textMuted);
@@ -1761,53 +1859,58 @@ public:
             return;
         }
 
+        juce::Graphics::ScopedSaveState clipped (g);
+        g.reduceClipRegion (juce::Rectangle<int> (0, 0, viewportWidth, getHeight()));
         drawMappedBands (g);
-        for (int slot = 0; slot < getPadCount(); ++slot)
+        const auto visible = visibleSlots();
+        for (int slot = visible.first; slot < visible.second; ++slot)
         {
             const auto base = tileBounds (slot).toFloat();
             if (base.isEmpty() || ! g.getClipBounds().toFloat().intersects (base)) continue;
             const auto& chop = state->chops[(size_t) orderedIndices[(size_t) slot]];
             const auto& v = visuals.at (chop.id);
-            const auto tile = base.reduced (v.press * 0.6f).translated (0.0f, v.press * 0.4f);
-            const auto accent = chop.favorite ? juce::Colour (0xffff2db1) : accentOrange;
-            const float radius = juce::jmin (4.0f, tile.getHeight() * 0.15f);
-            // Favorite colour belongs to the pad face, independently of the
-            // MIDI region, hover, selection, or whether this chop has a note.
-            const auto pinkTop = juce::Colour (isLight() ? 0xffffafd5 : 0xffa52c79);
-            const auto pinkBottom = juce::Colour (isLight() ? 0xfff28fbd : 0xff751b55);
+            const auto tile = base.reduced (v.press * 0.35f);
+            const float radius = juce::jmin (2.0f, tile.getHeight() * 0.10f);
+            const juce::Colour pink (0xfff6339a), cream (0xfff2e7da);
             const float favorite = chop.favorite ? juce::jmax (0.8f, v.favorite) : v.favorite;
-            auto top = panelHi.interpolatedWith (pinkTop, favorite).brighter (v.hover * 0.10f);
-            auto bottom = panelDark.interpolatedWith (pinkBottom, favorite).brighter (v.hover * 0.05f);
-            top = top.interpolatedWith (accent.brighter (0.12f), v.activity * 0.78f + v.selected * 0.08f);
-            bottom = bottom.interpolatedWith (accent, v.activity * 0.82f + v.selected * 0.05f);
-            top = top.interpolatedWith (accent.brighter (0.65f), v.flash * 0.45f);
-            if (tile.getHeight() > 16.0f)
-            {
-                g.setColour (juce::Colours::black.withAlpha ((isLight() ? 0.16f : 0.32f) * (1.0f - v.press * 0.5f)));
-                g.fillRoundedRectangle (base.translated (0.0f, 1.0f), radius);
-            }
-            g.setGradientFill ({ top, tile.getTopLeft(), bottom, tile.getBottomLeft(), false });
+            const float sounding = juce::jmax (v.activity, v.flash);
+            // Signal Grid uses flat faces. Favorite identity, selection and
+            // sounding have separate colour roles, even when they overlap.
+            auto face = panelHi.interpolatedWith (pink, favorite);
+            face = face.interpolatedWith (isLight() ? darkInk : cream, v.hover * 0.035f);
+            face = face.interpolatedWith (cream, sounding * 0.08f).darker (v.press * 0.04f);
+            g.setColour (face);
             g.fillRoundedRectangle (tile, radius);
-            const float emphasis = juce::jmax (v.selected * 0.85f, juce::jmax (v.activity, v.flash));
-            g.setColour (borderMid.interpolatedWith (accent.brighter (0.40f), juce::jlimit (0.0f, 1.0f, emphasis + favorite * 0.25f)));
-            g.drawRoundedRectangle (tile.reduced (0.6f), radius, 1.0f + emphasis * 0.6f);
+            g.setColour (borderDark.interpolatedWith (pink.darker (0.15f), favorite)
+                                   .interpolatedWith (borderMid, v.hover * (1.0f - favorite)));
+            g.drawRoundedRectangle (tile.reduced (0.5f), radius, 1.0f);
+            if (sounding > 0.005f)
+            {
+                g.setColour ((isLight() && favorite < 0.5f ? darkInk : cream).withAlpha (sounding));
+                g.drawRoundedRectangle (tile.reduced (0.9f), radius, 1.5f);
+            }
             if (v.selected > 0.005f)
             {
-                g.setColour (accent.brighter (0.70f).withAlpha (v.selected * 0.8f));
-                g.drawRoundedRectangle (tile.reduced (2.1f), juce::jmax (0.5f, radius - 0.7f), 1.0f);
+                g.setColour (accentOrange.withAlpha (v.selected));
+                g.drawRoundedRectangle (tile.reduced (juce::jmin (2.2f, tile.getHeight() * 0.15f)),
+                                        juce::jmax (0.5f, radius - 0.7f), 1.3f);
             }
 
             const int note = state->midiMap.noteForChopIndex[(size_t) orderedIndices[(size_t) slot]];
             if (isMappedSlot (slot))
             {
-                // The surrounding band marks the assigned MIDI region. Its
-                // small top rail marks the currently reachable typing octave.
+                // Keep the typing-octave cue separate from the range outline
+                // and the selection/playback rims: a short bottom tick.
                 const auto midiColour = juce::Colour (isLight() ? 0xff007c91 : 0xff49d9e8);
                 const bool typing = previewWindowStart < 0 && note >= processor.getKeyboardStartNote()
                                  && note < processor.getKeyboardStartNote() + 32;
-                g.setColour (midiColour.withAlpha (typing ? 1.0f : 0.38f));
-                g.fillRoundedRectangle (tile.getX() + 4.0f, tile.getY() + 2.2f,
-                    juce::jmax (0.0f, tile.getWidth() - 8.0f), juce::jmin (1.8f, tile.getHeight() * 0.07f), 0.8f);
+                if (typing && tile.getHeight() > 18.0f)
+                {
+                    const float width = juce::jmin (10.0f, tile.getWidth() * 0.25f);
+                    g.setColour (midiColour.withAlpha (0.85f));
+                    g.fillRoundedRectangle (tile.getCentreX() - width * 0.5f,
+                                            tile.getBottom() - 4.4f, width, 1.2f, 0.5f);
+                }
             }
 
             // Preserve a visible number as density rises; no MIDI labels or
@@ -1815,14 +1918,25 @@ public:
             const auto number = juce::String (slot + 1);
             const float fontHeight = juce::jmin (18.0f, juce::jmin (tile.getHeight() * 0.50f,
                 tile.getWidth() / (0.68f * (float) number.length() + 0.6f)));
-            g.setFont (monoFont (juce::jmax (1.0f, fontHeight)));
-            g.setColour (isLight() ? darkInk : textPrimary.interpolatedWith (darkInk, v.activity));
+            auto font = monoFont (juce::jmax (1.0f, fontHeight));
+            if (fontHeight >= 13.0f) font.setStyleFlags (juce::Font::plain);
+            g.setFont (font);
+            g.setColour (textPrimary.interpolatedWith (cream, favorite));
             g.drawText (number, tile, juce::Justification::centred, false);
         }
     }
 
     void mouseMove (const juce::MouseEvent& e) override { setHoveredSlot (slotAt (e.position)); }
     void mouseExit (const juce::MouseEvent&) override { setHoveredSlot (-1); }
+    void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails& wheel) override
+    {
+        if (contentHeight <= getHeight() || ! std::isfinite (wheel.deltaX) || ! std::isfinite (wheel.deltaY)) return;
+        const float delta = std::abs (wheel.deltaY) >= std::abs (wheel.deltaX) ? wheel.deltaY : wheel.deltaX;
+        wheelRowRemainder = juce::jlimit (-(double) rows, (double) rows, wheelRowRemainder - (double) delta * 3.0);
+        const int wholeRows = (int) std::trunc (wheelRowRemainder);
+        wheelRowRemainder -= wholeRows;
+        if (wholeRows != 0) setScrollOffset (scrollOffset + wholeRows * padCellHeight, true);
+    }
     void mouseDown (const juce::MouseEvent& e) override
     {
         releaseNote();
@@ -1996,75 +2110,129 @@ private:
     void drawMappedBands (juce::Graphics& g) const
     {
         const auto cyan = juce::Colour (isLight() ? 0xff007c91 : 0xff49d9e8);
-        for (int slot = 0; slot < getPadCount();)
+        const auto visible = visibleSlots();
+        for (int slot = visible.first; slot < visible.second;)
         {
             if (! isMappedSlot (slot)) { ++slot; continue; }
             const int row = slot / columns;
             auto band = tileBounds (slot).toFloat();
             ++slot;
-            while (slot < getPadCount() && slot / columns == row && isMappedSlot (slot))
+            while (slot < visible.second && slot / columns == row && isMappedSlot (slot))
             {
                 band = band.getUnion (tileBounds (slot).toFloat());
                 ++slot;
             }
-            band = band.expanded (1.8f).getIntersection (getLocalBounds().toFloat().reduced (0.5f));
-            g.setColour (cyan.withAlpha (previewWindowStart >= 0 ? 0.22f : 0.12f));
-            g.fillRoundedRectangle (band, 4.0f);
-            g.setColour (cyan.withAlpha (previewWindowStart >= 0 ? 0.95f : 0.70f));
-            g.drawRoundedRectangle (band, 4.0f, 1.2f);
+            band = band.expanded (1.3f).getIntersection (juce::Rectangle<float> (0, 0, (float) viewportWidth, (float) getHeight()).reduced (0.7f));
+            g.setColour (cyan.withAlpha (previewWindowStart >= 0 ? 1.0f : 0.90f));
+            g.drawRoundedRectangle (band, 2.0f, 1.3f);
         }
     }
 
     void updateGrid()
     {
         const int count = getPadCount();
-        // Short sets keep comfortable pad widths instead of stretching a few
-        // chops across the entire instrument. Spare cells remain inactive.
-        const int layoutCount = juce::jmax (count, juce::jmax (1, (getWidth() + 79) / 80));
-        columns = rows = 1;
-        float bestSize = 0.0f;
-        float bestDifference = std::numeric_limits<float>::max();
-        // Maximise the smaller tile dimension. Break ties toward square pads,
-        // and use integer partitions so even the last row stays in bounds.
-        for (int candidateRows = 1; candidateRows <= layoutCount; ++candidateRows)
+        viewportWidth = getWidth();
+        columns = juce::jmax (1, viewportWidth / padCellWidth);
+        rows = juce::jmax (1, (count + columns - 1) / columns);
+        if (rows * padCellHeight > getHeight())
         {
-            const int candidateColumns = juce::jmax (1, (layoutCount + candidateRows - 1) / candidateRows);
-            const float w = (float) getWidth() / (float) candidateColumns;
-            const float h = (float) getHeight() / (float) candidateRows;
-            const float size = juce::jmin (w, h);
-            const float difference = std::abs (w - h);
-            if (size > bestSize || (std::abs (size - bestSize) < 0.001f && difference < bestDifference))
-            {
-                bestSize = size;
-                bestDifference = difference;
-                columns = candidateColumns;
-                rows = candidateRows;
-            }
-            if (h < bestSize) break;
+            viewportWidth = juce::jmax (1, getWidth() - scrollBarWidth - scrollBarGap);
+            columns = juce::jmax (1, viewportWidth / padCellWidth);
+            rows = juce::jmax (1, (count + columns - 1) / columns);
         }
+        contentHeight = rows * padCellHeight;
+        scrollOffset = juce::jlimit (0, juce::jmax (0, contentHeight - getHeight()), scrollOffset);
+        scrollOffset = scrollOffset / padCellHeight * padCellHeight;
+        const bool overflow = contentHeight > getHeight();
+        verticalScrollBar.setVisible (overflow);
+        verticalScrollBar.setBounds (getWidth() - scrollBarWidth, 0, scrollBarWidth, getHeight());
+        verticalScrollBar.setRangeLimits (0.0, (double) juce::jmax (1, juce::jmax (contentHeight, getHeight())), juce::dontSendNotification);
+        verticalScrollBar.setCurrentRange ((double) scrollOffset, (double) getHeight(), juce::dontSendNotification);
         getProperties().set ("padCount", count);
         getProperties().set ("padColumns", columns);
         getProperties().set ("padRows", rows);
+        updateScrollDiagnostics();
     }
 
     juce::Rectangle<int> tileBounds (int slot) const
     {
         const int column = slot % columns, row = slot / columns;
-        const int x = column * getWidth() / columns;
-        const int y = row * getHeight() / rows;
-        const int w = (column + 1) * getWidth() / columns - x;
-        const int h = (row + 1) * getHeight() / rows - y;
-        return juce::Rectangle<int> (x, y, w, h).reduced (juce::jmin (4, juce::jmin (w, h) / 10));
+        const int x = column * viewportWidth / columns;
+        const int y = row * padCellHeight - scrollOffset;
+        const int w = (column + 1) * viewportWidth / columns - x;
+        const int h = padCellHeight;
+        return juce::Rectangle<int> (x, y, w, h).reduced (juce::jmin (2, juce::jmin (w, h) / 10));
     }
 
     int slotAt (juce::Point<float> position) const
     {
-        if (getPadCount() == 0 || getWidth() <= 0 || getHeight() <= 0
-            || ! getLocalBounds().toFloat().contains (position)) return -1;
-        const int column = juce::jmin (columns - 1, (((int) position.x + 1) * columns - 1) / getWidth());
-        const int row = juce::jmin (rows - 1, (((int) position.y + 1) * rows - 1) / getHeight());
+        if (getPadCount() == 0 || viewportWidth <= 0 || getHeight() <= 0
+            || ! juce::Rectangle<float> (0, 0, (float) viewportWidth, (float) getHeight()).contains (position)) return -1;
+        const int column = juce::jmin (columns - 1, (((int) position.x + 1) * columns - 1) / viewportWidth);
+        const int row = ((int) position.y + scrollOffset) / padCellHeight;
         const int slot = row * columns + column;
         return slot < getPadCount() && tileBounds (slot).toFloat().contains (position) ? slot : -1;
+    }
+
+    float cellHeight() const noexcept
+    {
+        return (float) padCellHeight;
+    }
+
+    std::pair<int, int> visibleSlots() const noexcept
+    {
+        const int firstRow = scrollOffset / padCellHeight;
+        const int lastRow = (scrollOffset + getHeight() + padCellHeight - 1) / padCellHeight;
+        return { juce::jmin (getPadCount(), firstRow * columns), juce::jmin (getPadCount(), lastRow * columns) };
+    }
+
+    void updateScrollDiagnostics()
+    {
+        getProperties().set ("padScrollOffset", scrollOffset);
+        getProperties().set ("padContentHeight", contentHeight);
+        getProperties().set ("padCellHeight", cellHeight());
+        getProperties().set ("padCellWidth", viewportWidth / (float) columns);
+        getProperties().set ("padViewportWidth", viewportWidth);
+        getProperties().set ("padVisibleHeight", getHeight());
+        getProperties().set ("padVisibleRows", getPadCount() == 0 ? 0 : juce::jmin (rows, getHeight() / padCellHeight));
+    }
+
+    void setScrollOffset (int next, bool fromWheel = false)
+    {
+        if (! fromWheel) wheelRowRemainder = 0.0;
+        next = juce::jmax (0, next);
+        next = juce::roundToInt (next / (double) padCellHeight) * padCellHeight;
+        next = juce::jlimit (0, juce::jmax (0, contentHeight - getHeight()), next);
+        if (next == scrollOffset)
+        {
+            verticalScrollBar.setCurrentRangeStart ((double) scrollOffset, juce::dontSendNotification);
+            if (fromWheel) wheelRowRemainder = 0.0;
+            return;
+        }
+        scrollOffset = next;
+        verticalScrollBar.setCurrentRangeStart ((double) scrollOffset, juce::dontSendNotification);
+        updateScrollDiagnostics();
+        lastDownChopId = doubleTapCandidateId = -1;
+        lastDownClickCount = 0;
+        setHoveredSlot (slotAt (getMouseXYRelative().toFloat()));
+        repaint();
+    }
+
+    void scrollBarMoved (juce::ScrollBar*, double rangeStart) override
+    {
+        setScrollOffset (juce::roundToInt (rangeStart));
+    }
+
+    void revealWindow (int start)
+    {
+        if (getPadCount() == 0) return;
+        const int firstRow = juce::jlimit (0, getPadCount() - 1, start) / columns;
+        const int lastRow = juce::jmin (getPadCount() - 1, start + AudioPluginAudioProcessor::performanceMidiCapacity - 1) / columns;
+        const int top = firstRow * padCellHeight, bottom = (lastRow + 1) * padCellHeight;
+        int next = scrollOffset;
+        if (bottom - top > getHeight() || top < scrollOffset) next = top;
+        else if (bottom > scrollOffset + getHeight()) next = bottom - getHeight();
+        setScrollOffset (next);
     }
 
     void setHoveredSlot (int slot)
@@ -2089,6 +2257,11 @@ private:
     std::shared_ptr<const AudioPluginAudioProcessor::ChopState> dragState;
     std::vector<int> orderedIndices;
     std::map<int, PadVisual> visuals;
+    juce::ScrollBar verticalScrollBar { true };
+    std::shared_ptr<const AudioPluginAudioProcessor::LoadedSampleData> layoutSource;
+    static constexpr int padCellWidth = 48, padCellHeight = 40, maxVisibleRows = 3, scrollBarWidth = 12, scrollBarGap = 4;
+    int layoutMicroDivision = -1, viewportWidth = 0, contentHeight = 0, scrollOffset = 0;
+    double wheelRowRemainder = 0.0;
     double lastAnimationTime = 0.0;
     uint64_t observedTriggerRevision = 0;
     juce::Point<int> dragOrigin;
@@ -2106,7 +2279,23 @@ public:
         : processor (p), grid (pads), handle (*this)
     {
         setComponentID ("midi-performance-controls");
+        micro.setComponentID ("micro-chop-division");
+        micro.getProperties().set ("cueStyle", "padMicroMode");
+        micro.setWantsKeyboardFocus (false);
+        micro.addItem ("OFF", 1);
+        for (const int division : { 2, 4, 8, 16 })
+            micro.addItem ("1/" + juce::String (division) + " BAR", division);
+        micro.setTooltip ("Micro-Chops: split each bar into 2, 4, 8 or 16 chops. OFF returns to the remembered 1/2/4/8-bar setting. Changes are undoable; MIDI Lock protects the grid.");
+        micro.onChange = [this]
+        {
+            const int division = micro.getSelectedId() == 1 ? 0 : micro.getSelectedId();
+            grid.endWindowDrag (false);
+            processor.setMicroChopDivision (division);
+            refresh();
+        };
+        addAndMakeVisible (micro);
         mode.setComponentID ("midi-map-mode");
+        mode.getProperties().set ("cueStyle", "padMidiMode");
         mode.setWantsKeyboardFocus (false);
         mode.addItem ("WINDOW", 1);
         mode.addItem ("FAVORITES", 2);
@@ -2122,7 +2311,7 @@ public:
         addAndMakeVisible (mode);
         configureButton (lock, "MIDI LOCK", textPrimary);
         lock.setComponentID ("midi-map-lock");
-        lock.getProperties().set ("cueStyle", "segment");
+        lock.getProperties().set ("cueStyle", "padMidiLock");
         lock.setTooltip ("Protect the MIDI layout after recording. Browsing and audition still work. Unlock to move the window or change its performance set.");
         lock.onClick = [this]
         {
@@ -2152,8 +2341,34 @@ public:
         mode.setSelectedId (window ? 1 : 2,
                             juce::dontSendNotification);
         const bool locked = processor.isMidiMappingLocked();
+        const int division = processor.getMicroChopDivision();
+        // Beat-based projects keep their saved grid until an explicit bar choice.
+        // Keep that current value visible without adding another editable mode.
+        const int nextLegacyId = processor.isPreservedMicroChopBeatGrid() && division > 0 ? 1000 + division : 0;
+        if (nextLegacyId != legacyMicroItemId)
+        {
+            legacyMicroItemId = nextLegacyId;
+            micro.clear (juce::dontSendNotification);
+            micro.addItem ("OFF", 1);
+            for (const int denominator : { 2, 4, 8, 16 })
+                micro.addItem ("1/" + juce::String (denominator) + " BAR", denominator);
+            if (legacyMicroItemId != 0)
+            {
+                micro.addItem ("1/" + juce::String (division) + " BEAT*", legacyMicroItemId);
+                micro.setItemEnabled (legacyMicroItemId, false);
+            }
+        }
+        micro.setSelectedId (legacyMicroItemId != 0 ? legacyMicroItemId : division == 0 ? 1 : division,
+                             juce::dontSendNotification);
+        micro.setTooltip (legacyMicroItemId != 0
+            ? "Saved beat-based Micro grid: timing and recorded MIDI are preserved. Choose a BAR division to rebuild, or OFF to use the remembered BARS setting. Undo restores the saved grid."
+            : "Micro-Chops: split each bar into 2, 4, 8 or 16 chops. OFF returns to the remembered 1/2/4/8-bar setting. Changes are undoable; MIDI Lock protects the grid.");
+        micro.setEnabled (! locked && ! processor.isManualChopModeActive());
         mode.setEnabled (! locked);
         lock.setToggleState (locked, juce::dontSendNotification);
+        const auto layout = processor.getChopState();
+        lock.setEnabled (locked || ! processor.isTempoAnalysisInProgress()
+                         || (layout != nullptr && ! layout->chops.empty()));
         handle.setEnabled (! locked && window && grid.getPadCount() > 0);
         handle.setMouseCursor (handle.isEnabled() ? juce::MouseCursor::DraggingHandCursor : juce::MouseCursor::NormalCursor);
         handle.setTooltip (window
@@ -2166,9 +2381,12 @@ public:
     void resized() override
     {
         auto area = getLocalBounds();
-        area.removeFromLeft (34);
-        mode.setBounds (area.removeFromLeft (142).reduced (0, 1));
-        area.removeFromLeft (8);
+        area.removeFromLeft (86);
+        micro.setBounds (area.removeFromLeft (118).reduced (0, 1));
+        area.removeFromLeft (16);
+        midiLabelBounds = area.removeFromLeft (34);
+        mode.setBounds (area.removeFromLeft (146).reduced (0, 1));
+        area.removeFromLeft (10);
         lock.setBounds (area.removeFromLeft (96).reduced (0, 1));
         area.removeFromLeft (12);
         handle.setBounds (area);
@@ -2177,8 +2395,9 @@ public:
     void paint (juce::Graphics& g) override
     {
         g.setColour (textMuted);
-        g.setFont (monoFont (9.5f));
-        g.drawText ("MIDI", getLocalBounds().removeFromLeft (30), juce::Justification::centredLeft);
+        g.setFont (monoFont (10.5f));
+        g.drawText ("MICRO-CHOPS", getLocalBounds().removeFromLeft (82), juce::Justification::centredLeft);
+        g.drawText ("MIDI", midiLabelBounds, juce::Justification::centredLeft);
     }
 
 private:
@@ -2202,21 +2421,33 @@ private:
                 const int end = juce::jmin (owner.grid.getPadCount(), start + AudioPluginAudioProcessor::performanceMidiCapacity);
                 text = owner.grid.getPadCount() == 0 ? "LOAD A SAMPLE  /  C4 FIRST"
                     : "CHOPS " + juce::String (start + 1) + "-" + juce::String (end) + "  /  C4-G8";
-                if (preview < 0 && ! owner.grid.windowMatchesSourceRange()) text = "FIXED ASSIGNMENTS  /  CLICK TO REFRESH WINDOW";
-                if (preview < 0 && chosen == Mode::Legacy) text = "PROJECT NOTE ASSIGNMENTS  /  CLICK OR DRAG TO SET WINDOW";
-                if (isEnabled() && owner.grid.getPadCount() > AudioPluginAudioProcessor::performanceMidiCapacity) text = "DRAG  <>  " + text;
-                if (preview >= 0) text << "  /  RELEASE TO APPLY";
+                if (preview < 0 && ! owner.grid.windowMatchesSourceRange()) text = "FIXED MAP / CLICK TO REFRESH";
+                if (preview < 0 && chosen == Mode::Legacy) text = "PROJECT MAP / REFRESH TO SET C4";
+                if (preview >= 0) text = "CHOPS " + juce::String (start + 1) + "-" + juce::String (end) + " / RELEASE TO APPLY";
             }
             else
             {
                 const int count = state != nullptr ? (int) state->favoriteChopIndices.size() : 0;
-                text = chosen == Mode::LegacyFavorites ? "FAVORITES  /  PROJECT NOTE ASSIGNMENTS"
-                    : "FIXED FAVORITE SLOTS  /  C4-G8  /  " + juce::String (count) + " FAVORITES";
+                text = chosen == Mode::LegacyFavorites ? "PROJECT FAVORITES MAP"
+                    : juce::String (count) + " FAVORITES / C4-G8";
             }
-            if (owner.processor.isMidiMappingLocked()) text << "  /  LOCKED";
-            g.setColour (juce::Colour (isLight() ? 0xff007c91 : 0xff49d9e8));
-            g.setFont (monoFont (9.5f));
-            g.drawText (text, getLocalBounds().reduced (4, 0), juce::Justification::centredRight, true);
+            g.setColour (borderMid);
+            g.drawVerticalLine (0, 3.0f, (float) getHeight() - 3.0f);
+            g.setColour (isEnabled() ? textMuted : textFaint);
+            for (int row = 0; row < 3; ++row)
+                for (int column = 0; column < 2; ++column)
+                    g.fillEllipse (6.0f + (float) column * 4.0f,
+                                   (float) getHeight() * 0.5f - 5.0f + (float) row * 4.0f, 1.8f, 1.8f);
+            auto labelArea = getLocalBounds().withTrimmedLeft (20);
+            const auto action = owner.processor.isMidiMappingLocked() ? "LOCKED"
+                              : chosen == Mode::Window || chosen == Mode::Legacy ? "DRAG MIDI" : "MIDI SET";
+            g.setColour (isEnabled() ? textPrimary : textMuted);
+            g.setFont (monoFont (12.5f));
+            g.drawText (action, labelArea.removeFromLeft (92), juce::Justification::centredLeft);
+            g.setColour (preview >= 0 ? juce::Colour (isLight() ? 0xff007c91 : 0xff49d9e8) : textMuted);
+            g.setFont (monoFont (12.0f));
+            g.drawText (text, labelArea.reduced (4, 0),
+                        juce::Justification::centredRight, true);
         }
         void mouseDown (const juce::MouseEvent& e) override
         {
@@ -2229,7 +2460,9 @@ private:
     };
     AudioPluginAudioProcessor& processor;
     ChopPadGridComponent& grid;
-    juce::ComboBox mode;
+    juce::ComboBox micro, mode;
+    int legacyMicroItemId = 0;
+    juce::Rectangle<int> midiLabelBounds;
     SmoothHoverButton lock;
     DragHandle handle;
 };
@@ -3146,7 +3379,7 @@ public:
         };
         addAndMakeVisible (waveformColourButton);
         refreshWaveformColourMode();
-        setTooltip ("Click a chop to preview it. Use DRAG AUDIO to export, or ADSR to adjust its envelope and save an MP3.  "
+        setTooltip ("Click a chop to preview it. Use DRAG AUDIO to export, TRIM SAMPLE to crop to this chop, or ADSR to adjust its envelope and save an MP3.  "
                     "Double-click to toggle favourite (pink highlight).  "
                     "Drag a selected chop edge to change only that chop's start or end.  "
                     "Shift-drag a selected chop edge to resize the grid and update tempo.  "
@@ -3287,6 +3520,7 @@ public:
         pendingMarkerHovered = false;
         deleteBadgeHovered = false;
         deleteBadgePressed = false;
+        cancelTrimButtonPress();
         processor.cancelManualChopCapture();
         lastManualCaptureCompletionRevision = processor.getManualChopCaptureCompletionRevision();
         edgeDragChopId = -1;
@@ -3338,6 +3572,7 @@ public:
         refreshManualTools();
         if (source == &processor.sampleChangeBroadcaster)
         {
+            cancelTrimButtonPress();
             isSelectingAnalysisRegion = false;
             pendingManualStartSample = -1;
             pendingMarkerDragging = false;
@@ -3379,6 +3614,10 @@ public:
 
     juce::String getTooltip() override
     {
+        if (trimButtonHovered)
+            return processor.isMidiMappingLocked()
+                ? "Unlock MIDI to trim the sample to this chop."
+                : "Trim the sample immediately to this chop's start and end. Reanalyzes BPM, rebuilds chops and clears Favorites. The original audio stays recoverable.";
         if (adsrButtonHovered)
             return "Adjust this chop's envelope, or save it as an MP3 file.";
         if (exportButtonHovered)
@@ -3441,10 +3680,11 @@ public:
         hoveredChopId = -1;
         if (edgeDragChopId < 0)
             edgeHoverKind = 0;
-        if (exportButtonHovered || adsrButtonHovered)
+        if (exportButtonHovered || adsrButtonHovered || trimButtonHovered)
         {
             adsrButtonHovered = false;
             exportButtonHovered = false;
+            trimButtonHovered = false;
             repaint();
         }
         setMouseCursor (juce::MouseCursor::NormalCursor);
@@ -3454,6 +3694,14 @@ public:
     {
         if (! event.mods.isLeftButtonDown() || ! isPositionInsideDisplay (event.position))
             return;
+        // Applying Trim can remove this action row before the second click.
+        // Keep that click sequence owned by the button across source changes.
+        if (trimClickSequence && event.getNumberOfClicks() > 1 && trimClickBounds.contains (event.position))
+        {
+            trimRepeatPress = true;
+            return;
+        }
+        trimClickSequence = trimRepeatPress = false;
         grabKeyboardFocus();
         updateHoverState (event.position);
 
@@ -3471,6 +3719,21 @@ public:
         if (hitTestAdsrButton (event.position))
         {
             adsrButtonPressed = event.mods.isLeftButtonDown();
+            repaint();
+            return;
+        }
+
+        if (hitTestTrimButton (event.position))
+        {
+            trimClickBounds = getTrimButtonBounds();
+            trimClickSequence = true;
+            if (canTrimTargetChop())
+            {
+                trimPressedSample = processor.getLoadedSample();
+                trimPressedLayout = processor.getChopState();
+                trimPressedChopId = exportTargetChopId;
+                trimButtonPressed = true;
+            }
             repaint();
             return;
         }
@@ -3602,6 +3865,20 @@ public:
 
     void updateCursorForMode (juce::Point<float> pos)
     {
+        const bool overTrim = hitTestTrimButton (pos);
+        if (overTrim != trimButtonHovered)
+        {
+            trimButtonHovered = overTrim;
+            repaint();
+        }
+        if (overTrim)
+        {
+            // Clear older hints before returning from this priority control.
+            adsrButtonHovered = exportButtonHovered = deleteBadgeHovered = false;
+            setMouseCursor (canTrimTargetChop() ? juce::MouseCursor::PointingHandCursor
+                                               : juce::MouseCursor::NormalCursor);
+            return;
+        }
         const bool overDelete = hitTestDeleteBadge (pos);
         if (overDelete != deleteBadgeHovered)
         {
@@ -4238,6 +4515,7 @@ public:
 
     void mouseDrag (const juce::MouseEvent& event) override
     {
+        if (trimRepeatPress) return;
         if (exportWaitingForDrag)
         {
             if (! exportRendering && readyExportFile.existsAsFile())
@@ -4266,7 +4544,7 @@ public:
             return;
         }
 
-        if (adsrButtonPressed) return;
+        if (adsrButtonPressed || trimButtonPressed) return;
 
         if (processor.isWarpModeActive() && warpDragChopId >= 0 && warpDragMarkerIndex >= 0)
         {
@@ -4292,6 +4570,22 @@ public:
     void mouseUp (const juce::MouseEvent& event) override
     {
         exportWaitingForDrag = false;
+        if (trimRepeatPress)
+        {
+            trimRepeatPress = false;
+            return;
+        }
+        if (trimButtonPressed)
+        {
+            const bool apply = hitTestTrimButton (event.position) && canTrimTargetChop();
+            const auto sample = std::move (trimPressedSample);
+            const auto layout = std::move (trimPressedLayout);
+            const int chopId = trimPressedChopId;
+            cancelTrimButtonPress();
+            if (apply) trimSampleToChop (chopId, sample, layout);
+            repaint();
+            return;
+        }
         // Released on the delete badge => remove the chop. Releasing off the
         // badge cancels, matching normal button behaviour.
         if (deleteBadgePressed)
@@ -4362,8 +4656,9 @@ public:
     {
         if (! isPositionInsideDisplay (event.position))
             return;
+        if (trimClickSequence && trimClickBounds.contains (event.position)) return;
 
-        if (hitTestExportButton (event.position) || hitTestAdsrButton (event.position)
+        if (hitTestExportButton (event.position) || hitTestAdsrButton (event.position) || hitTestTrimButton (event.position)
             || hitTestDeleteBadge (event.position)) return;
 
         if (manualChopMode && ! processor.isWarpModeActive())
@@ -4897,14 +5192,14 @@ private:
         repaint();
     }
 
-    // ---- Floating chop-action button (ADSR menu + export drag handle) ----
+    // ---- Floating chop actions (ADSR, export drag handle and sample trim) ----
 
     // Repoints the button at a chop, replaying the pop-in when the target
     // actually changes. The target is the selected chop or the chop most
     // recently triggered from a MIDI key (see timerCallback).
     bool isExportGestureActive() const
     {
-        return exportButtonPressed || exportButtonDragArmed || exportWaitingForDrag || adsrButtonPressed;
+        return exportButtonPressed || exportButtonDragArmed || exportWaitingForDrag || adsrButtonPressed || trimButtonPressed;
     }
 
     void setExportTarget (int chopId)
@@ -4963,7 +5258,7 @@ private:
         if (visR - visL < 2.0f) // target chop scrolled out of view
             return {};
 
-        constexpr float w = 206.0f;
+        constexpr float w = 330.0f;
         constexpr float h = 28.0f;
         const float leftLimit  = display.getX() + 6.0f;
         const float rightLimit = (float) waveformColourButton.getX() - 6.0f;
@@ -4987,7 +5282,60 @@ private:
 
     juce::Rectangle<float> getDragAudioBounds() const
     {
-        return getExportButtonBounds().withTrimmedLeft (64.0f);
+        return getExportButtonBounds().withTrimmedLeft (64.0f).withWidth (142.0f);
+    }
+
+    juce::Rectangle<float> getTrimButtonBounds() const
+    {
+        return getExportButtonBounds().withTrimmedLeft (212.0f);
+    }
+
+    bool hitTestTrimButton (juce::Point<float> p) const
+    {
+        const auto bounds = getTrimButtonBounds();
+        return ! bounds.isEmpty() && bounds.contains (p);
+    }
+
+    bool canTrimTargetChop() const
+    {
+        return ! processor.isMidiMappingLocked() && processor.getSampleImportStatus() == nullptr
+               && isExportButtonActive();
+    }
+
+    void cancelTrimButtonPress()
+    {
+        trimButtonPressed = false;
+        trimPressedChopId = -1;
+        trimPressedSample.reset();
+        trimPressedLayout.reset();
+    }
+
+    void trimSampleToChop (int chopId,
+                          const std::shared_ptr<const AudioPluginAudioProcessor::LoadedSampleData>& sample,
+                          const std::shared_ptr<const AudioPluginAudioProcessor::ChopState>& layout)
+    {
+        // A source, chop edit or MIDI-map change during the click cancels it.
+        if (sample == nullptr || layout == nullptr || sample != processor.getLoadedSample()
+            || layout != processor.getChopState() || ! canTrimTargetChop()) return;
+        for (const auto& chop : layout->chops)
+        {
+            if (chop.id != chopId) continue;
+            const int length = sample->buffer.getNumSamples();
+            if (chop.startSample < 0 || chop.endSample > length || chop.endSample - chop.startSample < 2) return;
+            // The chop is relative to the committed crop; Trim uses original
+            // coordinates. Cue, reverse, warp and tails never move these edges.
+            const int start = sample->trimStartSample + chop.startSample;
+            const int end = sample->trimStartSample + chop.endSample;
+            if (processor.applySampleTrim (start, end, sample))
+            {
+                processor.releaseChopPreview();
+                processor.stopPlayback();
+                isHoldingToPlay = false;
+                clearPendingMarker();
+                setExportTarget (-1);
+            }
+            return;
+        }
     }
 
     bool hitTestAdsrButton (juce::Point<float> p) const
@@ -5114,6 +5462,7 @@ private:
         g.setOpacity (appear);
         const auto adsr = getAdsrButtonBounds();
         const auto drag = getDragAudioBounds();
+        const auto trim = getTrimButtonBounds();
         const juce::Colour amber (0xffffb300);
         g.setColour (adsrButtonPressed ? blackPanel.brighter (0.2f) : blackPanel);
         g.fillRoundedRectangle (adsr, 4.0f);
@@ -5147,6 +5496,14 @@ private:
             check.lineTo (x + 5.0f, y - 4.0f);
             g.strokePath (check, juce::PathStrokeType (1.5f));
         }
+        const bool trimEnabled = canTrimTargetChop();
+        g.setColour (trimButtonPressed ? blackPanel.brighter (0.2f) : blackPanel);
+        g.fillRoundedRectangle (trim, 4.0f);
+        g.setColour (trimEnabled ? (trimButtonHovered ? textPrimary : accentOrange) : textMuted.withAlpha (0.4f));
+        g.drawRoundedRectangle (trim.reduced (0.5f), 4.0f, 1.0f);
+        g.setColour (trimEnabled ? textPrimary : textMuted.withAlpha (0.5f));
+        g.setFont (monoFont (11.0f));
+        g.drawText ("TRIM SAMPLE", trim, juce::Justification::centred);
         paintDeleteBadge (g, appear);
     }
 
@@ -7225,6 +7582,12 @@ private:
     bool exportDragFired = false;
     bool adsrButtonHovered = false;
     bool adsrButtonPressed = false;
+    bool trimButtonHovered = false, trimButtonPressed = false;
+    bool trimClickSequence = false, trimRepeatPress = false;
+    juce::Rectangle<float> trimClickBounds;
+    int trimPressedChopId = -1;
+    std::shared_ptr<const AudioPluginAudioProcessor::LoadedSampleData> trimPressedSample;
+    std::shared_ptr<const AudioPluginAudioProcessor::ChopState> trimPressedLayout;
     int exportPressedChopId = -1;
     bool  exportButtonHovered   = false;
     bool  exportButtonPressed   = false;
@@ -7619,7 +7982,7 @@ public:
             configureButton (barsSegments[i], juce::String (barsChoices[i]),
                              textPrimary.withAlpha (0.75f));
             barsSegments[i].getProperties().set ("cueStyle", "segment");
-            barsSegments[i].setTooltip ("Bars per chop. Larger = fewer, longer chops.");
+            barsSegments[i].setTooltip ("Bars per chop. Larger = fewer, longer chops. Click to leave Micro-Chops and use this bar length.");
 
             // Deliberately NOT setClickingTogglesState: the lit segment is
             // whatever the processor actually holds, pushed back by
@@ -7628,7 +7991,7 @@ public:
             barsSegments[i].onClick = [this, i]
             {
                 const int chosen = barsChoices[i];
-                if (chosen != processor.getChopBarsCount())
+                if (chosen != processor.getChopBarsCount() || processor.getMicroChopDivision() != 0)
                     processor.setChopBarsCount (chosen);
 
                 refreshBarsSegments();
@@ -7698,6 +8061,9 @@ public:
         };
         loadButton.getProperties().set ("cueStyle", "flatAction");
 
+        playButton.setComponentID ("transport-play");
+        pauseButton.setComponentID ("transport-pause");
+        stopButton.setComponentID ("transport-stop");
         playButton.setTooltip ("Play the selected chop from its cue point. Click a chop on the waveform first to pick which one plays.");
         pauseButton.setTooltip ("Pause playback - press Play to resume from the same spot.");
         stopButton.setTooltip ("Stop playback and return to the beginning of the current chop.");
@@ -8024,7 +8390,7 @@ public:
     {
         const int current = processor.getChopBarsCount();
         for (size_t i = 0; i < barsChoices.size(); ++i)
-            barsSegments[i].setToggleState (barsChoices[i] == current,
+            barsSegments[i].setToggleState (processor.getMicroChopDivision() == 0 && barsChoices[i] == current,
                                             juce::dontSendNotification);
     }
     juce::Slider& getCueSlider() noexcept { return cueKnob.getSlider(); }
@@ -8162,6 +8528,16 @@ private:
 
     void updateTimeDisplay()
     {
+        const double trimPosition = processor.getSampleTrimPreviewPosition();
+        if (trimPosition >= 0.0)
+        {
+            const auto original = processor.getOriginalSampleForTrim();
+            if (original != nullptr && original->sampleRate > 0.0)
+            {
+                timeDisplay.setValueText (formatSampleTime (trimPosition / original->sampleRate));
+                return;
+            }
+        }
         const auto sampleData = processor.getLoadedSample();
         if (sampleData == nullptr || sampleData->buffer.getNumSamples() == 0 || sampleData->sampleRate <= 0.0)
         {
@@ -8369,7 +8745,7 @@ private:
             if (lastFlOctaveResult == cuesampler::FlOctaveShortcutResult::inactiveHost) return "FL OCT: FOCUS FL";
             if (lastFlOctaveResult == cuesampler::FlOctaveShortcutResult::unavailableWindow) return "FL OCT: CLOSE DIALOG";
             if (lastFlOctaveResult == cuesampler::FlOctaveShortcutResult::failed) return "FL OCT: REQUEST FAILED";
-            return "FL TYPING C2 - C6";
+            return "FL TYPING C4 - C6";
         }
         const auto state = processor.getChopState();
         const bool performance = processor.getMidiPerformanceMode() == AudioPluginAudioProcessor::MidiPerformanceMode::Window
@@ -8380,13 +8756,19 @@ private:
 
     void updateOctaveControls()
     {
-        const int start = processor.getKeyboardStartNote();
+        int start = processor.getKeyboardStartNote();
         if (controlsFlTypingOctave)
         {
-            octDownButton.setEnabled (start > 24);
+            const int clamped = cuesampler::flPadTypingOctaveStep (start, 0);
+            if (clamped != start)
+            {
+                processor.setMidiOctaveOffset (clamped / 12);
+                start = clamped;
+            }
+            octDownButton.setEnabled (start > 48);
             octUpButton.setEnabled (start < 72);
-            octDownButton.setTooltip ("Lower FL Studio's typing-keyboard octave (C2-C6, Standard Piano layout). Release typing keys first. All chop pads stay visible.");
-            octUpButton.setTooltip ("Raise FL Studio's typing-keyboard octave (C2-C6, Standard Piano layout). Release typing keys first. All chop pads stay visible.");
+            octDownButton.setTooltip ("Lower FL Studio's typing-keyboard octave (C4-C6, Standard Piano layout). Release typing keys first.");
+            octUpButton.setTooltip ("Raise FL Studio's typing-keyboard octave (C4-C6, Standard Piano layout). Release typing keys first.");
             return;
         }
         octDownButton.setEnabled (start > 0);
@@ -8402,7 +8784,7 @@ private:
         };
         if (controlsFlTypingOctave)
         {
-            const int next = juce::jlimit (24, 72, processor.getKeyboardStartNote() + direction * 12);
+            const int next = cuesampler::flPadTypingOctaveStep (processor.getKeyboardStartNote(), direction);
             if (next != processor.getKeyboardStartNote())
             {
                 lastFlOctaveResult = cuesampler::postFlOctaveShortcut (next);
@@ -9096,7 +9478,11 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     // while the processor is still on the hand-made chop layer.
     waveformDisplayComponent->setManualChopMode (processorRef.isManualChopModeActive());
     transportSectionComponent->getLoadButton().onClick = [this] { loadSampleFromFile(); };
-    transportSectionComponent->getPlayButton().onClick = [this] { processorRef.startPlayback(); };
+    transportSectionComponent->getPlayButton().onClick = [this]
+    {
+        if (sampleTrimComponent != nullptr && sampleTrimComponent->isVisible()) sampleTrimComponent->playPreview();
+        else processorRef.startPlayback();
+    };
     transportSectionComponent->getPauseButton().onClick = [this] { processorRef.pausePlayback(); };
     transportSectionComponent->getStopButton().onClick = [this] { processorRef.stopPlayback(); };
     transportSectionComponent->onTempoEntered = [this] (double requestedBpm)
@@ -9213,6 +9599,19 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     sampleImportOverlayComponent = std::make_unique<cue::SampleImportOverlayComponent> (processorRef);
     sampleImportOverlayComponent->onChooseSample = [this] { loadSampleFromFile(); };
     contentComponent.addChildComponent (*sampleImportOverlayComponent);
+    sampleTrimComponent = std::make_unique<cue::SampleTrimComponent> (processorRef, []
+    {
+        return cue::SampleTrimComponent::Palette { cue::panelDark, cue::blackPanel, cue::borderMid,
+                                                   cue::textPrimary, cue::textMuted, cue::getOrange() };
+    });
+    sampleTrimComponent->onClose = [this] { closeSampleTrim(); };
+    contentComponent.addChildComponent (*sampleTrimComponent);
+    cue::configureButton (trimSampleButton, "TRIM SAMPLE", cue::textPrimary);
+    trimSampleButton.setComponentID ("trim-sample-button");
+    trimSampleButton.getProperties().set ("cueStyle", "padMidiLock");
+    trimSampleButton.setTooltip ("Edit the full sample's start and end. Done reanalyzes BPM, rebuilds chops and clears Favorites. Original audio stays recoverable.");
+    trimSampleButton.onClick = [this] { beginSampleTrim(); };
+    contentComponent.addAndMakeVisible (trimSampleButton);
     favoritesViewComponent->onEditChop = [this] (int chopId)
     {
         processorRef.setFavoritesViewEnabled (false);
@@ -9374,6 +9773,11 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
 AudioPluginAudioProcessorEditor::~AudioPluginAudioProcessorEditor()
 {
     stopTimer();
+    if (sampleTrimComponent != nullptr)
+    {
+        sampleTrimComponent->onClose = {};
+        sampleTrimComponent->setVisible (false);
+    }
     if (chopPadGridComponent != nullptr)
     {
         // Cancel before members disappear: drag cancellation may synchronize
@@ -9398,18 +9802,56 @@ void AudioPluginAudioProcessorEditor::syncChopPads()
         chopMidiControlsComponent->refresh();
 }
 
+void AudioPluginAudioProcessorEditor::beginSampleTrim()
+{
+    if (processorRef.isMidiMappingLocked() || processorRef.getSampleImportStatus() != nullptr
+        || sampleTrimComponent == nullptr || ! sampleTrimComponent->beginTrim()) return;
+    processorRef.releaseChopPreview();
+    processorRef.cancelManualChopCapture();
+    waveformDisplayComponent->setManualAddTool (false);
+    if (chopPadGridComponent != nullptr) chopPadGridComponent->releaseNote();
+    sampleTrimComponent->setVisible (true);
+    sampleTrimComponent->toFront (false);
+    sampleTrimComponent->grabKeyboardFocus();
+    refreshFavoritesView();
+}
+
+void AudioPluginAudioProcessorEditor::closeSampleTrim()
+{
+    if (sampleTrimComponent != nullptr) sampleTrimComponent->setVisible (false);
+    refreshFavoritesView();
+}
+
+void AudioPluginAudioProcessorEditor::visibilityChanged()
+{
+    if (! isVisible() && sampleTrimComponent != nullptr) sampleTrimComponent->stopAudition();
+}
+
 void AudioPluginAudioProcessorEditor::refreshFavoritesView()
 {
     const bool enabled = processorRef.isFavoritesViewEnabled();
+    const bool trimming = sampleTrimComponent != nullptr && sampleTrimComponent->isVisible();
+    transportSectionComponent->getPlayButton().setTooltip (trimming
+        ? "Audition the current Trim start/end range in a loop. Play resumes after Pause."
+        : "Play the selected chop from its cue point. Click a chop on the waveform first to pick which one plays.");
+    transportSectionComponent->getPauseButton().setTooltip (trimming
+        ? "Pause the Trim audition. Play resumes from this position."
+        : "Pause playback - press Play to resume from the same spot.");
+    transportSectionComponent->getStopButton().setTooltip (trimming
+        ? "Stop the Trim audition and return to the selected Start point."
+        : "Stop playback and return to the beginning of the current chop.");
     const bool viewChanged = waveformDisplayComponent->isVisible() == enabled;
     favoritesButton.setToggleState (enabled, juce::dontSendNotification);
-    waveformDisplayComponent->setVisible (! enabled);
-    waveformFooterComponent->getZoomSlider().setEnabled (! enabled);
-    waveformFooterComponent->getScrollSlider().setEnabled (! enabled);
-    waveformFooterComponent->getTempoSlider().setEnabled (! enabled && ! processorRef.isMidiMappingLocked());
+    favoritesButton.setEnabled (! trimming);
+    trimSampleButton.setEnabled (! trimming && ! processorRef.isMidiMappingLocked()
+                                 && processorRef.getLoadedSample() != nullptr && processorRef.getSampleImportStatus() == nullptr);
+    waveformDisplayComponent->setVisible (! enabled && ! trimming);
+    waveformFooterComponent->getZoomSlider().setEnabled (! enabled && ! trimming);
+    waveformFooterComponent->getScrollSlider().setEnabled (! enabled && ! trimming);
+    waveformFooterComponent->getTempoSlider().setEnabled (! enabled && ! trimming && ! processorRef.isMidiMappingLocked());
     if (favoritesViewComponent != nullptr)
     {
-        favoritesViewComponent->setVisible (enabled);
+        favoritesViewComponent->setVisible (enabled && ! trimming);
         if (enabled) favoritesViewComponent->refresh();
     }
     if (viewChanged) repaint();
@@ -9430,6 +9872,10 @@ void AudioPluginAudioProcessorEditor::timerCallback()
     if (! cue::shouldRunRealtimeUi (*this))
         return;
 
+    const bool trimming = sampleTrimComponent != nullptr && sampleTrimComponent->isVisible();
+    trimSampleButton.setEnabled (! trimming && ! processorRef.isMidiMappingLocked()
+                                 && processorRef.getLoadedSample() != nullptr && processorRef.getSampleImportStatus() == nullptr);
+
     if (cuesampler::isFlOctaveShortcutAvailable())
     {
         const auto event = processorRef.getLatestHostMidiKeyEvent();
@@ -9440,8 +9886,8 @@ void AudioPluginAudioProcessorEditor::timerCallback()
             if (event != 0 && (! processorRef.isMidiBankModeEnabled() || channel == processorRef.getKeyboardMidiBank()))
             {
                 const int current = processorRef.getKeyboardStartNote();
-                const int view = cuesampler::flTypingViewForNote (current, (int) (event & 127u));
-                if (view != current && view >= 24 && view <= 72)
+                const int view = cuesampler::flPadTypingOctaveStep (cuesampler::flTypingViewForNote (current, (int) (event & 127u)), 0);
+                if (view != current)
                 {
                     processorRef.setMidiOctaveOffset (view / 12);
                     syncChopPads();
@@ -9502,11 +9948,7 @@ int AudioPluginAudioProcessorEditor::getUiFluidWidth() const noexcept
 int AudioPluginAudioProcessorEditor::getPadPanelHeight() const noexcept
 {
     const int count = chopPadGridComponent != nullptr ? chopPadGridComponent->getPadCount() : 0;
-    const int comfortableColumns = juce::jmax (1, (getUiFluidWidth() - 36) / 48);
-    const int comfortableRows = (count + comfortableColumns - 1) / comfortableColumns;
-    // Share vertical space with the waveform instead of growing the window.
-    // At the maximum rail height every pad still fits by reducing tile size.
-    return juce::jlimit (100, 220, 36 + comfortableRows * 40);
+    return cue::ChopPadGridComponent::preferredPanelHeight (count, getUiFluidWidth() - 36);
 }
 
 void AudioPluginAudioProcessorEditor::loadSampleFromFile()
@@ -9617,20 +10059,23 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
     defaultShadow.drawForRectangle (g, transportSectionComponent->getBounds().reduced (1));
     defaultShadow.drawForRectangle (g, stemRackComponent->getBounds().reduced (1));
 
-    // The pad rail grows upward for dense songs within the existing chassis.
+    // The pad rail uses at most three rows; later chops scroll within it.
     {
         const int panelHeight = getPadPanelHeight();
         const int panelY = 684 - panelHeight;
         auto padPanel = juce::Rectangle<float> (10.0f, (float) panelY, fluidW - 20.0f, (float) panelHeight);
-        juce::Path panelPath;
-        panelPath.addRoundedRectangle (padPanel, cue::mediumCorner);
-        cue::fillGlassPath (g, panelPath, padPanel);
-        g.setColour (cue::textMuted);
-        g.setFont (cue::monoFont (9.5f));
+        g.setColour (cue::panelDark);
+        g.fillRoundedRectangle (padPanel, cue::mediumCorner);
+        g.setColour (cue::borderMid);
+        g.drawRoundedRectangle (padPanel.reduced (0.5f), cue::mediumCorner, 1.0f);
+        g.setColour (cue::textPrimary);
+        g.setFont (cue::monoFont (10.5f));
         const int count = chopPadGridComponent != nullptr ? chopPadGridComponent->getPadCount() : 0;
         g.drawText ("CHOP PADS  /  " + juce::String (count), juce::Rectangle<int> (20, panelY + 4, 200, 24),
                     juce::Justification::centredLeft, false);
-        g.setColour (cue::blackPanel);
+        g.setColour (cue::borderDark);
+        g.drawHorizontalLine (panelY + 30, 18.0f, fluidW - 18.0f);
+        g.setColour (cue::shellDark);
         g.fillRoundedRectangle (juce::Rectangle<float> (17.0f, (float) panelY + 31.0f,
                                                        fluidW - 34.0f, (float) panelHeight - 34.0f), 2.0f);
     }
@@ -9648,13 +10093,16 @@ void AudioPluginAudioProcessorEditor::paint (juce::Graphics& g)
                              : processorRef.isManualChopModeActive()
                              ? "ADD CHOP: click start / end   EDIT: select + audition   Drag S / E: trim   Escape: cancel"
                              : "Click chop: preview   DRAG AUDIO: export to DAW   Drag edge: resize   Shift-drag: tempo",
-                         juce::Rectangle<int> (270, 84, juce::jmax (0, (int) fluidW - 280), 20),
+                         juce::Rectangle<int> (400, 84, juce::jmax (0, (int) fluidW - 410), 20),
                          juce::Justification::centred, 10.8f,
                          cue::textMuted.withAlpha (0.9f));
 }
 
 void AudioPluginAudioProcessorEditor::resized()
 {
+    // A uniform editor scale can change screen-space drag distances while
+    // leaving the grid's design-space bounds unchanged.
+    if (chopPadGridComponent != nullptr) chopPadGridComponent->endWindowDrag (false);
     const auto scale = getUiScale();
     const auto fluidW = getUiFluidWidth();
     contentComponent.setTransform (juce::AffineTransform::scale (scale));
@@ -9690,9 +10138,11 @@ void AudioPluginAudioProcessorEditor::resized()
     const int controlsY = 428 - reclaimedHeight;
 
     favoritesButton.setBounds (140, 82, 116, 22);
+    trimSampleButton.setBounds (268, 82, 120, 22);
     waveformDisplayComponent->setBounds (10, 106, coreW, waveHeight);
     favoritesViewComponent->setBounds (10, 106, coreW, waveHeight);
     sampleImportOverlayComponent->setBounds (10, 106, coreW, waveHeight);
+    sampleTrimComponent->setBounds (10, 106, coreW, waveHeight);
     transportSectionComponent->setBounds (10, controlsY, coreW, 148);
     waveformFooterComponent->setBounds (10, controlsY, coreW, 72);
     helpOverlayComponent->setBounds (10, 106, coreW, 470);
@@ -9702,7 +10152,11 @@ void AudioPluginAudioProcessorEditor::resized()
         chopPadGridComponent->setBounds (18, 684 - padPanelHeight + 32, fluidW - 36, padPanelHeight - 36);
     }
     if (chopMidiControlsComponent != nullptr)
-        chopMidiControlsComponent->setBounds (230, 684 - padPanelHeight + 4, fluidW - 250, 24);
+    {
+        const int controlsWidth = juce::jmin (1000, fluidW - 250);
+        chopMidiControlsComponent->setBounds (fluidW - controlsWidth - 20,
+                                              684 - padPanelHeight + 4, controlsWidth, 24);
+    }
 
     // Update banner: centred strip near the top, drawn over the content. Sized
     // in editor (unscaled) pixels since it is a direct child of the editor.
@@ -9749,6 +10203,7 @@ void AudioPluginAudioProcessorEditor::applyThemeToUi()
     headerComponent->refreshColours();
     transportSectionComponent->refreshColours();
     waveformFooterComponent->refreshColours();
+    if (sampleTrimComponent != nullptr) sampleTrimComponent->refreshColours();
 
     if (cueOrbComponent != nullptr)
         cueOrbComponent->setBackgroundColour (cue::shellDark);

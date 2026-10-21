@@ -96,6 +96,13 @@ inline int flTypingViewForNote (int currentNote, int playedNote, int visibleNote
     return std::clamp (playedNote / 12 * 12, 24, 72);
 }
 
+// The pad performance UI starts at FL's default C4. Keep its OCT controls
+// within C4..C6 without changing older screen-keyboard helper policies or MIDI.
+inline int flPadTypingOctaveStep (int currentNote, int direction) noexcept
+{
+    return std::clamp (currentNote + (direction < 0 ? -12 : direction > 0 ? 12 : 0), 48, 72);
+}
+
 struct FlOctaveShortcutContext
 {
     bool isFlStudio = false;

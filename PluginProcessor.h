@@ -43,6 +43,11 @@ public:
         int leadingContentStartSample = 0;
         juce::var serializedStateData; // shared immutable binary data; no audio copy per mute
         std::shared_ptr<SamplePersistenceData> deferredStateData;
+        // Trimmed buffers use slice-local coordinates; this retained pristine
+        // source and its half-open bounds permit later expansion without disk.
+        std::shared_ptr<const LoadedSampleData> trimOriginalSample;
+        int trimStartSample = 0;
+        int trimEndSample = -1; // full source when negative
 
         juce::var getSerializedStateData() const
         {
@@ -127,6 +132,7 @@ public:
         // The knob value is authoritative; the sample offset is derived on the
         // editing thread. Negative means an older in-memory/sample-offset cue.
         double cuePositionNormalized = -1.0;
+        float tailLengthMilliseconds = 0.0f;
         double getCueNormalized() const noexcept
         {
             return std::isfinite (cuePositionNormalized) && cuePositionNormalized >= 0.0
@@ -245,6 +251,23 @@ public:
     // UI imports prepare and publish on a worker; completion runs on the message thread.
     void loadAudioFileAsync (const juce::File& file, std::function<void (SampleLoadResult)> completed);
     std::shared_ptr<const LoadedSampleData> getLoadedSample() const;
+    std::shared_ptr<const LoadedSampleData> getOriginalSampleForTrim() const;
+    int getSampleTrimStartSample() const noexcept;
+    int getSampleTrimEndSample() const noexcept;
+    // Queues a recoverable crop in original-source coordinates. Completion
+    // re-analyses the slice and resets chops/Favorites; polling import status
+    // observes preparation. No sample work runs on the calling/audio thread.
+    // UI transactions can supply their opening sample to reject stale edits.
+    bool applySampleTrim (int startSample, int endSample,
+                          std::shared_ptr<const LoadedSampleData> expectedSample = {});
+    // Temporary original-source audition. Play loops the candidate range;
+    // Pause retains its cursor and Stop returns to its start. No project edits.
+    bool beginSampleTrimPreview (std::shared_ptr<const LoadedSampleData> expectedSample);
+    void updateSampleTrimPreviewRange (int startSample, int endSample);
+    void endSampleTrimPreview();
+    bool isSampleTrimPreviewActive() const noexcept;
+    bool isSampleTrimPreviewPlaying() const noexcept;
+    double getSampleTrimPreviewPosition() const noexcept; // original coordinates, -1 before Play / after takeover
 
     void startPlayback() noexcept;
     // Mouse auditions retrigger the selected chop and latch its playback mode.
@@ -363,6 +386,10 @@ public:
     float getWaveformScroll() const noexcept;
     double getResolvedGridAnchorSeconds() const noexcept;
     int getChopBarsCount() const noexcept;
+    // Off (0) uses BARS; 2/4/8/16 divide one beat into that many chops.
+    int getMicroChopDivision() const noexcept;
+    bool isPreservedMicroChopBeatGrid() const noexcept;
+    double getChopLengthInBars() const noexcept;
     bool isTempoAnalysisInProgress() const noexcept;
     bool isKeyDetectionInProgress() const noexcept;
     KeyDetector::Result getDetectedKey() const;
@@ -495,6 +522,7 @@ public:
     double getCurrentGridFingerprint() const noexcept;
 
     void setChopBarsCount (int bars);
+    void setMicroChopDivision (int division);
     void setTempoAnalysisRegion (int startSample, int endSample);
     void clearTempoAnalysisRegion();
     void addChop (int startSample, int endSample);
@@ -536,6 +564,8 @@ public:
     void setSelectedChopPitchSemitones (float pitchSemitones);
     enum class ChopEnvelopeParameter : int { Attack = 0, Decay, Sustain, Release };
     void setChopEnvelopeParameter (int chopId, ChopEnvelopeParameter parameter, float value);
+    // Adds fading source audio after the chop's normal audible boundary.
+    void setChopTailLength (int chopId, float milliseconds);
     void toggleSelectedChopFavorite();
     void setFavoritesViewEnabled (bool enabled);
     bool isFavoritesViewEnabled() const noexcept { return favoritesViewEnabled.load (std::memory_order_acquire); }
@@ -567,6 +597,7 @@ private:
     class TempoAnalysisJob;
     class DeferredSampleRestoreJob;
     class SampleImportJob;
+    class SampleTrimJob;
     class SampleStateEncodingJob;
     class WarpRenderJob;
     class KeyDetectionJob;
@@ -599,6 +630,8 @@ private:
         juce::String samplePath;
         juce::String sampleFileName;
         juce::var embeddedSampleData;
+        int restoredTrimStartSample = 0;
+        int restoredTrimEndSample = -1;
         juce::var embeddedStemData;
         std::shared_ptr<TempoEditState> editState;
         std::shared_ptr<TempoAnalysisData> analysis;
@@ -626,6 +659,8 @@ private:
         // older project's quantized source to look up its original separation.
         juce::String restoredStemCacheKey;
         int restoredBarsPerChop = 1;
+        int restoredMicroChopDivision = 0;
+        bool restoredPreservedMicroChopBeatGrid = false;
         int restoredMidiOctaveOffset = 0;
         int restoredRecordedMidiRoot = 36;
         bool restoredMidiBankMode = false;
@@ -680,6 +715,11 @@ private:
         bool playbackTriggeredByMidi = false;
         bool chopOneShot = false;
         bool playbackTriggeredByMouse = false;
+        bool sampleTrimPreview = false;
+        uint64_t sampleTrimPreviewGeneration = 0;
+        bool tailReleaseActive = false;
+        double tailFadeStartSample = -1.0;
+        float tailReleaseGain = 1.0f;
         bool manualChopCapture = false;
         uint64_t manualCaptureGeneration = 0;
         uint64_t manualCaptureContext = 0;
@@ -716,6 +756,14 @@ private:
         VoiceState (const VoiceState&) = delete;
         VoiceState& operator= (const VoiceState&) = delete;
 
+        void clearTailRelease() noexcept
+        {
+            tailReleaseActive = false;
+            tailFadeStartSample = -1.0;
+            tailReleaseGain = 1.0f;
+            releaseWatchdogSamples = -1.0;
+        }
+
         void reset()
         {
             playbackActive = false;
@@ -727,6 +775,9 @@ private:
             playbackTriggeredByMidi = false;
             chopOneShot = false;
             playbackTriggeredByMouse = false;
+            sampleTrimPreview = false;
+            sampleTrimPreviewGeneration = 0;
+            clearTailRelease();
             manualChopCapture = false;
             envelope.reset();
             envelopeConfigured = false;
@@ -883,6 +934,8 @@ private:
         float gridBpmTrim = 0.0f;
         float gridStartOffset = 0.0f;
         int   chopBarsCount = 1;
+        int   microChopDivision = 0;
+        bool  preservedMicroChopBeatGrid = false;
         bool doubleTempoEnabled = false;
         bool restoresGrid = false;
     };
@@ -950,6 +1003,8 @@ private:
     std::atomic<int> pendingStartChopId { -1 };
     std::atomic<bool> pendingStartMousePreview { false };
     std::atomic<bool> pendingStartOneShot { false };
+    std::atomic<bool> pendingStartSampleTrimPreview { false };
+    std::atomic<uint64_t> pendingSampleTrimPreviewGeneration { 0 };
     std::atomic<bool> mousePreviewHeld { false };
     std::atomic<double> pendingStartSyncPpq { 0.0 };
     std::atomic<double> pendingStartSyncSample { 0.0 };
@@ -970,6 +1025,24 @@ private:
     // Serializes non-realtime state writers and their final publication checks.
     // NEVER acquired by processBlock, MIDI handling, or voice rendering.
     mutable std::recursive_mutex sampleStateMutex;
+    struct SampleTrimPreviewContext
+    {
+        std::shared_ptr<const LoadedSampleData> expectedSample, originalSample;
+        int startSample = 0, endSample = 0;
+        uint64_t generation = 0;
+    };
+    std::shared_ptr<const SampleTrimPreviewContext> sampleTrimPreviewContext;
+    static_assert (std::atomic<const SampleTrimPreviewContext*>::is_always_lock_free
+                   && std::atomic<bool>::is_always_lock_free,
+                   "Trim preview publication and reader flag must be lock-free");
+    std::atomic<const SampleTrimPreviewContext*> publishedSampleTrimPreviewContext { nullptr };
+    std::atomic<bool> sampleTrimPreviewReaderActive { false };
+    std::vector<std::shared_ptr<const SampleTrimPreviewContext>> retiredSampleTrimPreviewContexts;
+    uint64_t nextSampleTrimPreviewGeneration = 0; // guarded by sampleStateMutex
+    std::atomic<double> sampleTrimPreviewPosition { 0.0 };
+    std::atomic<bool> sampleTrimPreviewPlaying { false }, sampleTrimPreviewCursorVisible { false };
+    void publishSampleTrimPreviewContext (std::shared_ptr<const SampleTrimPreviewContext>);
+    void reclaimSampleTrimPreviewContexts(); // sampleStateMutex held, never called by audio
     juce::ValueTree pendingRestoreState; // preserve host state during async decoding
     std::shared_ptr<LoadedSampleData> stemSource; // guarded by sampleStateMutex
 
@@ -1026,6 +1099,8 @@ private:
     std::atomic<bool> doubleTempoEnabled { false };
     std::atomic<bool> favoritesViewEnabled { false };
     std::atomic<int> chopBarsCount { 1 };
+    std::atomic<int> microChopDivision { 0 };
+    std::atomic<bool> preservedMicroChopBeatGrid { false };
     static_assert (std::atomic<uint16_t>::is_always_lock_free);
     static_assert (std::atomic<uint32_t>::is_always_lock_free);
     std::array<std::atomic<uint16_t>, 128> heldHostMidiChannels {};
@@ -1083,6 +1158,7 @@ private:
     void ensurePitchEnginesReady (double sourceRate, double hostRate, int channels);
 
     void launchTempoAnalysis (std::shared_ptr<const LoadedSampleData> sampleData);
+    void releaseChopVoice (VoiceState&, const ChopDefinition*, const LoadedSampleData*) noexcept;
     void publishTempoAnalysis (std::shared_ptr<TempoAnalysisData> analysisResult, uint64_t analysisGeneration);
 
     // Stem separation, mirroring the launchTempoAnalysis / publishTempoAnalysis
@@ -1126,7 +1202,11 @@ private:
         SampleLoadResult* loadResult = nullptr,
         const std::function<bool (float)>& progress = {},
         bool deferStateEncoding = false);
-    void publishImportedSample (const std::shared_ptr<LoadedSampleData>& sampleData);
+    void publishImportedSample (const std::shared_ptr<LoadedSampleData>& sampleData,
+                                bool preserveMicroGridUnit = false);
+    static std::shared_ptr<LoadedSampleData> createTrimmedSampleData (
+        std::shared_ptr<const LoadedSampleData> original, int startSample, int endSample,
+        const std::function<bool (float)>& progress = {});
     KeyDetector::Result tryReadKeyFromMetadata (const juce::File& file);
     bool computeGridTimingMetrics (const TempoAnalysisData& analysis,
                                    double& beatPeriodSeconds,

@@ -15,6 +15,7 @@ class HeaderComponent;
 class VisualizerOrb;
 class WaveformDisplayComponent;
 class SampleImportOverlayComponent;
+class SampleTrimComponent;
 class TransportSectionComponent;
 class FavoritesViewComponent;
 class WaveformFooterComponent;
@@ -38,6 +39,7 @@ public:
     //==============================================================================
     void paint (juce::Graphics&) override;
     void resized() override;
+    void visibilityChanged() override;
 
     void loadSampleFromFile();
 
@@ -57,6 +59,8 @@ private:
     void toggleTheme();
     void applyThemeToUi();
     void refreshFavoritesView();
+    void beginSampleTrim();
+    void closeSampleTrim();
     void syncChopPads();
     int getPadPanelHeight() const noexcept;
     uint32_t lastObservedHostMidiKeyEvent = 0;
@@ -69,9 +73,11 @@ private:
     std::unique_ptr<cue::HeaderComponent> headerComponent;
     std::unique_ptr<cue::WaveformDisplayComponent> waveformDisplayComponent;
     std::unique_ptr<cue::SampleImportOverlayComponent> sampleImportOverlayComponent;
+    std::unique_ptr<cue::SampleTrimComponent> sampleTrimComponent;
     std::unique_ptr<cue::TransportSectionComponent> transportSectionComponent;
     std::unique_ptr<cue::FavoritesViewComponent> favoritesViewComponent;
     juce::TextButton favoritesButton;
+    juce::TextButton trimSampleButton;
     std::unique_ptr<cue::WaveformFooterComponent> waveformFooterComponent;
     std::unique_ptr<cue::StemRackComponent> stemRackComponent;
 
