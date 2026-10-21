@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.22)
 # `project()` command. `project()` sets up some helpful variables that describe source/binary
 # directories, and the current project version. This is a standard CMake command.
 
-project(CueSampler VERSION 1.10.0)
+project(CueSampler VERSION 1.10.1)
 # Keep host/update metadata fully qualified; show the requested short release
 # label for a zero-patch release (for example, 1.10 rather than 1.10.0).
 set(CUE_VERSION_DISPLAY "${PROJECT_VERSION}")
@@ -548,6 +548,12 @@ if(CUE_BUILD_STEM_CACHE_TEST)
         juce::juce_core
         cue_mp3lame
         juce::juce_recommended_config_flags)
+    if(WIN32)
+        add_custom_command(TARGET test_stem_cache POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:cue_mp3lame>"
+                "$<TARGET_FILE_DIR:test_stem_cache>/$<TARGET_FILE_NAME:cue_mp3lame>")
+    endif()
     add_test(NAME stem_cache COMMAND test_stem_cache "${CMAKE_CURRENT_BINARY_DIR}")
 endif()
 
@@ -574,8 +580,14 @@ if(CUE_BUILD_STATE_TEST)
         set_target_properties(test_project_restore PROPERTIES BUILD_RPATH "${ONNXRUNTIME_ROOT}/lib")
     elseif(WIN32)
         add_custom_command(TARGET test_project_restore POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:cue_mp3lame>" "$<TARGET_FILE_DIR:test_project_restore>/$<TARGET_FILE_NAME:cue_mp3lame>"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ORT_RUNTIME_DLL}" "$<TARGET_FILE_DIR:test_project_restore>/onnxruntime.dll"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DIRECTML_DLL}" "$<TARGET_FILE_DIR:test_project_restore>/DirectML.dll")
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DIRECTML_DLL}" "$<TARGET_FILE_DIR:test_project_restore>/DirectML.dll"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:test_project_restore>" "$<TARGET_FILE_DIR:test_project_restore>/FL64.exe")
+        # Exercise JUCE's real FL host detection without adding a production
+        # host override. The fixture owns only a hidden native test window.
+        add_test(NAME host_keyboard_focus
+            COMMAND "$<TARGET_FILE_DIR:test_project_restore>/FL64.exe" "${CMAKE_CURRENT_BINARY_DIR}" --host-keyboard-focus)
     endif()
     add_test(NAME project_restore COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}")
     add_test(NAME stem_state COMMAND test_project_restore "${CMAKE_CURRENT_BINARY_DIR}" --state-only)
@@ -685,7 +697,7 @@ if(WIN32 AND MSVC)
     foreach(_tgt CueSampler_VST3 CueSampler_Standalone)
         if(TARGET ${_tgt})
             target_link_libraries(${_tgt} PRIVATE delayimp.lib)
-            target_link_options(${_tgt} PRIVATE "/DELAYLOAD:onnxruntime.dll")
+            target_link_options(${_tgt} PRIVATE "/DELAYLOAD:onnxruntime.dll" "/DELAYLOAD:mp3lame.dll")
         endif()
     endforeach()
 endif()

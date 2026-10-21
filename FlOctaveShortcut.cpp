@@ -6,13 +6,113 @@
 #if JUCE_MAC
 #import <Cocoa/Cocoa.h>
 #import <CoreGraphics/CoreGraphics.h>
+#elif JUCE_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 
 namespace cuesampler
 {
+#if JUCE_WINDOWS
+namespace
+{
+bool belongsToCurrentProcess (HWND window)
+{
+    DWORD process = 0;
+    return window != nullptr && GetWindowThreadProcessId (window, &process) != 0
+           && process == GetCurrentProcessId();
+}
+
+bool isNativeTextInput (HWND window)
+{
+    wchar_t className[256] {};
+    if (window == nullptr || GetClassNameW (window, className, 256) == 0) return false;
+    const auto name = juce::String (className).toLowerCase();
+    // Match native/VCL edit controls without treating plugin "Editor"
+    // wrapper windows as text fields. RichEdit class names include versions.
+    return name.endsWith ("edit") || name.startsWith ("richedit")
+           || name.endsWith ("memo") || name.endsWith ("combobox");
+}
+
+HWND usableFlWindow()
+{
+    const auto foreground = GetForegroundWindow();
+    if (! belongsToCurrentProcess (foreground)
+        || GetWindowThreadProcessId (foreground, nullptr) != GetCurrentThreadId()) return nullptr;
+    auto target = GetAncestor (foreground, GA_ROOT);
+    // VCL applications may have a hidden application HWND above their main
+    // form. Choose the outermost visible owner, keeping disabled owners so a
+    // native modal dialog causes the enabled check below to reject the request.
+    for (auto owner = GetWindow (target, GW_OWNER); owner != nullptr; owner = GetWindow (owner, GW_OWNER))
+        if (belongsToCurrentProcess (owner) && IsWindowVisible (owner)) target = owner;
+    // SetKeyboardState is local to this thread. Never attach another input
+    // queue or dispatch into another process (including a bridged plugin).
+    if (! belongsToCurrentProcess (target)
+        || GetWindowThreadProcessId (target, nullptr) != GetCurrentThreadId()
+        || ! IsWindowVisible (target) || ! IsWindowEnabled (target)
+        || ! IsWindowEnabled (foreground)
+        || juce::Component::getCurrentlyModalComponent() != nullptr)
+        return nullptr;
+
+    GUITHREADINFO info {};
+    info.cbSize = sizeof (info);
+    if (! GetGUIThreadInfo (GetCurrentThreadId(), &info)
+        || info.hwndFocus == nullptr || ! belongsToCurrentProcess (info.hwndFocus)
+        // JUCE creates this caret only for an active TextInputTarget, and
+        // destroys it when text input is dismissed or its peer loses focus.
+        || info.hwndCaret != nullptr
+        || (info.flags & (GUI_INMENUMODE | GUI_INMOVESIZE | GUI_POPUPMENUMODE | GUI_SYSTEMMENUMODE)) != 0)
+        return nullptr;
+    for (auto window = info.hwndFocus; window != nullptr; window = GetParent (window))
+        if (isNativeTextInput (window)) return nullptr;
+    for (auto* focus = juce::Component::getCurrentlyFocusedComponent(); focus != nullptr; focus = focus->getParentComponent())
+        if (dynamic_cast<juce::TextEditor*> (focus) != nullptr) return nullptr;
+    return target;
+}
+
+bool hasHeldKeyboardKeys()
+{
+    // Ignore mouse buttons so a button's mouse-up callback can request OCT.
+    // Include modifiers and every typing key: FL owns their note-off pairs.
+    for (int key = VK_BACK; key < 256; ++key)
+        if ((GetAsyncKeyState (key) & 0x8000) != 0) return true;
+    return false;
+}
+
+bool sendWindowsOctaveShortcut (HWND target, FlOctaveShortcut shortcut)
+{
+    struct ScopedKeyboardState
+    {
+        std::array<BYTE, 256> original {};
+        bool valid = GetKeyboardState (original.data()) != FALSE;
+        ~ScopedKeyboardState() { if (valid) SetKeyboardState (original.data()); }
+    } keyboard;
+    if (! keyboard.valid || target != usableFlWindow() || hasHeldKeyboardKeys()) return false;
+    auto state = keyboard.original;
+    for (const auto event : makeFlWindowsOctaveKeyEvents (shortcut))
+    {
+        state[event.virtualKey] = (BYTE) ((state[event.virtualKey] & 0x7f) | (event.down ? 0x80 : 0));
+        if (event.virtualKey == VK_MENU) state[VK_LMENU] = state[VK_MENU];
+        if (! SetKeyboardState (state.data())) return false;
+        const auto scan = MapVirtualKeyW (event.virtualKey, MAPVK_VK_TO_VSC) & 0xffu;
+        const auto flags = 1u | (scan << 16) | (event.altContext ? 1u << 29 : 0u)
+                           | (event.down ? 0u : (1u << 30) | (1u << 31));
+        // Synchronous, same-thread delivery keeps temporary modifier state
+        // scoped to the host handler. No global keyboard input is injected.
+        SendMessageW (target, event.down ? WM_SYSKEYDOWN : WM_SYSKEYUP,
+                      (WPARAM) event.virtualKey, (LPARAM) flags);
+        if (! IsWindow (target)) return false;
+    }
+    return true;
+}
+}
+#endif
+
 bool isFlOctaveShortcutAvailable()
 {
-   #if JUCE_MAC
+   #if JUCE_MAC || JUCE_WINDOWS
     return juce::PluginHostType().isFruityLoops();
    #else
     return false;
@@ -81,6 +181,13 @@ FlOctaveShortcutResult postFlOctaveShortcut (int startNote, FlTypingLayout layou
                 return true;
             }, layout);
     }
+   #elif JUCE_WINDOWS
+    if (! isFlOctaveShortcutAvailable()) return FlOctaveShortcutResult::unsupportedHost;
+    if (! belongsToCurrentProcess (GetForegroundWindow())) return FlOctaveShortcutResult::inactiveHost;
+    const auto target = usableFlWindow();
+    return dispatchFlOctaveShortcut (startNote,
+        { true, true, hasHeldKeyboardKeys(), target != nullptr },
+        [target] (FlOctaveShortcut shortcut) { return sendWindowsOctaveShortcut (target, shortcut); }, layout);
    #else
     juce::ignoreUnused (startNote, layout);
     return FlOctaveShortcutResult::unsupportedHost;

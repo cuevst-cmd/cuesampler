@@ -4,6 +4,7 @@
 #include "WaveformColourAnalysis.h"
 #include "MidiNoteNames.h"
 #include "FlOctaveShortcut.h"
+#include "UserDataDirectory.h"
 
 #include <array>
 #include <bitset>
@@ -21,6 +22,26 @@ namespace cue
 {
 namespace
 {
+bool hostOwnsTypingKeyboard()
+{
+   #if JUCE_WINDOWS
+    return juce::PluginHostType().isFruityLoops();
+   #else
+    return false;
+   #endif
+}
+
+void leaveTypingKeyboardWithHost (juce::Component& component)
+{
+    // Text fields deliberately take focus while the user edits a value.
+    if (dynamic_cast<juce::TextEditor*> (&component) != nullptr)
+        return;
+    component.setWantsKeyboardFocus (false);
+    component.setMouseClickGrabsKeyboardFocus (false);
+    for (auto* child : component.getChildren())
+        leaveTypingKeyboardWithHost (*child);
+}
+
 // One continuous chassis: content spans the full design width inside a
 // slim 10px margin (the CUERACK kMargin), no side rails.
 // Use the same absolute note labels on keys, chops and Favorites as FL Studio.
@@ -596,7 +617,11 @@ private:
 class SmoothHoverButton : public juce::TextButton, private juce::Timer
 {
 public:
-    SmoothHoverButton() : juce::TextButton() {}
+    SmoothHoverButton() : juce::TextButton()
+    {
+        setWantsKeyboardFocus (false);
+        setMouseClickGrabsKeyboardFocus (false);
+    }
     ~SmoothHoverButton() override { stopTimer(); }
 
     float getHoverAlpha() const noexcept { return hoverAlpha; }
@@ -3348,7 +3373,8 @@ public:
         : processor (p),
           horizontalScrollBar (false)
     {
-        setWantsKeyboardFocus (true);
+        setWantsKeyboardFocus (! hostOwnsTypingKeyboard());
+        setMouseClickGrabsKeyboardFocus (! hostOwnsTypingKeyboard());
         for (auto* button : { &manualEditButton, &manualAddButton })
         {
             button->getProperties().set ("cueStyle", "segment");
@@ -3702,7 +3728,8 @@ public:
             return;
         }
         trimClickSequence = trimRepeatPress = false;
-        grabKeyboardFocus();
+        if (! hostOwnsTypingKeyboard())
+            grabKeyboardFocus();
         updateHoverState (event.position);
 
         // Separate envelope and audio-drag controls remain available for
@@ -5159,8 +5186,9 @@ private:
     {
         // Hosts may reference dragged files instead of copying them. Successful
         // exports must outlive both the drag gesture and the plugin instance.
-        const auto directory = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                                   .getChildFile ("CueSampler/Exports");
+        const auto directory = cuesampler::userDataDirectory (
+            juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+                .getChildFile ("CueSampler")).getChildFile ("Exports");
         const auto retained = directory.getChildFile (readyExportFile.getFileName());
         if (! directory.createDirectory() || ! readyExportFile.moveFileTo (retained))
         {
@@ -9437,7 +9465,11 @@ private:
 AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAudioProcessor& p)
     : AudioProcessorEditor (&p), processorRef (p)
 {
-    uiSettingsFile = std::make_unique<juce::PropertiesFile> (cue::uiSettingsOptions());
+    const auto settingsOptions = cue::uiSettingsOptions();
+    const auto defaultSettingsFile = settingsOptions.getDefaultFile();
+    uiSettingsFile = std::make_unique<juce::PropertiesFile> (
+        cuesampler::userDataDirectory (defaultSettingsFile.getParentDirectory())
+            .getChildFile (defaultSettingsFile.getFileName()), settingsOptions);
 
     processorRef.sampleChangeBroadcaster.addChangeListener (this);
     processorRef.editChangeBroadcaster.addChangeListener (this);
@@ -9732,7 +9764,9 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
     addChildComponent (*initialLoadOverlayComponent); // shown asynchronously for a fresh instance
 
     setOpaque (true);
-    setWantsKeyboardFocus (true);
+    setWantsKeyboardFocus (! cue::hostOwnsTypingKeyboard());
+    if (cue::hostOwnsTypingKeyboard())
+        cue::leaveTypingKeyboardWithHost (*this);
     // Keep the window on the chassis aspect ratio. The UI deliberately scales
     // uniformly, so allowing height-only growth would leave an unused strip
     // below the pads instead of enlarging the controls.
@@ -9764,8 +9798,10 @@ AudioPluginAudioProcessorEditor::AudioPluginAudioProcessorEditor (AudioPluginAud
         {
             editor->initialLoadOverlayComponent->setBounds (editor->getLocalBounds());
             editor->initialLoadOverlayComponent->setVisible (true);
-            editor->initialLoadOverlayComponent->toFront (true);
-            editor->initialLoadOverlayComponent->grabKeyboardFocus();
+            const bool takeFocus = ! cue::hostOwnsTypingKeyboard();
+            editor->initialLoadOverlayComponent->toFront (takeFocus);
+            if (takeFocus)
+                editor->initialLoadOverlayComponent->grabKeyboardFocus();
         }
     });
 }
@@ -9825,6 +9861,23 @@ void AudioPluginAudioProcessorEditor::closeSampleTrim()
 void AudioPluginAudioProcessorEditor::visibilityChanged()
 {
     if (! isVisible() && sampleTrimComponent != nullptr) sampleTrimComponent->stopAudition();
+}
+
+void AudioPluginAudioProcessorEditor::parentHierarchyChanged()
+{
+    if (! cue::hostOwnsTypingKeyboard())
+        return;
+
+    cue::leaveTypingKeyboardWithHost (*this);
+    // JUCE's VST3 wrapper normally calls toFront(true) on clicks. Its native
+    // peer must also stay passive or Windows transfers focus before our
+    // controls see the click. FL remains the source of MIDI and recorded notes.
+    for (auto* parent = getParentComponent(); parent != nullptr; parent = parent->getParentComponent())
+    {
+        parent->setWantsKeyboardFocus (false);
+        parent->setMouseClickGrabsKeyboardFocus (false);
+        parent->setBroughtToFrontOnMouseClick (false);
+    }
 }
 
 void AudioPluginAudioProcessorEditor::refreshFavoritesView()

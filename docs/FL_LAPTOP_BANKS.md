@@ -47,11 +47,17 @@ chop 1 and C4. Shorter samples map every available chop.
 This also refreshes the stored Window while Favorites is active; Favorites keeps
 its separate fixed slots and gaps. One Undo restores the old bars and map.
 
-In FL Studio on macOS, **FL OCT -/+** controls the Standard Piano typing octave
+In FL Studio on macOS and Windows, **FL OCT -/+** controls the Standard Piano typing octave
 within C4-C6. The minus button is disabled at C4. Release typing keys before changing OCT. A blocked request leaves
 the octave unchanged. The installed Piano layout spans 32 chromatic notes;
 starting at C4 and stepping through C6 reaches the complete 56-note set.
 Changing octave does not reassign chops.
+
+On Windows, clicking CUE's waveform, pads, buttons or selectors leaves typing
+notes with FL Studio, including its normal recording path. Keep FL's **Typing
+keyboard to piano keyboard** enabled. Intentional text fields still take focus
+while editing a value. OCT requests are blocked while keys are held or a text
+entry/dialog/menu is active.
 
 For a pattern using distant chops, add them to **Favorites** in the desired
 order, then select **USE FOR MIDI** or choose **FAVORITES** in the MIDI selector.

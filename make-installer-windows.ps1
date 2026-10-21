@@ -152,6 +152,7 @@ $requiredRuntimeFiles = @(
     "Contents\x86_64-win\CUE SAMPLER.vst3",
     "Contents\x86_64-win\onnxruntime.dll",
     "Contents\x86_64-win\DirectML.dll",
+    "Contents\x86_64-win\mp3lame.dll",
     "Contents\x86_64-win\beat_this.onnx",
     "Contents\x86_64-win\beat_this.onnx.data"
 )

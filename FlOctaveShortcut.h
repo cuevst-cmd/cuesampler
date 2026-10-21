@@ -2,11 +2,12 @@
 
 #include <optional>
 #include <algorithm>
+#include <array>
 #include <bitset>
 
 namespace cuesampler
 {
-// FL's documented Opt+numeric-keypad shortcuts select absolute octaves 2..6.
+// FL's documented Alt/Opt+numeric-keypad shortcuts select absolute octaves 2..6.
 // This bridge never changes the plugin's incoming MIDI or saved chop mapping.
 enum class FlTypingLayout { standard, extended };
 
@@ -49,6 +50,23 @@ inline std::optional<FlOctaveShortcut> makeFlOctaveShortcut (int startNote, FlTy
         return std::nullopt;
     const int octave = shortcutNote / 12;
     return FlOctaveShortcut { octave, static_cast<unsigned short> (84 + octave - 2) };
+}
+
+// Win32 virtual-key values are platform-independent constants here so the
+// complete paired shortcut can be validated without sending host input.
+struct FlWindowsOctaveKeyEvent
+{
+    unsigned int virtualKey;
+    bool down;
+    bool altContext;
+};
+
+inline std::array<FlWindowsOctaveKeyEvent, 4> makeFlWindowsOctaveKeyEvents (FlOctaveShortcut shortcut)
+{
+    constexpr unsigned int alt = 0x12, numpad0 = 0x60;
+    const auto digit = numpad0 + (unsigned int) shortcut.octave;
+    return {{ { alt, true, false }, { digit, true, true },
+              { digit, false, true }, { alt, false, true } }};
 }
 
 enum class FlOctaveShortcutResult

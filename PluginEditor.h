@@ -40,6 +40,7 @@ public:
     void paint (juce::Graphics&) override;
     void resized() override;
     void visibilityChanged() override;
+    void parentHierarchyChanged() override;
 
     void loadSampleFromFile();
 

@@ -633,6 +633,174 @@ struct CueSamplerStateTests
                "legacy projects without Tail Length retain their original chop boundaries");
     }
 
+    static void runHostKeyboardFocus()
+    {
+       #if JUCE_WINDOWS
+        // JUCE detects FL from the executable name. Run a copy named FL64.exe
+        // beside the harness DLLs; no host override enters production code.
+        check (juce::PluginHostType().isFruityLoops(), "keyboard-focus fixture is running through JUCE's FL host detection");
+        if (! juce::PluginHostType().isFruityLoops()) return;
+
+        struct NativeHost
+        {
+            NativeHost()
+            {
+                WNDCLASSW windowClass {};
+                windowClass.hInstance = GetModuleHandleW (nullptr);
+                windowClass.lpszClassName = L"CueSamplerKeyboardFocusTest";
+                windowClass.lpfnWndProc = windowProc;
+                registered = RegisterClassW (&windowClass) != 0;
+                if (registered)
+                    window = CreateWindowExW (0, windowClass.lpszClassName, L"CueSampler keyboard test",
+                        WS_OVERLAPPED, 0, 0, 1400, 900, nullptr, nullptr, windowClass.hInstance, this);
+            }
+            ~NativeHost()
+            {
+                if (window != nullptr) DestroyWindow (window);
+                if (registered) UnregisterClassW (L"CueSamplerKeyboardFocusTest", GetModuleHandleW (nullptr));
+            }
+            static LRESULT CALLBACK windowProc (HWND hwnd, UINT message, WPARAM key, LPARAM flags)
+            {
+                if (message == WM_NCCREATE)
+                    SetWindowLongPtrW (hwnd, GWLP_USERDATA,
+                        (LONG_PTR) reinterpret_cast<CREATESTRUCTW*> (flags)->lpCreateParams);
+                if (auto* self = reinterpret_cast<NativeHost*> (GetWindowLongPtrW (hwnd, GWLP_USERDATA)))
+                {
+                    if (message == WM_KEYDOWN) { ++self->downs; self->lastDown = key; return 0; }
+                    if (message == WM_KEYUP) { ++self->ups; self->lastUp = key; return 0; }
+                    if (message == WM_CHAR) { ++self->characters; return 0; }
+                }
+                return DefWindowProcW (hwnd, message, key, flags);
+            }
+            void drainKeys()
+            {
+                // Dispatch only messages already forwarded by the JUCE peer.
+                // TranslateMessage would synthesize another character here.
+                MSG message {};
+                while (PeekMessageW (&message, window, WM_KEYFIRST, WM_KEYLAST, PM_REMOVE))
+                    DispatchMessageW (&message);
+            }
+            HWND window = nullptr;
+            bool registered = false;
+            int downs = 0, ups = 0, characters = 0;
+            WPARAM lastDown = 0, lastUp = 0;
+        } host;
+        check (host.window != nullptr, "create isolated native host window without global keyboard input");
+        if (host.window == nullptr) return;
+
+        juce::Component wrapper;
+        // Match the VST3 wrapper's default click/front behavior before the
+        // editor attaches. Its native parent stays hidden throughout the test.
+        wrapper.setWantsKeyboardFocus (true);
+        wrapper.setMouseClickGrabsKeyboardFocus (true);
+        wrapper.setBroughtToFrontOnMouseClick (true);
+        wrapper.setSize (1266, 692);
+        wrapper.addToDesktop (0, host.window);
+        wrapper.setVisible (true);
+        P p;
+        setup (p);
+        p.setWaveformZoom (0); p.setWaveformScroll (0);
+        p.setChopPlaybackMode (P::ChopPlaybackMode::OneShot);
+        p.prepareToPlay (8000, 64);
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+        wrapper.addAndMakeVisible (*editor);
+        auto* wave = findType (*editor, "WaveformDisplayComponent");
+        auto* up = findComponentId (*editor, "octave-up");
+        auto* down = findComponentId (*editor, "octave-down");
+        check (wave != nullptr && up != nullptr && down != nullptr && up->isShowing() && down->isShowing(),
+               "FL host detection shows octave controls and an active waveform");
+        if (wave == nullptr) return;
+        check (! editor->getWantsKeyboardFocus() && ! editor->getMouseClickGrabsKeyboardFocus()
+               && ! wave->getWantsKeyboardFocus() && ! wave->getMouseClickGrabsKeyboardFocus()
+               && ! wrapper.getWantsKeyboardFocus() && ! wrapper.getMouseClickGrabsKeyboardFocus()
+               && ! wrapper.isBroughtToFrontOnMouseClick(),
+               "editor attachment makes native wrapper and waveform passive for host keyboard input");
+        int controls = 0;
+        bool passiveControls = true;
+        std::function<void (juce::Component&)> inspect = [&] (juce::Component& component)
+        {
+            if (dynamic_cast<juce::TextEditor*> (&component) != nullptr) return;
+            if (dynamic_cast<juce::Button*> (&component) != nullptr || dynamic_cast<juce::ComboBox*> (&component) != nullptr)
+            {
+                ++controls;
+                passiveControls &= ! component.getWantsKeyboardFocus() && ! component.getMouseClickGrabsKeyboardFocus();
+            }
+            for (auto* child : component.getChildren()) inspect (*child);
+        };
+        inspect (*editor);
+        check (controls > 10 && passiveControls, "non-text buttons and MIDI selectors leave typing keys with FL");
+
+        const auto nativeEditor = static_cast<HWND> (wrapper.getPeer()->getNativeHandle());
+        SetFocus (host.window);
+        check (GetFocus() == host.window, "native host starts with keyboard focus");
+        check (SendMessageW (nativeEditor, WM_MOUSEACTIVATE, (WPARAM) host.window,
+                            MAKELPARAM (HTCLIENT, WM_LBUTTONDOWN)) == MA_NOACTIVATE,
+               "native editor mouse activation preserves the host's keyboard focus");
+        const auto click = [&] (juce::Component& target, juce::Point<float> position)
+        {
+            // Hidden peers cannot pass WindowFromPoint hit-testing. Exercise
+            // the real handlers directly, while native activation is checked
+            // above and actual native keyboard dispatch is checked below.
+            const auto now = juce::Time::getCurrentTime();
+            const juce::MouseEvent event (juce::Desktop::getInstance().getMainMouseSource(), position,
+                juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier), 1, 0, 0, 0, 0,
+                &target, &target, now, position, now, 1, false);
+            target.mouseDown (event);
+            target.mouseUp (event);
+        };
+        click (*wave, { 45.0f, 100.0f });
+        juce::AudioBuffer<float> output (2, 64);
+        juce::MidiBuffer midi;
+        p.processBlock (output, midi);
+        check (p.voice.playbackActive && p.voice.playbackTriggeredByMouse && output.getMagnitude (0, 64) > 0,
+               "waveform mouse handlers still audition audio while the host owns keyboard focus");
+        check (GetFocus() == host.window, "waveform mouse handlers do not steal host keyboard focus");
+        p.stopPlayback(); midi.clear(); p.processBlock (output, midi);
+        if (auto* lock = findComponentId (*editor, "midi-map-lock"))
+        {
+            click (*lock, lock->getLocalBounds().toFloat().getCentre());
+            check (p.isMidiMappingLocked() && GetFocus() == host.window,
+                   "control mouse handlers change MIDI Lock without stealing host keyboard focus");
+            click (*lock, lock->getLocalBounds().toFloat().getCentre());
+        }
+        else check (false, "MIDI Lock control available for native focus test");
+
+        const auto keyFlags = (LPARAM) (1 | (MapVirtualKeyW ('Z', MAPVK_VK_TO_VSC) << 16));
+        SendMessageW (nativeEditor, WM_KEYDOWN, 'Z', keyFlags);
+        SendMessageW (nativeEditor, WM_CHAR, 'z', keyFlags);
+        SendMessageW (nativeEditor, WM_KEYUP, 'Z', keyFlags | ((LPARAM) 3 << 30));
+        host.drainKeys();
+        check (host.downs == 1 && host.ups == 1 && host.characters == 1 && host.lastDown == 'Z' && host.lastUp == 'Z',
+               "unused piano-key down, character and note-off key-up reach native host exactly once");
+        midi.clear(); p.processBlock (output, midi);
+        check (! p.voice.playbackActive, "editor key forwarding does not synthesize duplicate local MIDI playback");
+
+        auto* openTrim = dynamic_cast<juce::Button*> (findComponentId (*editor, "trim-sample-button"));
+        if (openTrim != nullptr && openTrim->onClick) openTrim->onClick();
+        auto* startField = dynamic_cast<juce::TextEditor*> (findComponentId (*editor, "sample-trim-start-seconds"));
+        auto* cancel = dynamic_cast<juce::Button*> (findComponentId (*editor, "sample-trim-cancel"));
+        check (startField != nullptr && startField->isShowing() && cancel != nullptr,
+               "intentional sample-trim text editor remains available in FL");
+        if (startField != nullptr && startField->isShowing())
+        {
+            check (startField->getWantsKeyboardFocus() && startField->getMouseClickGrabsKeyboardFocus(),
+                   "text entry retains its normal explicit keyboard-focus behavior");
+            startField->setText ({}, false);
+            startField->grabKeyboardFocus();
+            const int hostCharacters = host.characters;
+            for (const auto character : juce::String ("1.25"))
+                SendMessageW (nativeEditor, WM_CHAR, (WPARAM) character, 1);
+            host.drainKeys();
+            check (startField->hasKeyboardFocus (false) && startField->getText() == "1.25"
+                   && host.characters == hostCharacters,
+                   "native text input edits the trim field and is consumed instead of playing host notes");
+        }
+        if (cancel != nullptr && cancel->onClick) cancel->onClick();
+       #else
+        check (false, "--host-keyboard-focus requires the Windows harness copied as FL64.exe");
+       #endif
+    }
+
     static void runMousePlaybackModes()
     {
         P p;
@@ -3177,6 +3345,12 @@ struct CueSamplerStateTests
                 const auto key = cuesampler::makeFlOctaveShortcut (octave * 12);
                 check (key && key->macKeyCode == 84 + octave - 2,
                        "FL shortcut uses the absolute numeric-keypad octave key");
+                const auto events = cuesampler::makeFlWindowsOctaveKeyEvents (*key);
+                check (events[0].virtualKey == 0x12 && events[0].down && ! events[0].altContext
+                       && events[1].virtualKey == (unsigned int) (0x60 + octave) && events[1].down && events[1].altContext
+                       && events[2].virtualKey == events[1].virtualKey && ! events[2].down && events[2].altContext
+                       && events[3].virtualKey == 0x12 && ! events[3].down && events[3].altContext,
+                       "Windows FL shortcuts pair Alt with absolute numpad keys, never top-row digits");
                 check (cuesampler::dispatchFlOctaveShortcut (octave * 12, { true, true, false, true }, post) == Result::queued,
                        "active FL window receives each supported octave request");
             }
@@ -4967,18 +5141,31 @@ int main (int argc, char** argv)
     juce::ScopedJuceInitialiser_GUI init;
     const auto base = argc > 1 ? juce::File (juce::String (argv[1])) : juce::File::getCurrentWorkingDirectory();
     const auto scratch = base.getNonexistentChildFile ("state-test-cache", {}, false);
-    scratch.createDirectory();
+    if (! scratch.createDirectory())
+    {
+        std::cerr << "Cannot create test scratch directory: " << scratch.getFullPathName() << std::endl;
+        return 2;
+    }
+    const auto userDataPath = scratch.getChildFile ("user-data").getFullPathName();
    #if JUCE_WINDOWS
-    ::_putenv_s ("CUE_STEM_CACHE_DIR", scratch.getFullPathName().toRawUTF8());
+    const bool isolated = ::_putenv_s ("CUE_USER_DATA_DIR", userDataPath.toRawUTF8()) == 0
+                          && ::_putenv_s ("CUE_STEM_CACHE_DIR", scratch.getFullPathName().toRawUTF8()) == 0;
    #else
-    ::setenv ("CUE_STEM_CACHE_DIR", scratch.getFullPathName().toRawUTF8(), 1);
+    const bool isolated = ::setenv ("CUE_USER_DATA_DIR", userDataPath.toRawUTF8(), 1) == 0
+                          && ::setenv ("CUE_STEM_CACHE_DIR", scratch.getFullPathName().toRawUTF8(), 1) == 0;
    #endif
+    if (! isolated)
+    {
+        std::cerr << "Cannot isolate test user data" << std::endl;
+        return 2;
+    }
     const auto filter = argc > 2 ? juce::String (argv[2]) : juce::String();
     const bool full = filter.isEmpty() || filter == "--separate";
     // Focused integration path: real inference/cache/save/mute checks without
     // unrelated export-drag dialogs or other UI gesture suites.
     if (filter == "--stem-separation") CueSamplerStateTests::run (true);
     if (filter == "--ui-benchmark") CueSamplerStateTests::runUiBenchmark();
+    if (filter == "--host-keyboard-focus") CueSamplerStateTests::runHostKeyboardFocus();
     if (filter == "--sample-import") CueSamplerStateTests::runSampleImport (scratch);
     if (full || filter == "--sample-import" || filter == "--sample-trim") CueSamplerStateTests::runSampleTrim (scratch);
     if (full || filter == "--sample-trim" || filter == "--trim-audition") CueSamplerStateTests::runSampleTrimAudition (scratch);

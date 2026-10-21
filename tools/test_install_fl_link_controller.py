@@ -5,7 +5,9 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import stat
 import tempfile
 import unittest
 from unittest import mock
@@ -54,6 +56,7 @@ class ControllerInstallerTests(unittest.TestCase):
         previous = b'# An older CUE controller implementation\n'
         self.destination.write_bytes(previous)
         self.destination.chmod(0o640)
+        previous_mode = self.destination.stat().st_mode
         sibling = self.destination.parent / 'personal_mapping.py'
         sibling.write_bytes(b'# Keep this custom mapping\n')
         other_controller = self.hardware / 'User Controller/device_Custom.py'
@@ -65,7 +68,12 @@ class ControllerInstallerTests(unittest.TestCase):
         backup = Path(result['backup'])
         self.assertEqual(result['status'], 'updated')
         self.assertEqual(backup.read_bytes(), previous)
-        self.assertEqual(backup.stat().st_mode & 0o777, 0o640)
+        if os.name == 'nt':
+            # Windows chmod exposes the readonly flag, not POSIX permission bits.
+            self.assertEqual(backup.stat().st_mode & stat.S_IWRITE,
+                             previous_mode & stat.S_IWRITE)
+        else:
+            self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o640)
         self.assertTrue(backup.is_relative_to(self.backups))
         self.assertFalse(backup.is_relative_to(self.hardware))
         self.assertEqual(self.destination.read_bytes(), self.bytes)
@@ -102,7 +110,12 @@ class ControllerInstallerTests(unittest.TestCase):
         unrelated = self.root / 'unrelated.py'
         unrelated.write_bytes(b'# Keep this external file\n')
         self.destination.parent.mkdir(parents=True)
-        self.destination.symlink_to(unrelated)
+        try:
+            self.destination.symlink_to(unrelated)
+        except OSError as error:
+            if os.name == 'nt' and getattr(error, 'winerror', None) == 1314:
+                self.skipTest('Windows symlink privilege is unavailable')
+            raise
         with self.assertRaisesRegex(ValueError, 'symlink'):
             self.install()
         self.assertTrue(self.destination.is_symlink())

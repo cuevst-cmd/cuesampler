@@ -3,6 +3,7 @@
 #include "StemCache.h"
 #include "Mp3AudioCodec.h"
 #include "TempoAnalysisPolicy.h"
+#include "UserDataDirectory.h"
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -11,6 +12,7 @@
 struct DllPathHelper {
     HMODULE hDml = NULL;
     HMODULE hOnnx = NULL;
+    HMODULE hLame = NULL;
 
     DllPathHelper() {
         wchar_t path[MAX_PATH];
@@ -27,8 +29,10 @@ struct DllPathHelper {
                 std::wstring dir = wpath.substr(0, pos);
                 std::wstring dmlPath = dir + L"\\DirectML.dll";
                 std::wstring onnxPath = dir + L"\\onnxruntime.dll";
+                std::wstring lamePath = dir + L"\\mp3lame.dll";
                 hDml = LoadLibraryExW(dmlPath.c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
                 hOnnx = LoadLibraryExW(onnxPath.c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+                hLame = LoadLibraryExW(lamePath.c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
             }
         }
     }
@@ -133,8 +137,9 @@ constexpr char cueSamplerStateMagic[] = "CSB2";
 // the update-check cache and must otherwise remain untouched.
 void removeLegacyDataSharingFiles()
 {
-    const auto dataDir = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                             .getChildFile ("CueSampler");
+    const auto dataDir = cuesampler::userDataDirectory (
+        juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+            .getChildFile ("CueSampler"));
 
     for (const auto* fileName : { "telemetry_events.jsonl",
                                   "telemetry_events.uploading.jsonl",

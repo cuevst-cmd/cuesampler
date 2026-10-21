@@ -1,4 +1,5 @@
 #include "UpdateChecker.h"
+#include "UserDataDirectory.h"
 
 #ifndef CUE_VERSION_STRING
  #define CUE_VERSION_STRING "0.0.0"
@@ -324,8 +325,9 @@ void UpdateChecker::markCheckFinished()
 
 juce::File UpdateChecker::baseDir() const
 {
-    auto dir = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                   .getChildFile ("CueSampler");
+    auto dir = userDataDirectory (
+        juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+            .getChildFile ("CueSampler"));
     dir.createDirectory();
     return dir;
 }
