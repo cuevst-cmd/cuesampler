@@ -113,6 +113,16 @@ def project_version():
     return match[1]
 
 
+def dependency_source(build_dir, name):
+    cache = build_dir / "CMakeCache.txt"
+    if cache.is_file():
+        prefix = f"FETCHCONTENT_SOURCE_DIR_{name.upper()}:PATH="
+        for line in cache.read_text().splitlines():
+            if line.startswith(prefix) and line[len(prefix):]:
+                return Path(line[len(prefix):])
+    return build_dir / "_deps" / (name + "-src")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build")
@@ -128,11 +138,11 @@ def main():
     write_if_changed(ROOT / "LICENSE.txt", license_text())
     if args.license_only:
         return
-    deps = args.build_dir / "_deps"
     output = args.output or args.build_dir / "release-notices-mac"
-    expected = stage(output, args.juce_source or deps / "juce-src",
-                     args.bungee_source or deps / "bungee-src", args.ort_source or deps / "onnxruntime-src",
-                     args.lame_source or deps / "lame-src")
+    expected = stage(output, args.juce_source or dependency_source(args.build_dir, "juce"),
+                     args.bungee_source or dependency_source(args.build_dir, "bungee"),
+                     args.ort_source or dependency_source(args.build_dir, "onnxruntime"),
+                     args.lame_source or dependency_source(args.build_dir, "lame"))
     for bundle in args.bundle + args.verify_bundle:
         with (bundle / "Contents/Info.plist").open("rb") as stream:
             info = plistlib.load(stream)

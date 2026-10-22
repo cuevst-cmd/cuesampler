@@ -10,6 +10,7 @@
 #
 # Usage:  ./make-installer.sh [version]
 #         PKG_TAG=osx11 ./make-installer.sh 1.0.6
+#         CUE_INSTALLER_TMPDIR=/path/with/free/space ./make-installer.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -36,7 +37,11 @@ AU="build/CueSampler_artefacts/Release/AU/CUE SAMPLER.component"
 python3 tools/prepare_release_legal.py --verify-bundle "$VST3" --verify-bundle "$AU"
 codesign --verify --deep --strict "$VST3"
 codesign --verify --deep --strict "$AU"
-STAGE="$(mktemp -d)"
+if [ -n "${CUE_INSTALLER_TMPDIR:-}" ]; then
+  STAGE="$(mktemp -d "${CUE_INSTALLER_TMPDIR%/}/cuesampler-installer.XXXXXXXX")"
+else
+  STAGE="$(mktemp -d)"
+fi
 trap 'rm -rf "$STAGE"' EXIT
 OUT="dist"
 UNSIGNED="$STAGE/unsigned.pkg"

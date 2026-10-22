@@ -134,10 +134,12 @@ bool Mp3AudioCodec::decode (const juce::MemoryBlock& mp3Data,
         || channels < 1 || channels > 2 || samples <= 0)
         return false;
 
-    juce::AudioFormatManager formats;
-    formats.registerBasicFormats();
+    // Internal LAME payloads use the same decoder on every platform. macOS
+    // CoreAudio already removes encoder delay, so selecting it through the
+    // format manager would apply our software decoder's trim a second time.
+    juce::MP3AudioFormat format;
     auto reader = std::unique_ptr<juce::AudioFormatReader> (
-        formats.createReaderFor (std::make_unique<juce::MemoryInputStream> (mp3Data, false)));
+        format.createReaderFor (new juce::MemoryInputStream (mp3Data, false), true));
 
     // JUCE's software reader exposes LAME's 576-sample encoder delay plus the
     // Layer III synthesis filterbank's 529 samples. The LAME tag remains in the

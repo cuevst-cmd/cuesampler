@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.22)
 # `project()` command. `project()` sets up some helpful variables that describe source/binary
 # directories, and the current project version. This is a standard CMake command.
 
-project(CueSampler VERSION 1.10.1)
+project(CueSampler VERSION 1.10.2)
 # Keep host/update metadata fully qualified; show the requested short release
 # label for a zero-patch release (for example, 1.10 rather than 1.10.0).
 set(CUE_VERSION_DISPLAY "${PROJECT_VERSION}")
