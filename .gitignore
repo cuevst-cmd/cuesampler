@@ -1,0 +1,6 @@
+build/
+assets/
+dist/
+._*
+.DS_Store
+*.json
